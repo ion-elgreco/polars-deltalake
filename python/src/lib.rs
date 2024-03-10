@@ -1,16 +1,17 @@
 mod error;
 
 use arrow_schema::Schema as ArrowSchema;
+use polars::io::parquet::ParallelStrategy;
+use polars::io::predicates::{BatchStats, ColumnStats};
 // use deltalake::kernel::{Schema, SchemaRef};
 // use deltalake::{DeltaOps, DeltaResult};
-use polars::prelude::{Schema, SchemaRef};
-use deltalake::{DeltaTable, DeltaTableError};
+use deltalake::DeltaTableError;
 use error::PythonError;
-use polars_lazy::prelude::LazyFrame;
+use polars::prelude::Schema;
 use polars_arrow::datatypes::ArrowSchema as PolarsArrowSchema;
 use polars_arrow::datatypes::Field;
-use polars_plan::logical_plan::FileScan;
-use polars_plan::logical_plan::{FileInfo, LogicalPlan};
+use polars_lazy::prelude::LazyFrame;
+use polars_plan::logical_plan::{FileInfo, FileScan, LogicalPlan};
 use polars_plan::prelude::{FileScanOptions, ParquetOptions};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::types::PyModule;
@@ -18,7 +19,6 @@ use pyo3::{pyfunction, pymodule, PyResult, Python};
 use pyo3_polars::PyLazyFrame;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use jemallocator::Jemalloc;
@@ -34,14 +34,13 @@ fn rt() -> PyResult<tokio::runtime::Runtime> {
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-fn scan_delta(
+fn custom_scan_delta(
     uri: String,
-    version: Option<i64>,
-    storage_options: Option<HashMap<String, String>>,
-    parallel: bool,
     low_memory: bool,
     use_statistics: bool,
-) -> PyResult<()> {
+    version: Option<i64>,
+    storage_options: Option<HashMap<String, String>>,
+) -> PyResult<PyLazyFrame> {
     let mut builder = deltalake::DeltaTableBuilder::from_uri(uri);
     if let Some(storage_options) = storage_options {
         builder = builder.with_storage_options(storage_options)
@@ -51,7 +50,19 @@ fn scan_delta(
     }
     let table = rt()?.block_on(builder.load()).map_err(PythonError::from)?;
 
-    let file_paths = table.get_file_uris().map_err(PythonError::from)?.map(|path| PathBuf::from(path)).collect::<Vec<PathBuf>>();
+    let file_paths = table
+        .get_file_uris()
+        .map_err(PythonError::from)?
+        .map(|path| PathBuf::from(path))
+        .collect::<Vec<PathBuf>>();
+
+    let partition_cols = table
+        .metadata()
+        .map_err(PythonError::from)?
+        .partition_columns
+        .clone();
+
+    let hive_partitioning = !partition_cols.is_empty();
 
     let schema: ArrowSchema = table
         .snapshot()
@@ -64,19 +75,23 @@ fn scan_delta(
     let polars_arrow_schema: PolarsArrowSchema = schema
         .all_fields()
         .iter()
+        .filter(|f| !partition_cols.contains(f.name()))
         .map(|f| (*f).clone().into())
         .collect::<Vec<Field>>()
         .into();
 
-    let polars_schema: Schema = polars_arrow_schema.into();
-    // let schema_ref: SchemaRef = polars_schema.into();
+    let polars_schema: Schema = polars_arrow_schema.clone().into();
 
-    let mut file_info = FileInfo::new(
-        polars_schema.into(),
-        Some(polars_arrow_schema.into()),
-        (None, 10),
-    );
+    let mut file_info = FileInfo::new(polars_schema.into(), None, (None, 10));
 
+    if hive_partitioning {
+        file_info
+            .init_hive_partitions(file_paths[0].as_path())
+            .map_err(|err| DeltaTableError::Generic(err.to_string()))
+            .map_err(PythonError::from)?;
+    }
+
+    dbg!(file_info.hive_parts.clone());
 
     let options = FileScanOptions {
         with_columns: None,
@@ -85,39 +100,34 @@ fn scan_delta(
         rechunk: false,
         row_index: None,
         file_counter: Default::default(),
-        hive_partitioning: false,
+        hive_partitioning: hive_partitioning,
     };
 
     let scan_type = FileScan::Parquet {
-            options: ParquetOptions {
-                parallel,
-                low_memory,
-                use_statistics,
-            },
-            cloud_options: None,
-            metadata: None,
-        };
+        options: ParquetOptions {
+            parallel: ParallelStrategy::Auto,
+            low_memory,
+            use_statistics,
+        },
+        cloud_options: None,
+        metadata: None,
+    };
 
-    let mut lf: LazyFrame = LogicalPlan::Scan {
-        paths:file_paths.into(),
+    let plan = LogicalPlan::Scan {
+        paths: file_paths.into(),
         file_info,
         file_options: options,
         predicate: None,
-        scan_type: scan_type
-    }
-    .into()
-    .build()
-    .into();
-
-
-    dbg!(table.version());
-    Ok(PyLazyFrame(lf))
+        scan_type: scan_type,
+    };
+    let frame: LazyFrame = plan.into();
+    Ok(PyLazyFrame(frame))
 }
 
 #[pymodule]
 fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    m.add_function(pyo3::wrap_pyfunction!(scan_delta, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(custom_scan_delta, m)?)?;
     deltalake::azure::register_handlers(None);
     Ok(())
 }
