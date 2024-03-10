@@ -55,7 +55,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --manifest-path python/polars_deltalake/Cargo.toml
+          args: --release --out dist --find-interpreter --manifest-path python/Cargo.toml
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
@@ -79,7 +79,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --manifest-path python/polars_deltalake/Cargo.toml
+          args: --release --out dist --find-interpreter --manifest-path python/Cargo.toml
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v3
@@ -101,7 +101,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --manifest-path python/polars_deltalake/Cargo.toml
+          args: --release --out dist --find-interpreter --manifest-path python/Cargo.toml
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v3
@@ -117,7 +117,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --out dist --manifest-path python/polars_deltalake/Cargo.toml
+          args: --out dist --manifest-path python/Cargo.toml
       - name: Upload sdist
         uses: actions/upload-artifact@v3
         with:
