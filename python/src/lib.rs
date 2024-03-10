@@ -90,9 +90,6 @@ fn custom_scan_delta(
             .map_err(|err| DeltaTableError::Generic(err.to_string()))
             .map_err(PythonError::from)?;
     }
-
-    dbg!(file_info.hive_parts.clone());
-
     let options = FileScanOptions {
         with_columns: None,
         cache: true,
@@ -129,5 +126,7 @@ fn _internal(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(pyo3::wrap_pyfunction!(custom_scan_delta, m)?)?;
     deltalake::azure::register_handlers(None);
+    deltalake::gcp::register_handlers(None);
+    deltalake::aws::register_handlers(None);
     Ok(())
 }
