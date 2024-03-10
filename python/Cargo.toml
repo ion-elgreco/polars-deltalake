@@ -8,13 +8,18 @@ name = "polars_deltalake"
 crate-type = ["cdylib"]
 
 [dependencies]
-polars = {   workspace = true, features = ["dtype-struct", "dtype-array", 'dtype-u16', 'dtype-u8', 'dtype-i8','dtype-i16']}
-polars-core = {workspace = true}
-polars-arrow = {workspace = true}
+polars = {   workspace = true, features = ["parquet"]}
+polars-lazy = { workspace = true, features = ["parquet"]}
+polars-arrow = { workspace = true, features = ["arrow_rs"]}
+polars-plan = {workspace = true, features = ["parquet"]}
+arrow-schema ={ version = "*"}
 pyo3 = { workspace = true, features = ["extension-module"] }
-pyo3-polars = { workspace = true, features = ["derive"] }
+pyo3-polars = { workspace = true, features = ["derive", "lazy"] }
 serde = { workspace = true, features = ["derive"] }
-deltalake = { workspace = true}
+deltalake = { workspace = true, features = ["azure", "s3", "gcs"]}
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+thiserror = { version = "1" }
+
 
 [target.'cfg(target_os = "linux")'.dependencies]
 jemallocator = { version = "0.5", features = ["disable_initial_exec_tls"] }

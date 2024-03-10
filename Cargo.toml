@@ -11,10 +11,12 @@ keywords = ["deltalake", "polars", "datalake"]
 
 
 [workspace.dependencies]
-polars = { version = "0.38.1" , features = ["dtype-struct", "dtype-array", 'dtype-u16', 'dtype-u8', 'dtype-i8','dtype-i16']}
-polars-core = {version = "0.38.1"}
-polars-arrow = {version = "0.38.1"}
+polars = { version = "0.38.1", features = ["parquet"]}
+polars-lazy ={ version = "0.38.1",  features = ["parquet"]}
+polars-plan = {version = "0.38.1", features = ["parquet"]}
+polars-arrow = {version = "0.38.1", features = ["arrow_rs"]}
 pyo3 = { version = "0.20", features = ["extension-module"] }
-pyo3-polars = { version = "0.12", features = ["derive"] }
+pyo3-polars = { version = "0.12", features = ["derive", "lazy"] }
 serde = { version = "1", features = ["derive"] }
-deltalake = {version = "*", features = ["azure"]}
+deltalake = {version = "*", features = ["azure", "s3", "gcs"]}
+tokio = { version = "*",  features = ["rt-multi-thread"] }

@@ -1,5 +1,6 @@
 maturin
 polars
+deltalake
 pytest
 mypy
 ruff
