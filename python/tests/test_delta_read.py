@@ -29,24 +29,24 @@ def data_batch_1():
 def test_roundtrip_read(tmp_path, data_batch_1: pl.DataFrame):
     data_batch_1.write_delta(tmp_path, mode="append")
 
-    result = pl.scan_delta(str(tmp_path)).collect()
+    result = pldl.scan_delta(str(tmp_path)).collect()
 
     assert_frame_equal(result, data_batch_1)
 
     data_batch_1.write_delta(tmp_path, mode="append")
-    result = pl.scan_delta(str(tmp_path)).collect()
+    result = pldl.scan_delta(str(tmp_path)).collect()
     assert_frame_equal(result, pl.concat([data_batch_1] * 2))
 
 
 def test_roundtrip_read_filter(tmp_path, data_batch_1: pl.DataFrame):
     data_batch_1.write_delta(tmp_path, mode="append")
 
-    result = pl.scan_delta(str(tmp_path)).filter(pl.col("foo") > 5).collect()
+    result = pldl.scan_delta(str(tmp_path)).filter(pl.col("foo") > 5).collect()
 
     assert_frame_equal(result, data_batch_1.filter(pl.col("foo") > 5))
 
     data_batch_1.write_delta(tmp_path, mode="append")
-    result = pl.scan_delta(str(tmp_path)).filter(pl.col("foo") > 5).collect()
+    result = pldl.scan_delta(str(tmp_path)).filter(pl.col("foo") > 5).collect()
     assert_frame_equal(result, pl.concat([data_batch_1] * 2).filter(pl.col("foo") > 5))
 
 
@@ -57,12 +57,12 @@ def test_roundtrip_read_partitioned(tmp_path, data_batch_1: pl.DataFrame):
         delta_write_options={"partition_by": ["date_month", "static_part"]},
     )
 
-    result = pl.scan_delta(str(tmp_path)).collect()
+    result = pldl.scan_delta(str(tmp_path)).collect()
 
     assert_frame_equal(result, data_batch_1, check_row_order=False)
 
     data_batch_1.write_delta(tmp_path, mode="append")
-    result = pl.scan_delta(str(tmp_path)).collect()
+    result = pldl.scan_delta(str(tmp_path)).collect()
     assert_frame_equal(result, pl.concat([data_batch_1] * 2), check_row_order=False)
 
 
@@ -74,7 +74,7 @@ def test_roundtrip_read_partitioned_filtered(tmp_path, data_batch_1: pl.DataFram
     )
 
     result = (
-        pl.scan_delta(str(tmp_path))
+        pldl.scan_delta(str(tmp_path))
         .filter(
             (pl.col("static_part") == "A")
             & (pl.col("date_month").is_in([201001, 201002]))
@@ -93,7 +93,7 @@ def test_roundtrip_read_partitioned_filtered(tmp_path, data_batch_1: pl.DataFram
 
     data_batch_1.write_delta(tmp_path, mode="append")
     result = (
-        pl.scan_delta(str(tmp_path))
+        pldl.scan_delta(str(tmp_path))
         .filter(
             (pl.col("static_part") == "A")
             & (pl.col("date_month").is_in([201001, 201002]))
@@ -120,7 +120,7 @@ def test_roundtrip_read_partitioned_filtered_select(
     )
 
     result = (
-        pl.scan_delta(str(tmp_path))
+        pldl.scan_delta(str(tmp_path))
         .filter(
             (pl.col("static_part") == "A")
             & (pl.col("date_month").is_in([201001, 201002]))
@@ -140,7 +140,7 @@ def test_roundtrip_read_partitioned_filtered_select(
 
     data_batch_1.write_delta(tmp_path, mode="append")
     result = (
-        pl.scan_delta(str(tmp_path))
+        pldl.scan_delta(str(tmp_path))
         .filter(
             (pl.col("static_part") == "A")
             & (pl.col("date_month").is_in([201001, 201002]))
