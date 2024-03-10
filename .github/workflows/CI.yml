@@ -35,7 +35,7 @@ jobs:
         working-directory: python
       - run: venv/bin/python -m black --check .
         working-directory: python
-      - run: venv/bin/python -m mypy python/polars_deltalake
+      - run: venv/bin/python -m mypy python
         working-directory: python
       - run: venv/bin/python -m ruff .
         working-directory: python
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [x86_64, x86, aarch64, armv7, s390x, ppc64le]
+        target: [x86_64, x86, armv7, s390x, ppc64le]
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
