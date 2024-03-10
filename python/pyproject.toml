@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "polars-deltalake"
+requires-python = ">=3.8"
+dependencies = [
+  'polars >= 0.20.14'
+]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+authors = [
+  { name="Ion Koutsours", email="15728914+ion-elgreco@users.noreply.github.com"},
+]
+description = "Native polars deltalake reader"
+readme = "README.md"
+
+[project.urls]
+"Repository" = "https://github.com/ion-elgreco/polars-deltalake"
+"Documentation" = "https://ion-elgreco.github.io/polars-deltalake/"
+"Change Log" = "https://github.com/ion-elgreco/polars-deltalake/releases"
+"Issue Tracker" = "https://github.com/ion-elgreco/polars-deltalake/issues"
+
+
+[tool.maturin]
+module-name = "polars_deltalake._internal"

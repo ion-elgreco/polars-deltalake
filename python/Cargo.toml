@@ -1,0 +1,25 @@
+[package]
+name = "polars_deltalake"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "polars_deltalake"
+crate-type = ["cdylib"]
+
+[dependencies]
+polars = {   workspace = true, features = ["dtype-struct", "dtype-array", 'dtype-u16', 'dtype-u8', 'dtype-i8','dtype-i16']}
+polars-core = {workspace = true}
+polars-arrow = {workspace = true}
+pyo3 = { workspace = true, features = ["extension-module"] }
+pyo3-polars = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+deltalake = { workspace = true}
+
+[target.'cfg(target_os = "linux")'.dependencies]
+jemallocator = { version = "0.5", features = ["disable_initial_exec_tls"] }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"

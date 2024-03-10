@@ -1,0 +1,9 @@
+/pyo3-polars/target
+Cargo.lock
+.idea/
+venv/
+target/
+rust-toolchain.toml
+*.pyc
+site
+*.so

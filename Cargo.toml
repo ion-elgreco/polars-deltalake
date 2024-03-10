@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "python",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Ion Koutsouris"]
+rust-version = "1.72"
+keywords = ["deltalake", "polars", "datalake"]
+
+
+[workspace.dependencies]
+polars = { version = "0.38.1" , features = ["dtype-struct", "dtype-array", 'dtype-u16', 'dtype-u8', 'dtype-i8','dtype-i16']}
+polars-core = {version = "0.38.1"}
+polars-arrow = {version = "0.38.1"}
+pyo3 = { version = "0.20", features = ["extension-module"] }
+pyo3-polars = { version = "0.12", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+deltalake = {version = "*", features = ["azure"]}
