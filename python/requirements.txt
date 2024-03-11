@@ -1,5 +1,5 @@
 maturin
-polars
+polars==0.20.10
 deltalake
 pytest
 mypy

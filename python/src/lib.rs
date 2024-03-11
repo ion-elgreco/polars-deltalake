@@ -58,7 +58,7 @@ fn custom_scan_delta(
     let file_paths = table
         .get_file_uris()
         .map_err(PythonError::from)?
-        .map(|path| PathBuf::from(path))
+        .map(PathBuf::from)
         .collect::<Vec<PathBuf>>();
 
     let partition_cols = table
@@ -105,13 +105,17 @@ fn custom_scan_delta(
         rechunk: false,
         row_index: None,
         file_counter: Default::default(),
-        hive_partitioning: hive_partitioning,
+        hive_partitioning,
     };
 
     let cloud_options = storage_options
         .map(|opts| CloudOptions::from_untyped_config(&uri, &opts))
         .transpose()
-        .map_err(PyPolarsErr::from)?;
+        .map_err(PyPolarsErr::from)?
+        .map(|mut options| {
+            options.max_retries = 10;
+            options
+        });
 
     let scan_type = FileScan::Parquet {
         options: ParquetOptions {
