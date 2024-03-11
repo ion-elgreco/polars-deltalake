@@ -5,6 +5,7 @@ use polars::io::parquet::ParallelStrategy;
 use polars::io::predicates::{BatchStats, ColumnStats};
 // use deltalake::kernel::{Schema, SchemaRef};
 // use deltalake::{DeltaOps, DeltaResult};
+// use polars_plan::logical_plan::hive;
 use deltalake::DeltaTableError;
 use error::PythonError;
 use polars::prelude::Schema;
@@ -82,7 +83,13 @@ fn custom_scan_delta(
 
     let polars_schema: Schema = polars_arrow_schema.clone().into();
 
-    let mut file_info = FileInfo::new(polars_schema.into(), None, (None, 10));
+    dbg!(polars_schema.to_arrow(true));
+
+    let mut file_info = FileInfo::new(
+        polars_schema.clone().into(),
+        Some(polars_schema.to_arrow(true).into()),
+        (None, 10),
+    );
 
     if hive_partitioning {
         file_info
