@@ -87,8 +87,6 @@ fn custom_scan_delta(
 
     let polars_schema: Schema = polars_arrow_schema.clone().into();
 
-    dbg!(polars_schema.to_arrow(true));
-
     let mut file_info = FileInfo::new(
         polars_schema.clone().into(),
         Some(polars_schema.to_arrow(true).into()),

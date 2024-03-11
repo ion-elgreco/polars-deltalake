@@ -31,13 +31,13 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.3
       - run: make install
         working-directory: python
-      - run: venv/bin/python -m pytest .
+      - run: .venv/bin/python -m pytest .
         working-directory: python
-      - run: venv/bin/python -m black --check .
+      - run: .venv/bin/python -m black --check .
         working-directory: python
-      - run: venv/bin/python -m mypy polars_deltalake
+      - run: .venv/bin/python -m mypy polars_deltalake
         working-directory: python
-      - run: venv/bin/python -m ruff .
+      - run: .venv/bin/python -m ruff .
         working-directory: python
 
 

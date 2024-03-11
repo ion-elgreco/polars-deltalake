@@ -11,9 +11,9 @@ keywords = ["deltalake", "polars", "datalake"]
 
 
 [workspace.dependencies]
-polars = { version = "0.38.1", features = ["parquet"]}
-polars-lazy ={ version = "0.38.1",  features = ["parquet"]}
-polars-plan = {version = "0.38.1", features = ["parquet"]}
+polars = { version = "0.38.1", features = ["parquet", "cloud", "azure"]}
+polars-lazy ={ version = "0.38.1",  features = ["parquet","cloud"]}
+polars-plan = {version = "0.38.1", features = ["parquet","cloud"]}
 polars-arrow = {version = "0.38.1", features = ["arrow_rs"]}
 pyo3 = { version = "0.20", features = ["extension-module"] }
 pyo3-polars = { version = "0.12", features = ["derive", "lazy"] }

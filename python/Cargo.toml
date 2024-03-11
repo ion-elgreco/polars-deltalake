@@ -8,10 +8,10 @@ name = "polars_deltalake"
 crate-type = ["cdylib"]
 
 [dependencies]
-polars = {   workspace = true, features = ["parquet"]}
-polars-lazy = { workspace = true, features = ["parquet"]}
-polars-arrow = { workspace = true, features = ["arrow_rs"]}
-polars-plan = {workspace = true, features = ["parquet"]}
+polars = { version = "0.38.1", features = ["parquet", "cloud", "azure"]}
+polars-lazy ={ version = "0.38.1",  features = ["parquet","cloud"]}
+polars-plan = {version = "0.38.1", features = ["parquet","cloud"]}
+polars-arrow = {version = "0.38.1", features = ["arrow_rs"]}
 arrow-schema ={ version = "*"}
 pyo3 = { workspace = true, features = ["extension-module"] }
 pyo3-polars = { workspace = true, features = ["derive", "lazy"] }
