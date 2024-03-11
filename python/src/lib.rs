@@ -44,6 +44,7 @@ fn custom_scan_delta(
     use_statistics: bool,
     version: Option<i64>,
     storage_options: Option<HashMap<String, String>>,
+    retries: Option<i64>,
 ) -> PyResult<PyLazyFrame> {
     let mut builder = deltalake::DeltaTableBuilder::from_uri(&uri);
     if let Some(storage_options) = storage_options.clone() {
@@ -113,7 +114,7 @@ fn custom_scan_delta(
         .transpose()
         .map_err(PyPolarsErr::from)?
         .map(|mut options| {
-            options.max_retries = 10;
+            options.max_retries = retries.unwrap_or(10) as usize;
             options
         });
 
