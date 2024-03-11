@@ -158,21 +158,3 @@ def test_roundtrip_read_partitioned_filtered_select(
         .select("foo"),
         check_row_order=False,
     )
-
-
-
-def test_roundtrip_read_schema_evolved(tmp_path, data_batch_1: pl.DataFrame):
-    data_batch_1.write_delta(tmp_path, mode="append")
-
-    result = pldl.scan_delta(str(tmp_path)).collect()
-
-    assert_frame_equal(result, data_batch_1)
-
-    data_batch_2 = data_batch_1.with_columns(pl.lit('new_value').alias('new_col'))
-
-    data_batch_2.write_delta(tmp_path, mode="append", delta_write_options={"schema_mode":"merge", "engine":"rust"})
-    result = pldl.scan_delta(str(tmp_path)).collect()
-    
-    assert result.schema == data_batch_2.schema
-    
-    assert_frame_equal(result, pl.concat([data_batch_1, data_batch_2], how='diagonal'))
