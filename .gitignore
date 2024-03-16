@@ -7,3 +7,4 @@ rust-toolchain.toml
 *.pyc
 site
 *.so
+.venv
