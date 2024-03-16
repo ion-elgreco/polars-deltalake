@@ -16,7 +16,7 @@ arrow-schema ={ version = "*"}
 pyo3 = { version = "0.20.3", features = ["extension-module"] }
 pyo3-polars = { version = "0.12.0", features = ["derive", "lazy"] }
 serde = { version = "*", features = ["derive"] }
-deltalake = { version = "*", features = ["azure", "s3", "gcs"]}
+deltalake = { version = "0.17.1", features = ["azure", "s3", "gcs"]}
 tokio = { version = "*", features = ["rt-multi-thread"] }
 thiserror = { version = "1" }
 
