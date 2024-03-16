@@ -4,7 +4,7 @@ Cargo.lock
 venv/
 .venv/
 target/
-rust-toolchain.toml
 *.pyc
 site
 *.so
+.venv
