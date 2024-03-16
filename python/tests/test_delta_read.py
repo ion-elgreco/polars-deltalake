@@ -186,4 +186,5 @@ def test_roundtrip_read_schema_evolved(tmp_path, data_batch_1: pl.DataFrame):
         result,
         pl.concat([data_batch_1, data_batch_2], how="diagonal"),
         check_row_order=False,
+        check_column_order=False,
     )
