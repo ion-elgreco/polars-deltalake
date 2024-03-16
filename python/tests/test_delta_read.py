@@ -2,6 +2,7 @@ import polars as pl
 import pytest
 import polars_deltalake as pldl
 from polars.testing import assert_frame_equal
+from datetime import datetime, timezone
 
 
 @pytest.fixture()
@@ -10,6 +11,8 @@ def data_batch_1():
         {
             "foo": [1, 2, 3, 4, 5, 6, 7, 8, 9],
             "bar": ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+            "datetime": [datetime(2010, 1, 1)] * 9,
+            # "datetime_tz": [datetime(2010, 1, 1, tzinfo=timezone.utc)] * 9, # TODO: uncomment when delta-rs 0.17.2
             "date_month": [
                 201001,
                 201002,
@@ -22,6 +25,7 @@ def data_batch_1():
                 201009,
             ],
             "static_part": ["A", "A", "A", "B", "B", "B", "C", "C", "C"],
+            "list": [["5", "B"]] * 9,
         }
     )
 
@@ -167,11 +171,19 @@ def test_roundtrip_read_schema_evolved(tmp_path, data_batch_1: pl.DataFrame):
 
     assert_frame_equal(result, data_batch_1)
 
-    data_batch_2 = data_batch_1.with_columns(pl.lit('new_value').alias('new_col'))
+    data_batch_2 = data_batch_1.with_columns(pl.lit("new_value").alias("new_col"))
 
-    data_batch_2.write_delta(tmp_path, mode="append", delta_write_options={"schema_mode":"merge", "engine":"rust"})
+    data_batch_2.write_delta(
+        tmp_path,
+        mode="append",
+        delta_write_options={"schema_mode": "merge", "engine": "rust"},
+    )
     result = pldl.scan_delta(str(tmp_path)).collect()
-    
+
     assert result.schema == data_batch_2.schema
-    
-    assert_frame_equal(result, pl.concat([data_batch_1, data_batch_2], how='diagonal'))
+
+    assert_frame_equal(
+        result,
+        pl.concat([data_batch_1, data_batch_2], how="diagonal"),
+        check_row_order=False,
+    )

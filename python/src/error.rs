@@ -1,8 +1,6 @@
 use deltalake::protocol::ProtocolError;
 use deltalake::{errors::DeltaTableError, ObjectStoreError};
-use pyo3::exceptions::{
-    PyException, PyFileNotFoundError, PyIOError, PyNotImplementedError, PyValueError,
-};
+use pyo3::exceptions::{PyException, PyFileNotFoundError, PyIOError, PyValueError};
 use pyo3::{create_exception, PyErr};
 
 create_exception!(_internal, DeltaError, PyException);

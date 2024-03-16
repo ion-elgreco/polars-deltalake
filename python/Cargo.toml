@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 polars = { version = "0.38.2", features = ["parquet", "cloud", "azure", "aws", "gcp", "async"]}
-polars-lazy ={ version = "0.38.2",  features = ["parquet","cloud", "async"]}
+polars-lazy ={ version = "0.38.2",  features = ["parquet","cloud", "async", "diagonal_concat"]}
 polars-plan = {version = "0.38.2", features = ["parquet","cloud", "async"]}
 polars-arrow = {version = "0.38.2", features = ["arrow_rs"]}
 arrow-schema ={ version = "*"}
@@ -19,7 +19,6 @@ serde = { version = "*", features = ["derive"] }
 deltalake = { version = "*", features = ["azure", "s3", "gcs"]}
 tokio = { version = "*", features = ["rt-multi-thread"] }
 thiserror = { version = "1" }
-
 
 [target.'cfg(target_os = "linux")'.dependencies]
 jemallocator = { version = "0.5", features = ["disable_initial_exec_tls"] }
