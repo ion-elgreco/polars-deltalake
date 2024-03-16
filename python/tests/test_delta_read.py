@@ -2,7 +2,7 @@ import polars as pl
 import pytest
 import polars_deltalake as pldl
 from polars.testing import assert_frame_equal
-from datetime import datetime, timezone
+from datetime import datetime
 
 
 @pytest.fixture()
