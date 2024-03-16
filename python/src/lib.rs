@@ -1,6 +1,8 @@
 mod error;
 
 use arrow_schema::Schema as ArrowSchema;
+use deltalake::storage::StorageOptions;
+use polars::io::cloud::CloudOptions;
 use polars::io::parquet::ParallelStrategy;
 use polars::io::predicates::{BatchStats, ColumnStats};
 // use deltalake::kernel::{Schema, SchemaRef};
@@ -17,6 +19,7 @@ use polars_plan::prelude::{FileScanOptions, ParquetOptions};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::types::PyModule;
 use pyo3::{pyfunction, pymodule, PyResult, Python};
+use pyo3_polars::error::PyPolarsErr;
 use pyo3_polars::PyLazyFrame;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,20 +44,22 @@ fn custom_scan_delta(
     use_statistics: bool,
     version: Option<i64>,
     storage_options: Option<HashMap<String, String>>,
+    retries: Option<i64>,
 ) -> PyResult<PyLazyFrame> {
-    let mut builder = deltalake::DeltaTableBuilder::from_uri(uri);
-    if let Some(storage_options) = storage_options {
+    let mut builder = deltalake::DeltaTableBuilder::from_uri(&uri);
+    if let Some(storage_options) = storage_options.clone() {
         builder = builder.with_storage_options(storage_options)
     }
     if let Some(version) = version {
         builder = builder.with_version(version)
     }
+
     let table = rt()?.block_on(builder.load()).map_err(PythonError::from)?;
 
     let file_paths = table
         .get_file_uris()
         .map_err(PythonError::from)?
-        .map(|path| PathBuf::from(path))
+        .map(PathBuf::from)
         .collect::<Vec<PathBuf>>();
 
     let partition_cols = table
@@ -83,8 +88,6 @@ fn custom_scan_delta(
 
     let polars_schema: Schema = polars_arrow_schema.clone().into();
 
-    dbg!(polars_schema.to_arrow(true));
-
     let mut file_info = FileInfo::new(
         polars_schema.clone().into(),
         Some(polars_schema.to_arrow(true).into()),
@@ -94,8 +97,7 @@ fn custom_scan_delta(
     if hive_partitioning {
         file_info
             .init_hive_partitions(file_paths[0].as_path())
-            .map_err(|err| DeltaTableError::Generic(err.to_string()))
-            .map_err(PythonError::from)?;
+            .map_err(PyPolarsErr::from)?;
     }
     let options = FileScanOptions {
         with_columns: None,
@@ -104,8 +106,17 @@ fn custom_scan_delta(
         rechunk: false,
         row_index: None,
         file_counter: Default::default(),
-        hive_partitioning: hive_partitioning,
+        hive_partitioning,
     };
+
+    let cloud_options = storage_options
+        .map(|opts| CloudOptions::from_untyped_config(&uri, &opts))
+        .transpose()
+        .map_err(PyPolarsErr::from)?
+        .map(|mut options| {
+            options.max_retries = retries.unwrap_or(10) as usize;
+            options
+        });
 
     let scan_type = FileScan::Parquet {
         options: ParquetOptions {
@@ -113,7 +124,7 @@ fn custom_scan_delta(
             low_memory,
             use_statistics,
         },
-        cloud_options: None,
+        cloud_options,
         metadata: None,
     };
 

@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "polars-deltalake"
 requires-python = ">=3.8"
 dependencies = [
-  'polars >= 0.20.14'
+  'polars >= 0.20.10'
 ]
 classifiers = [
   "Programming Language :: Rust",

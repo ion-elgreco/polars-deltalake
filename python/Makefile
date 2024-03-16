@@ -2,19 +2,20 @@
 SHELL=/bin/bash
 
 venv:  ## Set up virtual environment
-	python3 -m venv venv
-	venv/bin/pip install -r requirements.txt
+	python3 -m venv .venv
+	.venv/bin/pip install uv
+	.venv/bin/uv pip install -r requirements.txt
 
 install: venv ## Install polars-deltalake in develop mode
 	unset CONDA_PREFIX && \
-	source venv/bin/activate && maturin develop -m Cargo.toml
+	source .venv/bin/activate && maturin develop -m Cargo.toml
 
 install-release: venv ## Install polars-deltalake in release mode
 	unset CONDA_PREFIX && \
-	source venv/bin/activate && maturin develop --release -m Cargo.toml
+	source .venv/bin/activate && maturin develop --release -m Cargo.toml
 
 clean: ## Clean venv and clean cargo
-	-@rm -r venv
+	-@rm -r .venv
 	-@cargo clean
 
 .PHONY: help

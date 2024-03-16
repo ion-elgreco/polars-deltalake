@@ -160,7 +160,6 @@ def test_roundtrip_read_partitioned_filtered_select(
     )
 
 
-
 def test_roundtrip_read_schema_evolved(tmp_path, data_batch_1: pl.DataFrame):
     data_batch_1.write_delta(tmp_path, mode="append")
 

@@ -8,16 +8,16 @@ name = "polars_deltalake"
 crate-type = ["cdylib"]
 
 [dependencies]
-polars = {   workspace = true, features = ["parquet"]}
-polars-lazy = { workspace = true, features = ["parquet"]}
-polars-arrow = { workspace = true, features = ["arrow_rs"]}
-polars-plan = {workspace = true, features = ["parquet"]}
+polars = { version = "0.38.2", features = ["parquet", "cloud", "azure", "aws", "gcp", "async"]}
+polars-lazy ={ version = "0.38.2",  features = ["parquet","cloud", "async"]}
+polars-plan = {version = "0.38.2", features = ["parquet","cloud", "async"]}
+polars-arrow = {version = "0.38.2", features = ["arrow_rs"]}
 arrow-schema ={ version = "*"}
-pyo3 = { workspace = true, features = ["extension-module"] }
-pyo3-polars = { workspace = true, features = ["derive", "lazy"] }
-serde = { workspace = true, features = ["derive"] }
-deltalake = { workspace = true, features = ["azure", "s3", "gcs"]}
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+pyo3 = { version = "0.20.3", features = ["extension-module"] }
+pyo3-polars = { version = "0.12.0", features = ["derive", "lazy"] }
+serde = { version = "*", features = ["derive"] }
+deltalake = { version = "*", features = ["azure", "s3", "gcs"]}
+tokio = { version = "*", features = ["rt-multi-thread"] }
 thiserror = { version = "1" }
 
 
