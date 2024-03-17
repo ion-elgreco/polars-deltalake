@@ -55,6 +55,31 @@ def test_roundtrip_read_filter(tmp_path, data_batch_1: pl.DataFrame):
 
 
 def test_roundtrip_read_partitioned(tmp_path, data_batch_1: pl.DataFrame):
+    """Checks if partition dtypes are using the delta types, Polars inference of hive
+    parition dtypes is not always correct."""
+    data_batch_1.write_delta(
+        tmp_path,
+        mode="append",
+        delta_write_options={"partition_by": ["bar"]},
+    )
+
+    result = pldl.scan_delta(str(tmp_path)).collect()
+
+    assert_frame_equal(
+        result, data_batch_1, check_row_order=False, check_column_order=False
+    )
+
+    data_batch_1.write_delta(tmp_path, mode="append")
+    result = pldl.scan_delta(str(tmp_path)).collect()
+    assert_frame_equal(
+        result,
+        pl.concat([data_batch_1] * 2),
+        check_row_order=False,
+        check_column_order=False,
+    )
+
+
+def test_roundtrip_read_partitioned_dtypes(tmp_path, data_batch_1: pl.DataFrame):
     data_batch_1.write_delta(
         tmp_path,
         mode="append",

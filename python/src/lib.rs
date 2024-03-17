@@ -3,9 +3,13 @@
 mod error;
 use arrow_schema::Schema as ArrowSchema;
 use deltalake::kernel::ReaderFeatures;
+use deltalake::DeltaTableError;
 use error::PythonError;
 use polars::io::cloud::CloudOptions;
 use polars::io::parquet::ParallelStrategy;
+use polars::prelude::Schema as PolarsSchema;
+use polars_arrow::datatypes::ArrowSchema as PolarsArrowSchema;
+use polars_arrow::datatypes::Field;
 use polars_lazy::dsl::functions::concat_lf_diagonal;
 use polars_lazy::dsl::UnionArgs;
 use polars_lazy::frame::ScanArgsParquet;
@@ -60,6 +64,10 @@ fn custom_scan_delta(
             return Err(PyNotImplementedError::new_err(
                 "Deletion Vectors are not supported yet.",
             ));
+        } else if features.contains(&ReaderFeatures::ColumnMapping) {
+            return Err(PyNotImplementedError::new_err(
+                "Column Mapping is not supported yet.",
+            ));
         }
     }
     let file_paths = table
@@ -75,6 +83,16 @@ fn custom_scan_delta(
         .clone();
 
     let hive_partitioning = !partition_cols.is_empty();
+
+    let schema: ArrowSchema = table
+        .snapshot()
+        .map_err(PythonError::from)?
+        .schema()
+        .try_into()
+        .map_err(|_| {
+            DeltaTableError::Generic("can't convert Delta schema into Arrow schema".to_string())
+        })
+        .map_err(PythonError::from)?;
 
     let cloud_options = storage_options
         .map(|opts| CloudOptions::from_untyped_config(&uri, &opts))
@@ -105,7 +123,7 @@ fn custom_scan_delta(
         })
         .try_collect::<Vec<_>>();
 
-    let final_frame = concat_lf_diagonal(
+    let mut final_frame = concat_lf_diagonal(
         frames.map_err(PyPolarsErr::from)?,
         UnionArgs {
             rechunk: false,
@@ -114,6 +132,23 @@ fn custom_scan_delta(
         },
     )
     .map_err(PyPolarsErr::from)?;
+
+    let polars_arrow_schema: PolarsArrowSchema = schema
+        .fields()
+        .iter()
+        .map(|f| (*f).clone().into())
+        .collect::<Vec<Field>>()
+        .into();
+    let polars_schema: PolarsSchema = polars_arrow_schema.clone().into();
+
+    final_frame = final_frame.cast(
+        polars_schema
+            .iter()
+            .map(|(field, dtype)| (field.as_str(), dtype.to_owned()))
+            .collect(),
+        true,
+    );
+
     Ok(PyLazyFrame(final_frame))
 }
 
