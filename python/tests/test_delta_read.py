@@ -54,7 +54,7 @@ def test_roundtrip_read_filter(tmp_path, data_batch_1: pl.DataFrame):
     assert_frame_equal(result, pl.concat([data_batch_1] * 2).filter(pl.col("foo") > 5))
 
 
-def test_roundtrip_read_partitioned(tmp_path, data_batch_1: pl.DataFrame):
+def test_roundtrip_read_partitioned_dtypes(tmp_path, data_batch_1: pl.DataFrame):
     """Checks if partition dtypes are using the delta types, Polars inference of hive
     parition dtypes is not always correct."""
     data_batch_1.write_delta(
@@ -79,7 +79,7 @@ def test_roundtrip_read_partitioned(tmp_path, data_batch_1: pl.DataFrame):
     )
 
 
-def test_roundtrip_read_partitioned_dtypes(tmp_path, data_batch_1: pl.DataFrame):
+def test_roundtrip_read_partitioned(tmp_path, data_batch_1: pl.DataFrame):
     data_batch_1.write_delta(
         tmp_path,
         mode="append",
