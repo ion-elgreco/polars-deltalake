@@ -3,6 +3,7 @@
 mod error;
 use arrow_schema::Schema as ArrowSchema;
 use deltalake::kernel::ReaderFeatures;
+use deltalake::parquet::file;
 use deltalake::DeltaTableError;
 use error::PythonError;
 use polars::io::cloud::CloudOptions;
@@ -103,32 +104,18 @@ fn custom_scan_delta(
             options
         });
 
-    let frames = file_paths
-        .iter()
-        .map(|path| {
-            LazyFrame::scan_parquet(
-                path,
-                ScanArgsParquet {
-                    n_rows: None,
-                    cache: true,
-                    parallel: ParallelStrategy::Auto,
-                    rechunk: false,
-                    row_index: None,
-                    low_memory,
-                    cloud_options: cloud_options.clone(),
-                    use_statistics,
-                    hive_partitioning,
-                },
-            )
-        })
-        .try_collect::<Vec<_>>();
-
-    let mut final_frame = concat_lf_diagonal(
-        frames.map_err(PyPolarsErr::from)?,
-        UnionArgs {
+    let mut df = LazyFrame::scan_parquet_files(
+        file_paths.into(),
+        ScanArgsParquet {
+            n_rows: None,
+            cache: true,
+            parallel: ParallelStrategy::Auto,
             rechunk: false,
-            parallel: true,
-            ..Default::default()
+            row_index: None,
+            low_memory,
+            cloud_options: cloud_options.clone(),
+            use_statistics,
+            hive_partitioning,
         },
     )
     .map_err(PyPolarsErr::from)?;
@@ -141,7 +128,7 @@ fn custom_scan_delta(
         .into();
     let polars_schema: PolarsSchema = polars_arrow_schema.clone().into();
 
-    final_frame = final_frame.cast(
+    df = df.cast(
         polars_schema
             .iter()
             .map(|(field, dtype)| (field.as_str(), dtype.to_owned()))
@@ -149,7 +136,7 @@ fn custom_scan_delta(
         true,
     );
 
-    Ok(PyLazyFrame(final_frame))
+    Ok(PyLazyFrame(df))
 }
 
 #[pymodule]
