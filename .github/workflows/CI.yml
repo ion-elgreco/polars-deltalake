@@ -33,7 +33,7 @@ jobs:
         working-directory: python
       - run: .venv/bin/python -m pytest .
         working-directory: python
-      - run: .venv/bin/python -m black --check .
+      - run: .venv/bin/python -m ruff format --check .
         working-directory: python
       - run: .venv/bin/python -m mypy polars_deltalake
         working-directory: python

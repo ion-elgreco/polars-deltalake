@@ -2,7 +2,7 @@ import polars as pl
 import pytest
 import polars_deltalake as pldl
 from polars.testing import assert_frame_equal
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @pytest.fixture()
@@ -12,7 +12,7 @@ def data_batch_1():
             "foo": [1, 2, 3, 4, 5, 6, 7, 8, 9],
             "bar": ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
             "datetime": [datetime(2010, 1, 1)] * 9,
-            # "datetime_tz": [datetime(2010, 1, 1, tzinfo=timezone.utc)] * 9, # TODO: uncomment when delta-rs 0.17.2
+            "datetime_tz": [datetime(2010, 1, 1, tzinfo=timezone.utc)] * 9,
             "date_month": [
                 201001,
                 201002,

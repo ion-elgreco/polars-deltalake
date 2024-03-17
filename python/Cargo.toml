@@ -1,6 +1,6 @@
 [package]
 name = "polars_deltalake"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -12,8 +12,9 @@ polars = { version = "0.38.2", features = ["parquet", "cloud", "azure", "aws", "
 polars-lazy ={ version = "0.38.2",  features = ["parquet","cloud", "async", "diagonal_concat"]}
 polars-plan = {version = "0.38.2", features = ["parquet","cloud", "async"]}
 polars-arrow = {version = "0.38.2", features = ["arrow_rs"]}
-arrow-schema ={ version = "*"}
-pyo3 = { version = "0.20.3", features = ["extension-module"] }
+arrow-schema ={ version = "50.0.0"}
+arrow-array = { version = "50.0.0", features = ["chrono-tz"]}
+pyo3 = { version = "0.20.3", features = ["extension-module", "abi3", "abi3-py38"] }
 pyo3-polars = { version = "0.12.0", features = ["derive", "lazy"] }
 serde = { version = "*", features = ["derive"] }
 deltalake = { version = "0.17.1", features = ["azure", "s3", "gcs"]}
