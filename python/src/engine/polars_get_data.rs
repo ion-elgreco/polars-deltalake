@@ -14,8 +14,6 @@
 use delta_kernel::{engine_data::{GetData, ListItem}, DeltaResult};
 use polars::{prelude::{BooleanChunked, Int32Chunked, Int64Chunked, ListChunked, StringChunked}, series::IntoSeries};
 
-use super::polars_data::PolarsListSeries;
-
 
 pub struct WrappedBooleanChunked<'a> {
     pub inner: &'a BooleanChunked
@@ -104,8 +102,7 @@ impl<'a> GetData<'a> for WrappedTuple {
         (get_bool, bool),
         (get_int, i32),
         (get_long, i64),
-        (get_str, &'a str)
-        // (get_list, ListItem<'a>),
-        // (get_map, MapItem<'a>)
+        (get_str, &'a str),
+        (get_list, ListItem<'a>)
     );
 }
