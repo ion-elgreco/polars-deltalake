@@ -1,20 +1,27 @@
-use delta_kernel::engine_data::{EngineData, EngineList, EngineMap, GetData,};
-use delta_kernel::schema::{DataType as DeltaKernelDataType, PrimitiveType, Schema, SchemaRef, StructField};
+use delta_kernel::engine_data::{EngineData, EngineList, EngineMap, GetData};
+use delta_kernel::schema::{
+    DataType as DeltaKernelDataType, PrimitiveType, Schema, SchemaRef, StructField,
+};
 use delta_kernel::{DataVisitor, DeltaResult, Error};
 
+use crate::engine::polars_get_data::{
+    WrappedBooleanChunked, WrappedInt32Chunked, WrappedInt64Chunked, WrappedStringChunked,
+    WrappedTuple,
+};
 use polars::chunked_array::ChunkedArray;
+use polars::datatypes::DataType;
 use polars::error::polars_bail;
 use polars::frame::DataFrame;
-use polars::prelude::{GetAnyValue, LargeStringArray, PolarsDataType, StringChunked, StructChunked};
-use polars::datatypes::DataType;
+use polars::prelude::{
+    GetAnyValue, LargeStringArray, PolarsDataType, StringChunked, StructChunked,
+};
 use polars::series::{IntoSeries, Series};
 use polars_arrow::array::{Array, GenericBinaryArray, MapArray, Utf8Array};
+use polars_arrow::compute::cast::{self, CastOptionsImpl};
+use polars_arrow::datatypes::ArrowDataType;
 use pyo3_polars::export::polars_core::utils::Container;
 use std::any::Any;
 use std::borrow::Borrow;
-use polars_arrow::datatypes::ArrowDataType;
-use polars_arrow::compute::cast::{self, CastOptionsImpl};
-use crate::engine::polars_get_data::{WrappedBooleanChunked, WrappedInt32Chunked, WrappedInt64Chunked, WrappedStringChunked, WrappedTuple};
 
 use super::polars_delta_conversion::DeltaDataType;
 use super::polars_get_data::PolarsListChunked;
@@ -95,7 +102,6 @@ impl From<Box<PolarsEngineData>> for DataFrame {
     }
 }
 
-
 /// This is a trait that allows us to query something by column name and get out an Arrow
 /// `Array`. Both `RecordBatch` and `StructArray` can do this. By having our `extract_*` functions
 /// just take anything that implements this trait we can use the same function to drill into
@@ -108,15 +114,13 @@ trait ProvidesColumnByName {
 impl ProvidesColumnByName for DataFrame {
     fn column_by_name(&self, name: &str) -> Option<&Series> {
         let index = self.get_column_index(name);
-        index.map(|v|self.get_columns().get(v)).flatten()
+        index.map(|v| self.get_columns().get(v)).flatten()
     }
 }
 
 impl ProvidesColumnByName for StructChunked {
     fn column_by_name(&self, name: &str) -> Option<&Series> {
-        self.fields()
-            .iter()
-            .find(|s| s.name() == name)
+        self.fields().iter().find(|s| s.name() == name)
     }
 }
 
@@ -127,27 +131,28 @@ impl ProvidesColumnByName for StructChunked {
 impl EngineList for PolarsListChunked<'_> {
     fn len(&self, row_index: usize) -> usize {
         // Verify syntax
-        self.inner
-            .get(row_index)
-            .map(|v|v.len())
-            .unwrap_or(0)
+        self.inner.get(row_index).map(|v| v.len()).unwrap_or(0)
     }
 
     fn get(&self, row_index: usize, index: usize) -> String {
-        let arry: Option<Box<dyn Array>>= self.inner
-            .get(row_index);
-        
+        let arry: Option<Box<dyn Array>> = self.inner.get(row_index);
 
         let nested_arry = match arry {
-            Some(arr) => {Some(
+            Some(arr) => {
+                Some(
                     cast::cast(&*arr, &ArrowDataType::LargeUtf8, CastOptionsImpl::default())
-                    .expect("Couldn't cast nested array to String Array")
-                .as_any()
-                .downcast_ref::<LargeStringArray>().cloned() // Must be some way to avoid a clone and  cast to String more efficiently
-            )},
-            _ =>  None,
-        }.flatten();
-        nested_arry.map(|arr| arr.value(index).to_string()).unwrap_or("None".to_string())
+                        .expect("Couldn't cast nested array to String Array")
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .cloned(), // Must be some way to avoid a clone and  cast to String more efficiently
+                )
+            }
+            _ => None,
+        }
+        .flatten();
+        nested_arry
+            .map(|arr| arr.value(index).to_string())
+            .unwrap_or("None".to_string())
     }
 
     fn materialize(&self, row_index: usize) -> Vec<String> {
@@ -238,7 +243,7 @@ impl PolarsEngineData {
                     Self::extract_columns_from_array(out_col_array, inner_struct.as_ref(), None)?;
                 } else {
                     debug!("Pushing a null field for {}", field.name);
-                    out_col_array.push(&WrappedTuple{inner:()});
+                    out_col_array.push(&WrappedTuple { inner: () });
                 }
             } else {
                 return Err(Error::MissingData(format!(
@@ -253,7 +258,7 @@ impl PolarsEngineData {
     fn extract_column<'a>(
         out_col_array: &mut Vec<&dyn GetData<'a>>,
         field: &StructField,
-        col: &'a Series
+        col: &'a Series,
     ) -> DeltaResult<()> {
         match (col.dtype(), &field.data_type) {
             (&DataType::Struct(ref f), DeltaKernelDataType::Struct(fields)) => {
@@ -267,30 +272,38 @@ impl PolarsEngineData {
             }
             (&DataType::Boolean, &DeltaKernelDataType::Primitive(PrimitiveType::Boolean)) => {
                 debug!("Pushing boolean array for {}", field.name);
-                let ca = WrappedBooleanChunked { inner: col.bool().unwrap()};
+                let ca = WrappedBooleanChunked {
+                    inner: col.bool().unwrap(),
+                };
                 out_col_array.push(&ca);
             }
             (&DataType::String, &DeltaKernelDataType::Primitive(PrimitiveType::String)) => {
                 debug!("Pushing string array for {}", field.name);
-                let ca = WrappedStringChunked { inner: col.str().unwrap()};
+                let ca = WrappedStringChunked {
+                    inner: col.str().unwrap(),
+                };
                 out_col_array.push(&ca);
             }
             (&DataType::Int32, &DeltaKernelDataType::Primitive(PrimitiveType::Integer)) => {
                 debug!("Pushing int32 array for {}", field.name);
-                let ca: WrappedInt32Chunked = WrappedInt32Chunked{inner: col.i32().unwrap()};
+                let ca: WrappedInt32Chunked = WrappedInt32Chunked {
+                    inner: col.i32().unwrap(),
+                };
                 out_col_array.push(&ca);
             }
             (&DataType::Int64, &DeltaKernelDataType::Primitive(PrimitiveType::Long)) => {
                 debug!("Pushing int64 array for {}", field.name);
-                let ca = WrappedInt64Chunked{inner: col.i64().unwrap()};
+                let ca = WrappedInt64Chunked {
+                    inner: col.i64().unwrap(),
+                };
                 out_col_array.push(&ca);
             }
             (DataType::List(arrow_field), DeltaKernelDataType::Array(_array_type)) => {
                 match arrow_field.clone().implode() {
                     DataType::String => {
                         debug!("Pushing list for {}", field.name);
-                        let list= col.list().unwrap();
-                        let ca = PolarsListChunked { inner: list};
+                        let list = col.list().unwrap();
+                        let ca = PolarsListChunked { inner: list };
                         out_col_array.push(&ca);
                     }
                     _ => {
@@ -301,8 +314,10 @@ impl PolarsEngineData {
                     }
                 }
             }
-            (_, &DeltaKernelDataType::Map(_)) => {    
-                return Err(Error::unexpected_column_type("Polars doesn't support map types"))
+            (_, &DeltaKernelDataType::Map(_)) => {
+                return Err(Error::unexpected_column_type(
+                    "Polars doesn't support map types",
+                ))
             }
             (polars_datatype, data_type) => {
                 warn!(

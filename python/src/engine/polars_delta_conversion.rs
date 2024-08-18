@@ -1,12 +1,16 @@
 //! Conversions from delta types to polars types
 
-use polars::prelude::{Schema as PolarsSchema, DataType as PolarsDataType, Field as PolarsField, TimeUnit};
+use polars::prelude::{
+    DataType as PolarsDataType, Field as PolarsField, Schema as PolarsSchema, TimeUnit,
+};
 use polars_arrow::legacy::error::{PolarsError, PolarsResult};
 
 use itertools::Itertools;
 
 use delta_kernel::error::Error;
-use delta_kernel::schema::{ArrayType, DataType as DeltaKernelDataType, MapType, PrimitiveType, StructField, StructType};
+use delta_kernel::schema::{
+    ArrayType, DataType as DeltaKernelDataType, MapType, PrimitiveType, StructField, StructType,
+};
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
 pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
@@ -91,32 +95,34 @@ impl TryFrom<DeltaStructField> for PolarsField {
             f.inner.name(),
             PolarsDataType::try_from(DeltaDataType {
                 inner: f.inner.data_type().to_owned(),
-            })?
+            })?,
         );
 
         Ok(field)
     }
 }
 
-
 impl TryFrom<PolarsField> for DeltaStructField {
     type Error = PolarsError;
 
     fn try_from(f: PolarsField) -> PolarsResult<Self> {
-        let delta_datatype: DeltaDataType = f.data_type().try_into()?; 
-        let field = DeltaStructField { inner: StructField::new(f.name, delta_datatype.inner, true)};
+        let delta_datatype: DeltaDataType = f.data_type().try_into()?;
+        let field = DeltaStructField {
+            inner: StructField::new(f.name, delta_datatype.inner, true),
+        };
 
         Ok(field)
     }
 }
 
-
-
 impl TryFrom<&DeltaArrayType> for PolarsDataType {
     type Error = PolarsError;
 
     fn try_from(a: &DeltaArrayType) -> PolarsResult<Self> {
-        let inner_type = DeltaDataType {inner: a.inner.element_type().clone()}.try_into()?;
+        let inner_type = DeltaDataType {
+            inner: a.inner.element_type().clone(),
+        }
+        .try_into()?;
         Ok(PolarsDataType::List(Box::new(inner_type)))
     }
 }
@@ -133,7 +139,9 @@ impl TryFrom<&DeltaMapType> for PolarsField {
     type Error = PolarsError;
 
     fn try_from(_: &DeltaMapType) -> PolarsResult<Self> {
-        Err(PolarsError::ComputeError("Map type is not supported by polars".into()))
+        Err(PolarsError::ComputeError(
+            "Map type is not supported by polars".into(),
+        ))
     }
 }
 
@@ -164,7 +172,10 @@ impl TryFrom<DeltaDataType> for PolarsDataType {
                     PrimitiveType::Decimal(precision, scale) => {
                         PrimitiveType::check_decimal(precision, scale)
                             .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
-                        Ok(PolarsDataType::Decimal(Some(precision as usize), Some(scale as usize)))
+                        Ok(PolarsDataType::Decimal(
+                            Some(precision as usize),
+                            Some(scale as usize),
+                        ))
                     }
                     PrimitiveType::Date => {
                         // A calendar date, represented as a year-month-day triple without a
@@ -187,10 +198,10 @@ impl TryFrom<DeltaDataType> for PolarsDataType {
                     .collect::<Result<Vec<PolarsField>, PolarsError>>()?
                     .into(),
             )),
-            DeltaKernelDataType::Array(a) => Ok(
-                DeltaArrayType { inner: *a }.try_into()?,
-            ),
-            DeltaKernelDataType::Map(_) => Err(PolarsError::ComputeError("Map type is not supported by polars".into())),
+            DeltaKernelDataType::Array(a) => Ok(DeltaArrayType { inner: *a }.try_into()?),
+            DeltaKernelDataType::Map(_) => Err(PolarsError::ComputeError(
+                "Map type is not supported by polars".into(),
+            )),
         }
     }
 }
@@ -199,7 +210,8 @@ impl TryFrom<&PolarsSchema> for DeltaStructType {
     type Error = PolarsError;
 
     fn try_from(polars_schema: &PolarsSchema) -> PolarsResult<Self> {
-        let new_fields: Vec<DeltaStructField> = polars_schema.iter_fields()
+        let new_fields: Vec<DeltaStructField> = polars_schema
+            .iter_fields()
             .map(|field| TryInto::<DeltaStructField>::try_into(field))
             .collect::<Result<Vec<_>, _>>()?;
         let fields = new_fields
@@ -217,11 +229,7 @@ impl TryFrom<&PolarsField> for DeltaStructField {
 
     fn try_from(polars_field: &PolarsField) -> PolarsResult<Self> {
         let delta_type: DeltaDataType = polars_field.data_type().try_into()?;
-        let inner_struct = StructField::new(
-            polars_field.name.clone(),
-            delta_type.inner,
-            true
-        );
+        let inner_struct = StructField::new(polars_field.name.clone(), delta_type.inner, true);
         Ok(DeltaStructField::new(inner_struct))
     }
 }
@@ -231,19 +239,39 @@ impl TryFrom<&PolarsDataType> for DeltaDataType {
 
     fn try_from(polars_datatype: &PolarsDataType) -> PolarsResult<Self> {
         match polars_datatype {
-            PolarsDataType::String => Ok(DeltaKernelDataType::Primitive(PrimitiveType::String).into()),
+            PolarsDataType::String => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::String).into())
+            }
             PolarsDataType::Int64 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Long).into()), // undocumented type
-            PolarsDataType::Int32 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Integer).into()),
-            PolarsDataType::Int16 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Short).into()),
+            PolarsDataType::Int32 => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::Integer).into())
+            }
+            PolarsDataType::Int16 => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::Short).into())
+            }
             PolarsDataType::Int8 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Byte).into()),
-            PolarsDataType::UInt64 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Long).into()), // undocumented type
-            PolarsDataType::UInt32 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Integer).into()),
-            PolarsDataType::UInt16 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Short).into()),
+            PolarsDataType::UInt64 => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::Long).into())
+            } // undocumented type
+            PolarsDataType::UInt32 => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::Integer).into())
+            }
+            PolarsDataType::UInt16 => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::Short).into())
+            }
             PolarsDataType::UInt8 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Byte).into()),
-            PolarsDataType::Float32 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Float).into()),
-            PolarsDataType::Float64 => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Double).into()),
-            PolarsDataType::Boolean => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Boolean).into()),
-            PolarsDataType::Binary => Ok(DeltaKernelDataType::Primitive(PrimitiveType::Binary).into()),
+            PolarsDataType::Float32 => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::Float).into())
+            }
+            PolarsDataType::Float64 => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::Double).into())
+            }
+            PolarsDataType::Boolean => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::Boolean).into())
+            }
+            PolarsDataType::Binary => {
+                Ok(DeltaKernelDataType::Primitive(PrimitiveType::Binary).into())
+            }
             PolarsDataType::Decimal(p, s) => {
                 if s.unwrap_or(0) < 0 {
                     return Err(PolarsError::ComputeError(
@@ -278,10 +306,9 @@ impl TryFrom<&PolarsDataType> for DeltaDataType {
                 )))
                 .into())
             }
-            PolarsDataType::List(inner_dtype) => Ok(DeltaKernelDataType::Array(Box::new(ArrayType::new(
-                DeltaDataType::try_from(inner_dtype.as_ref())?.inner,
-                true,
-            )))
+            PolarsDataType::List(inner_dtype) => Ok(DeltaKernelDataType::Array(Box::new(
+                ArrayType::new(DeltaDataType::try_from(inner_dtype.as_ref())?.inner, true),
+            ))
             .into()),
             s => Err(PolarsError::SchemaMismatch(
                 format!("Invalid data type for Delta Lake: {:?}", s)
