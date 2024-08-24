@@ -17,8 +17,8 @@ pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
 pub(crate) const MAP_KEY_DEFAULT: &str = "key";
 pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
 
-struct DeltaStructType {
-    inner: StructType,
+pub struct DeltaStructType {
+    pub inner: StructType,
 }
 
 struct DeltaMapType {

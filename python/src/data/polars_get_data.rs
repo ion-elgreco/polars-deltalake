@@ -1,16 +1,3 @@
-// use arrow_array::{
-//     types::{GenericStringType, Int32Type, Int64Type},
-//     Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
-//     PrimitiveArray,
-// };
-
-// use crate::{
-//     engine_data::{GetData, ListItem, MapItem},
-//     DeltaResult,
-// };
-
-// actual impls (todo: could macro these)
-
 use delta_kernel::{
     engine_data::{GetData, ListItem},
     DeltaResult,

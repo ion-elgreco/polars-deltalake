@@ -4,12 +4,10 @@ use delta_kernel::schema::{
 };
 use delta_kernel::{DataVisitor, DeltaResult, Error};
 
-use crate::engine::polars_get_data::WrappedValue;
+use super::polars_get_data::WrappedValue;
 use polars::datatypes::DataType;
 use polars::frame::DataFrame;
-use polars::prelude::{
-    LargeStringArray,StructChunked,
-};
+use polars::prelude::{LargeStringArray, StructChunked};
 use polars::series::Series;
 use polars_arrow::compute::cast::{self, CastOptionsImpl};
 use polars_arrow::datatypes::ArrowDataType;
@@ -18,18 +16,6 @@ use std::any::Any;
 
 use super::polars_delta_conversion::DeltaDataType;
 use tracing::{debug, warn};
-/// convenient way to return an error if a condition isn't true
-macro_rules! require {
-    ( $cond:expr, $err:expr ) => {
-        if !($cond) {
-            return Err($err);
-        }
-    };
-}
-
-// pub struct PolarsMapArray {
-//     inner: MapArray
-// }
 
 /// PolarsEngineData holds an Arrow RecordBatch, implements `EngineData` so the kernel can extract from it.
 pub struct PolarsEngineData {
@@ -61,7 +47,7 @@ impl EngineData for PolarsEngineData {
         let mut col_array: Vec<&dyn GetData> = vec![];
         let mut wrapped_value_arr: Vec<WrappedValue> = vec![];
         self.extract_columns(&mut wrapped_value_arr, &schema)?;
-        
+
         for item in wrapped_value_arr.iter() {
             col_array.push(item)
         }
@@ -162,42 +148,6 @@ impl EngineList for WrappedValue<'_> {
         result
     }
 }
-
-// ///  POLARS HASN'T FULLY IMPLEMENTED MAP IN POLARS_ARROW, NOR IN THE FRONT FACING API
-// impl EngineMap for PolarsSeries {
-//     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
-//         unimplemented!();
-//     //     let offsets = self.inner.offsets();
-//     //     let start_offset = offsets[row_index] as usize;
-//     //     let count = offsets[row_index + 1] as usize - start_offset;
-//     //     let keys = self.inner.keys().as_string::<i32>();
-//     //     for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
-//     //         if let Some(map_key) = map_key {
-//     //             if key == map_key {
-//     //                 // found the item
-//     //                 let vals = self.inner.values().as_string::<i32>();
-//     //                 return Some(vals.value(idx));
-//     //             }
-//     //         }
-//     //     }
-//     //     None
-//     }
-
-//     fn materialize(&self, row_index: usize) -> HashMap<String, String> {
-//         unimplemented!();
-//     //     let mut ret = HashMap::new();
-//     //     let map_val = self.value(row_index);
-//     //     let keys = map_val.column(0).as_string::<i32>();
-//     //     let values = map_val.column(1).as_string::<i32>();
-//     //     for (key, value) in keys.iter().zip(values.iter()) {
-//     //         if let (Some(key), Some(value)) = (key, value) {
-//     //             ret.insert(key.into(), value.into());
-//     //         }
-//     //     }
-//     //     ret
-//     // }
-//     }
-// }
 
 impl PolarsEngineData {
     /// Extracts an exploded view (all leaf values), in schema order of that data contained
