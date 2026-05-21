@@ -89,6 +89,21 @@ impl LogicalScanIter {
         let file_col = df
             .column(FILE_ID_COL)
             .map_err(|e| delta_kernel::Error::Generic(format!("file-id column missing: {e}")))?;
+
+        // Single-file batch: skip the per-row `rle` pass.
+        let file_str = file_col
+            .str()
+            .map_err(|e| delta_kernel::Error::Generic(format!("file-id column not Utf8: {e}")))?;
+        if let Some(first) = file_str.get(0)
+            && Some(first) == file_str.get(df.height() - 1)
+        {
+            // `first` borrows df; own only on the fast path so we can move df.
+            let file_id = first.to_owned();
+            let out = self.apply_rewrite(&file_id, df);
+            self.pending.push_back(out);
+            return Ok(());
+        }
+
         let runs = polars::prelude::rle(file_col).map_err(|e| {
             delta_kernel::Error::Generic(format!("rle on file-id column failed: {e}"))
         })?;
