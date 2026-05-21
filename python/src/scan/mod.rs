@@ -30,11 +30,19 @@ pub(crate) use read::{build_lazy_scan, select_exprs_for_schema};
 use logical::LogicalScanIter;
 use plan::{ResolvedScan, resolve_scan};
 use predicate::{
-    conjunction, extract_expr_via_json, flatten_and_conjuncts, has_column_mapping,
-    predicate_only_touches_data_columns, rewrite_predicate_to_physical,
+    conjunction, extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
+    has_column_mapping, predicate_only_touches_data_columns, rewrite_predicate_to_physical,
+    touches_partition_only,
 };
 
 type BatchIter = Box<dyn Iterator<Item = Result<DataFrame, delta_kernel::Error>> + Send>;
+
+struct Conjunct {
+    expr: Expr,
+    /// Kernel-translatable: cached from `configure` so `build_iter` doesn't
+    /// re-run `polars_expr_to_kernel_predicate` every scan.
+    kernel_translatable: bool,
+}
 
 // `unsendable` because the scan iterator is `Send` but not `Sync`; Python
 // only ever drives this from a single thread anyway (the one that holds the
@@ -48,8 +56,9 @@ pub struct DeltaSource {
     n_rows: Option<usize>,
     /// File-level stats skipping in kernel.
     kernel_predicate: Option<PredicateRef>,
-    /// User predicate, pre-split at top-level `AND`. Empty when unset.
-    original_predicate: Vec<Expr>,
+    /// User predicate, pre-split at top-level `AND`, each tagged with whether
+    /// it was kernel-translatable. Empty when unset.
+    original_predicate: Vec<Conjunct>,
     iter: Option<BatchIter>,
     rows_emitted: usize,
 }
@@ -88,14 +97,16 @@ impl DeltaSource {
             }
             Some(p) => {
                 let expr = extract_expr_via_json(&p)?;
-                let conjuncts: Vec<Expr> =
-                    flatten_and_conjuncts(&expr).into_iter().cloned().collect();
                 // Per-conjunct so one untranslatable term doesn't disable
                 // file-skipping for its siblings.
-                let translated: Vec<Predicate> = conjuncts
-                    .iter()
-                    .filter_map(|c| match polars_expr_to_kernel_predicate(c) {
-                        Some(kp) => Some(kp),
+                let mut translated: Vec<Predicate> = Vec::new();
+                let mut conjuncts: Vec<Conjunct> = Vec::new();
+                for c in flatten_and_conjuncts(&expr) {
+                    let kernel_translatable = match polars_expr_to_kernel_predicate(c) {
+                        Some(kp) => {
+                            translated.push(kp);
+                            true
+                        }
                         None => {
                             tracing::debug!(
                                 target: "polars_deltalake::pushdown",
@@ -103,10 +114,14 @@ impl DeltaSource {
                                 "conjunct not translatable to kernel; \
                                  relying on polars-io / Python-side filter",
                             );
-                            None
+                            false
                         }
-                    })
-                    .collect();
+                    };
+                    conjuncts.push(Conjunct {
+                        expr: c.clone(),
+                        kernel_translatable,
+                    });
+                }
                 self.kernel_predicate =
                     (!translated.is_empty()).then(|| Arc::new(Predicate::and_from(translated)));
                 self.original_predicate = conjuncts;
@@ -186,33 +201,69 @@ impl DeltaSource {
             return Ok(());
         }
         let ResolvedScan {
-            paths,
-            rewrites,
-            path_index,
+            mut paths,
+            mut rewrites,
+            mut path_index,
+            partition_values,
         } = resolved;
 
         let physical_schema = scan.physical_schema().clone();
         let logical_schema = scan.logical_schema().clone();
         let select_exprs = select_exprs_for_schema(&physical_schema);
 
-        // Drop partition-touching conjuncts — they'd fail parquet column
-        // resolution. Python-side filter is the correctness backstop.
-        let polars_predicate: Option<Expr> = {
-            let column_mapped = has_column_mapping(self.snapshot.table_properties());
-            let logical_schema = self.snapshot.schema();
-            let survivors: Vec<Expr> = self
-                .original_predicate
-                .iter()
-                .filter_map(|c| {
-                    if column_mapped {
-                        rewrite_predicate_to_physical(c, &logical_schema, &physical_schema)
-                    } else {
-                        predicate_only_touches_data_columns(c, &physical_schema).then(|| c.clone())
+        let column_mapped = has_column_mapping(self.snapshot.table_properties());
+        let table_logical_schema = self.snapshot.schema();
+
+        // Partition-touching conjuncts can't go to polars-io — the parquet
+        // reader can't resolve those column names.
+        let mut data_conjuncts: Vec<Expr> = Vec::new();
+        let mut partition_skip_conjuncts: Vec<Expr> = Vec::new();
+        for c in &self.original_predicate {
+            let for_polars_io = if column_mapped {
+                rewrite_predicate_to_physical(&c.expr, &table_logical_schema, &physical_schema)
+            } else {
+                predicate_only_touches_data_columns(&c.expr, &physical_schema)
+                    .then(|| c.expr.clone())
+            };
+            if let Some(e) = for_polars_io {
+                data_conjuncts.push(e);
+            } else if !c.kernel_translatable
+                && touches_partition_only(&c.expr, &table_logical_schema, &physical_schema)
+            {
+                partition_skip_conjuncts.push(c.expr.clone());
+            }
+        }
+
+        if !partition_skip_conjuncts.is_empty() {
+            let surviving = file_skip_via_partition_eval(
+                &partition_skip_conjuncts,
+                &partition_values,
+                &table_logical_schema,
+            )?;
+            if surviving.len() < paths.len() {
+                let mut new_paths = Vec::with_capacity(surviving.len());
+                let mut new_rewrites = Vec::with_capacity(surviving.len());
+                let mut new_path_index = HashMap::with_capacity(surviving.len());
+                for (i, (path, rewrite)) in paths.into_iter().zip(rewrites.into_iter()).enumerate()
+                {
+                    if surviving.contains(&i) {
+                        new_path_index.insert(path.as_str().to_string(), new_paths.len());
+                        new_paths.push(path);
+                        new_rewrites.push(rewrite);
                     }
-                })
-                .collect();
-            conjunction(survivors)
-        };
+                }
+                paths = new_paths;
+                rewrites = new_rewrites;
+                path_index = new_path_index;
+            }
+            if paths.is_empty() {
+                self.iter = Some(Box::new(std::iter::empty()));
+                self.rows_emitted = 0;
+                return Ok(());
+            }
+        }
+
+        let polars_predicate: Option<Expr> = conjunction(data_conjuncts);
 
         let lazy = build_lazy_scan(
             paths,

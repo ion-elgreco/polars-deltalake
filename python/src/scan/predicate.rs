@@ -1,15 +1,17 @@
 //! Predicate plumbing: extract polars `Expr` from Python, split AND chains,
 //! detect column mapping, and rewrite logical → physical column names.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use delta_kernel::schema::{MetadataValue, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::table_properties::TableProperties;
-use polars::prelude::Expr;
+use polars::prelude::{Column, DataFrame, Expr, IntoLazy};
 use polars_plan::dsl::Operator;
 use polars_utils::pl_str::PlSmallStr;
 use pyo3::prelude::*;
+
+use crate::translation::schema::KernelDataTypeExt;
 
 /// Gnarly workaround:
 /// JSON instead of bincode: bincode encodes enum variants positionally, and
@@ -82,6 +84,79 @@ pub(crate) fn predicate_only_touches_data_columns(
     polars_plan::utils::expr_to_leaf_column_names(expr)
         .iter()
         .all(|n| phys_names.contains(n.as_str()))
+}
+
+/// Polars-driven partition pruning for predicates kernel can't translate
+/// (e.g. `partition_col.dt.year() == 2024`). Returns the indices of files
+/// whose partition values satisfy `partition_conjuncts`.
+pub(crate) fn file_skip_via_partition_eval(
+    partition_conjuncts: &[Expr],
+    partition_values: &[HashMap<String, String>],
+    logical_schema: &StructType,
+) -> anyhow::Result<HashSet<usize>> {
+    // BTreeSet for one-pass dedup with sorted iteration order.
+    const FILE_IDX_COL: &str = "__pldl_file_idx__";
+    let partition_cols: BTreeSet<&str> = partition_values
+        .iter()
+        .flat_map(|pv| pv.keys().map(String::as_str))
+        .collect();
+
+    let mut columns: Vec<Column> = Vec::with_capacity(partition_cols.len() + 1);
+    for name in &partition_cols {
+        let field = logical_schema
+            .field(name)
+            .ok_or_else(|| anyhow::anyhow!("partition column not in logical schema: {name}"))?;
+        let polars_dtype = field.data_type.to_polars()?;
+        let vals: Vec<Option<&str>> = partition_values
+            .iter()
+            .map(|pv| pv.get(*name).map(String::as_str))
+            .collect();
+        let col = Column::new(PlSmallStr::from_str(name), vals.as_slice())
+            .cast(&polars_dtype)
+            .map_err(|e| anyhow::anyhow!("cast partition col {name} to dtype: {e:#}"))?;
+        columns.push(col);
+    }
+    let idx_vals: Vec<u32> = (0..partition_values.len() as u32).collect();
+    columns.push(Column::new(
+        PlSmallStr::from_static(FILE_IDX_COL),
+        idx_vals.as_slice(),
+    ));
+
+    let df = DataFrame::new(partition_values.len(), columns)
+        .map_err(|e| anyhow::anyhow!("partition DF build: {e:#}"))?;
+    let pred = conjunction(partition_conjuncts.to_vec())
+        .ok_or_else(|| anyhow::anyhow!("file_skip_via_partition_eval: empty conjuncts"))?;
+    let surviving = df
+        .lazy()
+        .filter(pred)
+        .select([polars::prelude::col(PlSmallStr::from_static(FILE_IDX_COL))])
+        .collect()
+        .map_err(|e| anyhow::anyhow!("partition eval: {e:#}"))?;
+    let idx_col = surviving
+        .column(FILE_IDX_COL)
+        .map_err(|e| anyhow::anyhow!("missing file-idx col: {e:#}"))?;
+    let chunked = idx_col
+        .u32()
+        .map_err(|e| anyhow::anyhow!("file-idx col not u32: {e:#}"))?;
+    Ok(chunked.into_iter().flatten().map(|x| x as usize).collect())
+}
+
+/// Returns true iff `expr` references any column that is in `logical_schema`
+/// but not in `physical_schema` (i.e. a partition column). Used to gate
+/// untranslatable conjuncts for [`file_skip_via_partition_eval`].
+pub(crate) fn touches_partition_only(
+    expr: &Expr,
+    logical_schema: &StructType,
+    physical_schema: &StructType,
+) -> bool {
+    let phys_names: HashSet<&str> = physical_schema.fields().map(|f| f.name.as_str()).collect();
+    let logical_names: HashSet<&str> = logical_schema.fields().map(|f| f.name.as_str()).collect();
+    let referenced = polars_plan::utils::expr_to_leaf_column_names(expr);
+    !referenced.is_empty()
+        && referenced.iter().all(|n| {
+            let s = n.as_str();
+            logical_names.contains(s) && !phys_names.contains(s)
+        })
 }
 
 /// Only meaningful when column mapping is active — see [`has_column_mapping`].

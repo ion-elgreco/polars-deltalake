@@ -29,12 +29,6 @@ class Backend:
     storage_options: dict[str, str]
 
 
-# ---------------------------------------------------------------------------
-# Per-backend container fixtures (module-scoped; one container per backend
-# shared across all tests).
-# ---------------------------------------------------------------------------
-
-
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -184,11 +178,6 @@ def _gcs():
 @pytest.fixture(scope="module", params=["s3", "azure", "gcs"])
 def backend(request) -> Backend:
     return request.getfixturevalue(f"_{request.param}")
-
-
-# ---------------------------------------------------------------------------
-# Tests — each runs once per backend (parametrized via `backend`).
-# ---------------------------------------------------------------------------
 
 
 def test_write_then_read(backend: Backend):

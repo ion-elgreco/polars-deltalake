@@ -35,6 +35,9 @@ pub(crate) struct ResolvedScan {
     pub(crate) paths: Vec<PlRefPath>,
     /// Parallel to `paths`.
     pub(crate) rewrites: Vec<LogicalRewrite>,
+    /// Parallel to `paths`. Used for predicate-driven file skipping via
+    /// polars (untranslatable partition conjuncts) before the bulk read.
+    pub(crate) partition_values: Vec<HashMap<String, String>>,
     /// `FILE_ID_COL` value (= `PlRefPath::as_str()`) → index in `paths` /
     /// `rewrites`.
     pub(crate) path_index: HashMap<String, usize>,
@@ -52,6 +55,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
         table_root: &'a Url,
         paths: Vec<PlRefPath>,
         rewrites: Vec<LogicalRewrite>,
+        partition_values: Vec<HashMap<String, String>>,
         path_index: HashMap<String, usize>,
         err: Option<delta_kernel::Error>,
     }
@@ -83,6 +87,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
             transform: scan_file.transform,
             dv,
         });
+        ctx.partition_values.push(scan_file.partition_values);
         Ok(())
     }
 
@@ -103,6 +108,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
         table_root: &table_root,
         paths: Vec::new(),
         rewrites: Vec::new(),
+        partition_values: Vec::new(),
         path_index: HashMap::new(),
         err: None,
     };
@@ -123,6 +129,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
     Ok(ResolvedScan {
         paths: ctx.paths,
         rewrites: ctx.rewrites,
+        partition_values: ctx.partition_values,
         path_index: ctx.path_index,
     })
 }
