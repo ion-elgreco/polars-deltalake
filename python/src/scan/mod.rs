@@ -240,26 +240,23 @@ impl DeltaSource {
                 &partition_values,
                 &table_logical_schema,
             )?;
-            if surviving.len() < paths.len() {
-                let mut new_paths = Vec::with_capacity(surviving.len());
-                let mut new_rewrites = Vec::with_capacity(surviving.len());
-                let mut new_path_index = HashMap::with_capacity(surviving.len());
-                for (i, (path, rewrite)) in paths.into_iter().zip(rewrites.into_iter()).enumerate()
-                {
-                    if surviving.contains(&i) {
-                        new_path_index.insert(path.as_str().to_string(), new_paths.len());
-                        new_paths.push(path);
-                        new_rewrites.push(rewrite);
-                    }
-                }
-                paths = new_paths;
-                rewrites = new_rewrites;
-                path_index = new_path_index;
-            }
-            if paths.is_empty() {
+            if surviving.is_empty() {
                 self.iter = Some(Box::new(std::iter::empty()));
                 self.rows_emitted = 0;
                 return Ok(());
+            }
+            if surviving.len() < paths.len() {
+                (paths, rewrites) = paths
+                    .into_iter()
+                    .zip(rewrites)
+                    .enumerate()
+                    .filter_map(|(i, pair)| surviving.contains(&i).then_some(pair))
+                    .unzip();
+                path_index = paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (p.as_str().to_string(), i))
+                    .collect();
             }
         }
 
