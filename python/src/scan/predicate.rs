@@ -14,6 +14,66 @@ use pyo3::prelude::*;
 use crate::scan::plan::ScanFileMeta;
 use crate::translation::schema::KernelDataTypeExt;
 
+/// A single conjunct of the user predicate, with its kernel-translatability
+/// cached so `build_iter` doesn't re-translate every scan.
+pub(crate) struct Conjunct {
+    pub(crate) expr: Expr,
+    pub(crate) kernel_translatable: bool,
+}
+
+/// Per-conjunct routing. Buckets are **non-disjoint** — a conjunct can
+/// appear in multiple buckets when several layers evaluate it. E.g. a
+/// translatable data conjunct is in both `kernel` (file-level stats) and
+/// `parquet_filter` (row-group + row).
+#[derive(Default)]
+pub(crate) struct ConjunctClassification {
+    /// Kernel `with_predicate` — file-level stats-based skipping. Every
+    /// kernel-translatable conjunct, regardless of which columns it touches.
+    pub(crate) kernel: Vec<Expr>,
+    /// Pushed to the parquet reader via `.filter` above `scan_parquet` —
+    /// row-group skipping + row-level filter. Rewritten to physical names
+    /// for column-mapped tables.
+    pub(crate) parquet_filter: Vec<Expr>,
+    /// Option-2 file pruning via polars eval on partition values.
+    pub(crate) partition_prune: Vec<Expr>,
+    /// Applied inside `LogicalScanIter` after `transform_to_logical`
+    /// materializes partition columns.
+    pub(crate) post_transform: Vec<Expr>,
+}
+
+/// Route each conjunct to the layer(s) that will evaluate it.
+pub(crate) fn classify_conjuncts(
+    conjuncts: &[Conjunct],
+    column_mapped: bool,
+    logical_schema: &StructType,
+    physical_schema: &StructType,
+) -> ConjunctClassification {
+    let mut out = ConjunctClassification::default();
+    for c in conjuncts {
+        if c.kernel_translatable {
+            out.kernel.push(c.expr.clone());
+        }
+        let partition_only = touches_partition_only(&c.expr, logical_schema, physical_schema);
+        let for_parquet = if column_mapped {
+            rewrite_predicate_to_physical(&c.expr, logical_schema, physical_schema)
+        } else {
+            predicate_only_touches_data_columns(&c.expr, physical_schema).then(|| c.expr.clone())
+        };
+        if let Some(e) = for_parquet {
+            out.parquet_filter.push(e);
+        } else if !c.kernel_translatable && partition_only {
+            out.partition_prune.push(c.expr.clone());
+        } else if !partition_only {
+            // Mixed atomic (touches partition + data) — kernel may best-effort
+            // file-skip, but rows in surviving files still need row-level eval
+            // once partition cols are materialized.
+            out.post_transform.push(c.expr.clone());
+        }
+        // Translatable + partition-only: kernel exact-skips, no further work.
+    }
+    out
+}
+
 /// Gnarly workaround:
 /// JSON instead of bincode: bincode encodes enum variants positionally, and
 /// our feature subset shifts `FunctionExpr` discriminants relative to the

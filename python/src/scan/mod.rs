@@ -30,19 +30,11 @@ pub(crate) use read::{build_lazy_scan, select_exprs_for_schema};
 use logical::LogicalScanIter;
 use plan::{ResolvedScan, resolve_scan};
 use predicate::{
-    conjunction, extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
-    has_column_mapping, predicate_only_touches_data_columns, rewrite_predicate_to_physical,
-    touches_partition_only,
+    Conjunct, classify_conjuncts, conjunction, extract_expr_via_json, file_skip_via_partition_eval,
+    flatten_and_conjuncts, has_column_mapping,
 };
 
 type BatchIter = Box<dyn Iterator<Item = Result<DataFrame, delta_kernel::Error>> + Send>;
-
-struct Conjunct {
-    expr: Expr,
-    /// Kernel-translatable: cached from `configure` so `build_iter` doesn't
-    /// re-run `polars_expr_to_kernel_predicate` every scan.
-    kernel_translatable: bool,
-}
 
 // `unsendable` because the scan iterator is `Send` but not `Sync`; Python
 // only ever drives this from a single thread anyway (the one that holds the
@@ -135,6 +127,38 @@ impl DeltaSource {
     fn next(&mut self) -> PyResult<Option<PyDataFrame>> {
         self.next_batch().map_err(py_err)
     }
+
+    /// Test / debug helper: classify a predicate by where each conjunct
+    /// would be routed, without running a scan
+    fn _classify_predicate(&self, predicate: Bound<'_, PyAny>) -> PyResult<HashMap<String, usize>> {
+        let expr = extract_expr_via_json(&predicate)?;
+        let conjuncts: Vec<Conjunct> = flatten_and_conjuncts(&expr)
+            .into_iter()
+            .map(|c| Conjunct {
+                expr: c.clone(),
+                kernel_translatable: polars_expr_to_kernel_predicate(c).is_some(),
+            })
+            .collect();
+        let scan = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            .build()
+            .map_err(|e| py_err(anyhow::anyhow!("failed to build scan: {e:#}")))?;
+        let logical_schema = self.snapshot.schema();
+        let routing = classify_conjuncts(
+            &conjuncts,
+            has_column_mapping(self.snapshot.table_properties()),
+            &logical_schema,
+            scan.physical_schema(),
+        );
+        Ok(HashMap::from([
+            ("kernel".to_string(), routing.kernel.len()),
+            ("parquet_filter".to_string(), routing.parquet_filter.len()),
+            ("partition_prune".to_string(), routing.partition_prune.len()),
+            ("post_transform".to_string(), routing.post_transform.len()),
+        ]))
+    }
 }
 
 impl DeltaSource {
@@ -212,39 +236,16 @@ impl DeltaSource {
         let column_mapped = has_column_mapping(self.snapshot.table_properties());
         let table_logical_schema = self.snapshot.schema();
 
-        // Partition-touching conjuncts can't go to polars-io — the parquet
-        // reader can't resolve those column names.
-        let mut data_conjuncts: Vec<Expr> = Vec::new();
-        let mut partition_skip_conjuncts: Vec<Expr> = Vec::new();
-        // Mixed atomic conjuncts (OR / Function touching both partition and
-        // data cols) — applied post-`transform_to_logical` in `LogicalScanIter`,
-        // when partition columns are materialized and rows are available.
-        let mut orphan_conjuncts: Vec<Expr> = Vec::new();
-        for c in &self.original_predicate {
-            let partition_only =
-                touches_partition_only(&c.expr, &table_logical_schema, &physical_schema);
-            let for_polars_io = if column_mapped {
-                rewrite_predicate_to_physical(&c.expr, &table_logical_schema, &physical_schema)
-            } else {
-                predicate_only_touches_data_columns(&c.expr, &physical_schema)
-                    .then(|| c.expr.clone())
-            };
-            if let Some(e) = for_polars_io {
-                data_conjuncts.push(e);
-            } else if !c.kernel_translatable && partition_only {
-                partition_skip_conjuncts.push(c.expr.clone());
-            } else if !partition_only {
-                // Touches both partition and data cols → only evaluable once
-                // partition values are materialized post-read.
-                orphan_conjuncts.push(c.expr.clone());
-            }
-            // Translatable + partition-only: kernel file-skips exactly. No
-            // post-read evaluation needed.
-        }
+        let routing = classify_conjuncts(
+            &self.original_predicate,
+            column_mapped,
+            &table_logical_schema,
+            &physical_schema,
+        );
 
-        if !partition_skip_conjuncts.is_empty() {
+        if !routing.partition_prune.is_empty() {
             let surviving = file_skip_via_partition_eval(
-                &partition_skip_conjuncts,
+                &routing.partition_prune,
                 &files,
                 &table_logical_schema,
             )?;
@@ -267,7 +268,7 @@ impl DeltaSource {
             }
         }
 
-        let polars_predicate: Option<Expr> = conjunction(data_conjuncts);
+        let polars_predicate: Option<Expr> = conjunction(routing.parquet_filter);
 
         let (paths, rewrites): (Vec<_>, Vec<_>) =
             files.into_iter().map(|f| (f.path, f.rewrite)).unzip();
@@ -296,7 +297,7 @@ impl DeltaSource {
             engine,
             physical_schema,
             logical_schema,
-            conjunction(orphan_conjuncts),
+            conjunction(routing.post_transform),
         );
         self.iter = Some(Box::new(logical_iter));
         self.rows_emitted = 0;
