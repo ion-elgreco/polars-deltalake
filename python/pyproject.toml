@@ -1,30 +1,40 @@
-[build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
-
 [project]
 name = "polars-deltalake"
-requires-python = ">=3.8"
-dependencies = [
-  'polars >= 0.20.10'
-]
-classifiers = [
-  "Programming Language :: Rust",
-  "Programming Language :: Python :: Implementation :: CPython",
-  "Programming Language :: Python :: Implementation :: PyPy",
-]
-authors = [
-  { name="Ion Koutsours", email="15728914+ion-elgreco@users.noreply.github.com"},
-]
-description = "Native polars deltalake reader"
+dynamic = ["version"]
+description = "Native Polars I/O plugin for Delta Lake, backed by delta-kernel-rs."
 readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "polars>=1.33.1",
+]
 
-[project.urls]
-"Repository" = "https://github.com/ion-elgreco/polars-deltalake"
-"Documentation" = "https://ion-elgreco.github.io/polars-deltalake/"
-"Change Log" = "https://github.com/ion-elgreco/polars-deltalake/releases"
-"Issue Tracker" = "https://github.com/ion-elgreco/polars-deltalake/issues"
+[project.optional-dependencies]
+test = [
+    "deltalake>=0.25.0",
+    "pyarrow>=18.0.0",
+    "pytest>=9.0.3",
+    # Cloud-emulator integration tests boot containers via testcontainers; the
+    # individual SDK clients are only used to pre-create the bucket/container
+    # before the kernel touches it.
+    "testcontainers>=4.5",
+    "boto3>=1.34",
+    "azure-storage-blob>=12.19",
+]
+dev = [
+    "ruff>=0.7",
+    "pyright>=1.1",
+    "typos>=1",
+]
 
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
 
 [tool.maturin]
 module-name = "polars_deltalake._internal"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that spin up Docker-backed cloud emulators (minio for S3, Azurite for Azure, fake-gcs-server for GCS). Filter with `-m integration` or `-m 'not integration'`; they auto-skip when no Docker daemon is reachable.",
+]

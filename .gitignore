@@ -8,3 +8,4 @@ target/
 site
 *.so
 .venv
+python/tests/.dat-cache/

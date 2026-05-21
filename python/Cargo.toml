@@ -1,30 +1,120 @@
 [package]
-name = "polars_deltalake"
-version = "0.2.0"
-edition = "2021"
+name = "polars-deltalake"
+version = "0.0.0-dev"
+edition = "2024"
+authors = ["Ion Koutsouris <ion@orchestration.rs>"]
+description = "Native Polars I/O plugin for Delta Lake, backed by delta-kernel-rs with a polars-io engine."
+license = "Apache-2.0"
+repository = "https://github.com/ion-elgreco/polars-deltalake"
 
 [lib]
 name = "polars_deltalake"
 crate-type = ["cdylib"]
 
 [dependencies]
-polars = { version = "0.38.2", features = ["parquet", "cloud", "azure", "aws", "gcp", "async"]}
-polars-lazy ={ version = "0.38.2",  features = ["parquet","cloud", "async", "diagonal_concat"]}
-polars-plan = {version = "0.38.2", features = ["parquet","cloud", "async"]}
-polars-arrow = {version = "0.38.2", features = ["arrow_rs"]}
-arrow-schema ={ version = "50.0.0"}
-arrow-array = { version = "50.0.0", features = ["chrono-tz"]}
-pyo3 = { version = "0.20.3", features = ["extension-module", "abi3", "abi3-py38"] }
-pyo3-polars = { version = "0.12.0", features = ["derive", "lazy"] }
-serde = { version = "*", features = ["derive"] }
-deltalake = { version = "0.17.1", features = ["azure", "s3", "gcs"]}
-tokio = { version = "*", features = ["rt-multi-thread"] }
-thiserror = { version = "1" }
+# Kernel — protocol only; we provide our own Engine implementation backed by
+# polars-io, so the default-engine feature is intentionally NOT enabled.
+# `internal-api` exposes the create_table transaction-builder module that the
+# write path needs.
+delta_kernel = { version = "0.23", default-features = false, features = ["internal-api"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-jemallocator = { version = "0.5", features = ["disable_initial_exec_tls"] }
+# Polars — parquet + ndjson readers, plus the lazy DSL for the expression
+# translator. `polars-arrow` exposes the ArrowSchema/Field/StructArray types
+# the parquet reader projects against.
+polars = { version = "0.53", default-features = false, features = [
+    "parquet",
+    "json",
+    "lazy",
+    "dtype-struct",
+    "dtype-array",
+    "dtype-decimal",
+    "dtype-date",
+    "dtype-datetime",
+    "timezones",      # carry kernel `Timestamp` → polars `Datetime(µs, UTC)` through scalar literals
+    "dtype-time",
+    "dtype-duration",
+    "dtype-categorical",
+    "partition_by",   # DataFrame::partition_by — used by write path for partitioned writes
+    "cloud",          # LazyFrame::scan_parquet with cloud_options
+    "aws",            # CloudOptions::from_untyped_config for S3 URLs
+    "azure",          # ditto Azure
+    "gcp",            # ditto GCS
+    "http",           # ditto http:// URLs
+    "is_in",          # kernel BinaryPredicateOp::In → polars Expr::is_in
+    "is_between",     # polars→kernel pushdown for is_between → kernel AND of >= / <=
+    "strings",        # enables Expr::str() namespace
+    "regex",          # str.contains/starts_with/etc. — needed for full BooleanFunction enum
+    "list_eval",      # kernel MapToStruct → list.eval(...)
+    "list_drop_nulls", # list().drop_nulls() used by MapToStruct extraction
+    "diagonal_concat", # JsonHandler::write_json_file combines per-action frames
+    "extract_jsonpath", # kernel ParseJson expression → polars Expr::str().json_decode
+    "extract_groups",
+    "object",         # polars-ops 0.53 has an unconditional match on DataType::Object that breaks without this
+    "round_series",
+    "abs",
+    "log",
+    "trigonometry",
+    "fmt",
+] }
+polars-arrow = { version = "0.53", default-features = false }
+polars-utils = { version = "0.53", default-features = false }
+# polars-parquet — for `deserialize_metadata` + `PARQUET_MAGIC` /
+# `FOOTER_SIZE` constants, used by the suffix-range footer reader to avoid
+# downloading the whole file for kernel's `read_parquet_footer`.
+polars-parquet = { version = "0.53", default-features = false }
+# polars-plan exposes Expr / Operator / FunctionExpr / BooleanFunction /
+# DynLiteralValue for the polars→kernel predicate pushdown translator.
+# Feature set must broadly match what the Python polars wheel exposes so the
+# serialized-Expr bytes we receive from pl.Expr.deserialize have all variant
+# discriminants in range.
+polars-plan = { version = "0.53", default-features = false, features = [
+    "is_in",
+    "is_between",
+    "strings",
+    "regex",
+    "list_drop_nulls",
+    "extract_jsonpath",
+    "extract_groups",
+    "round_series",
+    "abs",
+    "log",
+    "trigonometry",
+] }
+
+# Object store — for the StorageHandler. Kernel 0.23 pairs with object_store
+# 0.13 (via its `arrow-58` feature); we pin the same major so any future
+# kernel-side helpers we touch don't drift. Cloud backends are opt-in via
+# features, so deltas on local disk work out of the box and S3/Azure/GCS
+# users enable what they need at build time.
+object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
+
+# Tokio runtime for driving object_store from the kernel's sync handler API.
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+# Futures helpers used while collecting object_store streams in list_from.
+futures-util = { version = "0.3", default-features = false }
+# reqwest — used by the StorageHandler to fetch presigned URLs (Databricks /
+# R2 / SigV4 query-string-auth) directly, bypassing object_store. Pinned to
+# the version already in the workspace via polars-io's cloud deps.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# PyO3 boundary — polars-native types crossing into Python.
+# pyo3 pinned to 0.27 to match pyo3-polars 0.26 (the latest release).
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
+pyo3-polars = { version = "0.26", features = [
+    "lazy",
+    "dtype-decimal",   # surface kernel/polars Decimal columns to Python
+    "dtype-struct",
+    "dtype-array",
+    "dtype-categorical",
+] }
+
+anyhow = "1"
+bytes = "1"
+url = "2"
+tracing = "0.1"
 
 [profile.release]
-opt-level = 3
+lto = true
+strip = true
 codegen-units = 1
-lto = "fat"
+opt-level = "s"
