@@ -118,3 +118,20 @@ lto = true
 strip = true
 codegen-units = 1
 opt-level = "s"
+
+# CI profile — fast cold-start builds with cache-friendly artifacts.
+# Inherits dev so our crate compiles cheaply, but disables incremental
+# so sccache (which silently no-ops with CARGO_INCREMENTAL=1) can actually
+# populate the cache. Dependencies are built at opt-level=3 with debuginfo
+# stripped so the cached `target/` blob stays small and tests run at
+# near-release speed. Selected via `PROFILE=ci` in CI.
+[profile.ci]
+inherits = "dev"
+debug = false
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 3
+debug = false
+debug-assertions = false
+strip = "debuginfo"

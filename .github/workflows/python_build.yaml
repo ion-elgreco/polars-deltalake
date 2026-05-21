@@ -26,6 +26,9 @@ env:
   # sccache silently no-ops when CARGO_INCREMENTAL=1 (its default). Force
   # it off so dev-profile builds actually route through sccache.
   CARGO_INCREMENTAL: "0"
+  # Selects `[profile.ci]` in python/Cargo.toml — dev-fast for our crate,
+  # release-opt + stripped for deps so the sccache blob stays small.
+  PROFILE: "ci"
 
 jobs:
   linting:
