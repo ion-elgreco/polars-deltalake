@@ -95,50 +95,47 @@ pub(crate) fn file_skip_via_partition_eval(
     files: &[ScanFileMeta],
     logical_schema: &StructType,
 ) -> anyhow::Result<HashSet<usize>> {
-    // BTreeSet for one-pass dedup with sorted iteration order.
     const FILE_IDX_COL: &str = "__pldl_file_idx__";
+    // BTreeSet for one-pass dedup with sorted iteration order.
     let partition_cols: BTreeSet<&str> = files
         .iter()
         .flat_map(|f| f.partition_values.keys().map(String::as_str))
         .collect();
 
-    let mut columns: Vec<Column> = Vec::with_capacity(partition_cols.len() + 1);
-    for name in &partition_cols {
-        let field = logical_schema
-            .field(name)
-            .ok_or_else(|| anyhow::anyhow!("partition column not in logical schema: {name}"))?;
-        let polars_dtype = field.data_type.to_polars()?;
-        let vals: Vec<Option<&str>> = files
-            .iter()
-            .map(|f| f.partition_values.get(*name).map(String::as_str))
-            .collect();
-        let col = Column::new(PlSmallStr::from_str(name), vals.as_slice())
-            .cast(&polars_dtype)
-            .map_err(|e| anyhow::anyhow!("cast partition col {name} to dtype: {e:#}"))?;
-        columns.push(col);
-    }
+    let mut columns: Vec<Column> = partition_cols
+        .iter()
+        .map(|name| -> anyhow::Result<Column> {
+            let field = logical_schema
+                .field(name)
+                .ok_or_else(|| anyhow::anyhow!("partition column not in logical schema: {name}"))?;
+            let vals: Vec<Option<&str>> = files
+                .iter()
+                .map(|f| f.partition_values.get(*name).map(String::as_str))
+                .collect();
+            Column::new(PlSmallStr::from_str(name), vals.as_slice())
+                .cast(&field.data_type.to_polars()?)
+                .map_err(|e| anyhow::anyhow!("cast partition col {name}: {e:#}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
     let idx_vals: Vec<u32> = (0..files.len() as u32).collect();
     columns.push(Column::new(
         PlSmallStr::from_static(FILE_IDX_COL),
         idx_vals.as_slice(),
     ));
 
-    let df = DataFrame::new(files.len(), columns)
-        .map_err(|e| anyhow::anyhow!("partition DF build: {e:#}"))?;
     let pred = conjunction(partition_conjuncts.to_vec())
-        .ok_or_else(|| anyhow::anyhow!("file_skip_via_partition_eval: empty conjuncts"))?;
-    let surviving = df
+        .expect("caller gates on non-empty partition_skip_conjuncts");
+    let surviving = DataFrame::new(files.len(), columns)
+        .map_err(|e| anyhow::anyhow!("partition DF build: {e:#}"))?
         .lazy()
         .filter(pred)
         .select([polars::prelude::col(PlSmallStr::from_static(FILE_IDX_COL))])
         .collect()
         .map_err(|e| anyhow::anyhow!("partition eval: {e:#}"))?;
-    let idx_col = surviving
+    let chunked = surviving
         .column(FILE_IDX_COL)
-        .map_err(|e| anyhow::anyhow!("missing file-idx col: {e:#}"))?;
-    let chunked = idx_col
-        .u32()
-        .map_err(|e| anyhow::anyhow!("file-idx col not u32: {e:#}"))?;
+        .and_then(|c| c.u32())
+        .map_err(|e| anyhow::anyhow!("read file-idx col: {e:#}"))?;
     Ok(chunked.into_iter().flatten().map(|x| x as usize).collect())
 }
 
