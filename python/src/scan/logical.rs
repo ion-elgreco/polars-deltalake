@@ -101,14 +101,15 @@ impl LogicalScanIter {
         let idx = *self.path_index.get(file_id).ok_or_else(|| {
             delta_kernel::Error::Generic(format!("unknown file_id from polars-io scan: {file_id}"))
         })?;
-        // SV applied exactly once per file — take it instead of cloning. For
-        // a million-row DV file this saves a per-batch `Vec<bool>` allocation.
         let rewrite = &mut self.rewrites[idx];
-        let sv = rewrite.selection_vector.take();
+        let sv_chunk = rewrite
+            .selection_vector
+            .as_mut()
+            .map(|sv| consume_dv_prefix(sv, df.height()));
         let transform = rewrite.transform.clone();
 
         let mut physical: Box<dyn EngineData> = Box::new(PolarsEngineData::new(df));
-        if let Some(sv) = sv {
+        if let Some(sv) = sv_chunk {
             physical = physical.apply_selection_vector(sv)?;
         }
 
@@ -129,6 +130,18 @@ impl LogicalScanIter {
                 )
             })?;
         Ok(out.into_inner())
+    }
+}
+
+/// Pads with `true` (keep) if the DV is shorter than the batch — matches
+/// delta-rs's `consume_dv_mask` in `/scan/exec.rs`.
+fn consume_dv_prefix(sv: &mut Vec<bool>, batch_num_rows: usize) -> Vec<bool> {
+    if sv.len() >= batch_num_rows {
+        sv.drain(0..batch_num_rows).collect()
+    } else {
+        let mut out: Vec<bool> = std::mem::take(sv);
+        out.resize(batch_num_rows, true);
+        out
     }
 }
 

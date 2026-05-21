@@ -9,6 +9,7 @@ use delta_kernel::expressions::{Predicate, PredicateRef};
 use delta_kernel::scan::Scan;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use polars::prelude::{DataFrame, Expr, Schema as PlSchema};
+use polars_plan::dsl::Engine as PolarsEngineMode;
 use pyo3::prelude::*;
 use pyo3_polars::{PyDataFrame, PySchema};
 use tokio::runtime::Runtime;
@@ -223,13 +224,13 @@ impl DeltaSource {
 
         let rt: &'static Runtime = crate::engine::rt();
         let _enter = rt.enter();
-        let mut df = lazy
-            .collect()
-            .map_err(|e| anyhow::anyhow!("bulk scan collect failed: {e:#}"))?;
-        df.rechunk_mut();
-
+        // `maintain_order=true` keeps file-id runs contiguous, which the
+        // `rle` split + DV-prefix consumption in `LogicalScanIter` requires.
+        let batches = lazy
+            .collect_batches(PolarsEngineMode::Streaming, true, None, false)
+            .map_err(|e| anyhow::anyhow!("collect_batches failed: {e:#}"))?;
         let source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send> =
-            Box::new(std::iter::once(Ok(df)));
+            Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
         let logical_iter = LogicalScanIter::new(
             source,
             path_index,

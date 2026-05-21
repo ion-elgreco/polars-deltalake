@@ -25,6 +25,8 @@ polars = { version = "0.53", default-features = false, features = [
     "parquet",
     "json",
     "lazy",
+    "async",
+    "new_streaming",
     "fmt",
     "diagonal_concat",
     "partition_by",
