@@ -8,7 +8,7 @@ use delta_kernel::Engine;
 use delta_kernel::engine_data::EngineData;
 use delta_kernel::scan::state::transform_to_logical;
 use delta_kernel::schema::SchemaRef;
-use polars::prelude::DataFrame;
+use polars::prelude::{DataFrame, Expr, IntoLazy};
 
 use crate::engine::PolarsEngineData;
 use crate::scan::plan::{DvState, LogicalRewrite};
@@ -26,6 +26,9 @@ pub(crate) struct LogicalScanIter {
     engine: Arc<dyn Engine>,
     physical_schema: SchemaRef,
     logical_schema: SchemaRef,
+    /// Mixed atomic conjuncts (touching both partition and data cols) —
+    /// applied after `transform_to_logical` materializes partition values.
+    orphan_predicate: Option<Expr>,
     /// One inner frame may span multiple files; we slice into per-file
     /// frames here and drain before pulling the next inner frame.
     pending: VecDeque<Result<DataFrame, delta_kernel::Error>>,
@@ -39,6 +42,7 @@ impl LogicalScanIter {
         engine: Arc<dyn Engine>,
         physical_schema: SchemaRef,
         logical_schema: SchemaRef,
+        orphan_predicate: Option<Expr>,
     ) -> Self {
         Self {
             source,
@@ -47,6 +51,7 @@ impl LogicalScanIter {
             engine,
             physical_schema,
             logical_schema,
+            orphan_predicate,
             pending: VecDeque::new(),
         }
     }
@@ -129,7 +134,14 @@ impl LogicalScanIter {
                     "transform_to_logical returned non-PolarsEngineData".into(),
                 )
             })?;
-        Ok(out.into_inner())
+        let mut df = out.into_inner();
+        if let Some(pred) = &self.orphan_predicate {
+            df =
+                df.lazy().filter(pred.clone()).collect().map_err(|e| {
+                    delta_kernel::Error::Generic(format!("orphan predicate eval: {e}"))
+                })?;
+        }
+        Ok(df)
     }
 }
 

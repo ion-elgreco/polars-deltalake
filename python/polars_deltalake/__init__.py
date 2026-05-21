@@ -68,10 +68,6 @@ def scan_delta(
     ) -> Iterator[pl.DataFrame]:
         src.configure(with_columns, n_rows, predicate)
         while (df := src.next()) is not None:
-            # Kernel only data-skips files via the stashed predicate; row
-            # filtering still has to run on the polars side.
-            if predicate is not None:
-                df = df.filter(predicate)
             yield df
 
     return register_io_source(source, schema=schema)

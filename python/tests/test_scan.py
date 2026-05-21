@@ -9,7 +9,6 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from conftest import scan_delta_unfiltered
 from polars_deltalake import scan_delta
 
 
@@ -160,14 +159,14 @@ class TestPartitionedScan:
 
 
 class TestPredicatePushdown:
-    """Predicate pushdown tests using `scan_delta_unfiltered` — exact rows
-    here prove the Rust-side pushdown (kernel file-skip, polars-io row
-    filter, option-2 partition skip) is doing the actual filtering without
-    a Python-side backstop."""
+    """Exact row results prove the Rust-side pushdown chain
+    (kernel file-skip → polars-io row-group/row filter → option-2
+    partition skip → orphan post-`transform_to_logical` eval) handles
+    every case end-to-end. There is no Python-side correctness filter."""
 
     def test_partition_filter(self, multi_file_partitioned):
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter(pl.col("g") == "b")
             .collect()
             .sort("id")
@@ -178,7 +177,7 @@ class TestPredicatePushdown:
     def test_and_chain(self, multi_file_partitioned):
         """Partition + data AND — kernel file-skips `g`, polars-io row-filters `id`."""
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter((pl.col("g") == "b") & (pl.col("id") >= 4))
             .collect()
         )
@@ -188,7 +187,7 @@ class TestPredicatePushdown:
         """OR across partitions — single conjunct, translatable, kernel
         file-skips to the union of matching partitions."""
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter((pl.col("g") == "a") | (pl.col("g") == "c"))
             .collect()
             .sort("id")
@@ -204,15 +203,13 @@ class TestPredicatePushdown:
         df = pl.DataFrame({"id": [1, 2, 3], "name": ["a", None, "c"]})
         write_deltalake(table_path, df.to_arrow())
 
-        out = (
-            scan_delta_unfiltered(table_path).filter(pl.col("name").is_null()).collect()
-        )
+        out = scan_delta(table_path).filter(pl.col("name").is_null()).collect()
         assert out["id"].to_list() == [2]
 
     def test_is_between(self, multi_file_partitioned):
         """is_between → kernel `>=` AND `<=`."""
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter(pl.col("id").is_between(2, 5))
             .collect()
             .sort("id")
@@ -222,7 +219,7 @@ class TestPredicatePushdown:
     def test_is_in(self, multi_file_partitioned):
         """is_in → kernel `In` binary predicate."""
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter(pl.col("g").is_in(["a", "c"]))
             .collect()
             .sort("id")
@@ -233,7 +230,7 @@ class TestPredicatePushdown:
         """Kernel handles partition `g == 'b'`, polars-io row-filters the
         untranslatable `id.abs() >= 4`."""
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter((pl.col("g") == "b") & (pl.col("id").abs() >= 4))
             .collect()
         )
@@ -243,7 +240,7 @@ class TestPredicatePushdown:
         """Option-2 polars-driven file-skip handles untranslatable
         `g.upper() == 'B'`; kernel + polars-io handle `id >= 4`."""
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter((pl.col("g").str.to_uppercase() == "B") & (pl.col("id") >= 4))
             .collect()
         )
@@ -252,7 +249,7 @@ class TestPredicatePushdown:
     def test_three_way_and(self, multi_file_partitioned):
         """Three-conjunct AND — partition + translatable data + untranslatable data."""
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter(
                 (pl.col("g") == "b") & (pl.col("id") >= 3) & (pl.col("id").abs() <= 5)
             )
@@ -269,12 +266,7 @@ class TestPredicatePushdown:
         df = pl.DataFrame({"id": [1, 2, 3, 4], "active": [True, False, True, None]})
         write_deltalake(table_path, df.to_arrow())
 
-        out = (
-            scan_delta_unfiltered(table_path)
-            .filter(pl.col("active"))
-            .collect()
-            .sort("id")
-        )
+        out = scan_delta(table_path).filter(pl.col("active")).collect().sort("id")
         assert out["id"].to_list() == [1, 3]
         assert out["active"].to_list() == [True, True]
 
@@ -288,7 +280,7 @@ class TestPredicatePushdown:
         write_deltalake(table_path, df.to_arrow())
 
         out = (
-            scan_delta_unfiltered(table_path)
+            scan_delta(table_path)
             .filter(pl.col("v").ne_missing(5))
             .collect()
             .sort("id")
@@ -299,7 +291,7 @@ class TestPredicatePushdown:
     def test_not_via_neq(self, multi_file_partitioned):
         """`!=` → kernel `Predicate::Not(Binary(Equal))`."""
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter(pl.col("g") != "b")
             .collect()
             .sort("id")
@@ -316,7 +308,7 @@ class TestPredicatePushdown:
         write_deltalake(table_path, df.to_arrow())
 
         out = (
-            scan_delta_unfiltered(table_path)
+            scan_delta(table_path)
             .filter(pl.col("name").is_null().not_())
             .collect()
             .sort("id")
@@ -328,7 +320,7 @@ class TestPredicatePushdown:
         """Untranslatable string op on a data column — polars-io's row-level
         `.filter` handles it."""
         out = (
-            scan_delta_unfiltered(str(simple_table))
+            scan_delta(str(simple_table))
             .filter(pl.col("name").str.starts_with("a"))
             .collect()
         )
@@ -341,7 +333,7 @@ class TestPartitionSkip:
 
     def test_untranslatable_str_op(self, multi_file_partitioned):
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter(pl.col("g").str.to_uppercase() == "B")
             .collect()
             .sort("id")
@@ -369,7 +361,7 @@ class TestPartitionSkip:
             )
 
         out = (
-            scan_delta_unfiltered(table_path)
+            scan_delta(table_path)
             .filter(pl.col("d").dt.year() == 2024)
             .collect()
             .sort("id")
@@ -378,11 +370,29 @@ class TestPartitionSkip:
 
     def test_drops_every_file(self, multi_file_partitioned):
         out = (
-            scan_delta_unfiltered(multi_file_partitioned)
+            scan_delta(multi_file_partitioned)
             .filter(pl.col("g").str.to_uppercase() == "Z")
             .collect()
         )
         assert out.height == 0
+
+
+class TestMixedAtomicConjunct:
+    """Atomic OR conjuncts touching both partition and data cols. Neither
+    kernel, polars-io, nor option-2 can pre-filter them — they're evaluated
+    in `LogicalScanIter::apply_rewrite` after `transform_to_logical`
+    materializes the partition columns."""
+
+    def test_or_partition_and_data(self, multi_file_partitioned):
+        """`(g.upper() == 'A') | (id == 3)`: partition leg untranslatable,
+        OR'd with a data leg → only post-`transform_to_logical` eval works."""
+        out = (
+            scan_delta(multi_file_partitioned)
+            .filter((pl.col("g").str.to_uppercase() == "A") | (pl.col("id") == 3))
+            .collect()
+            .sort("id")
+        )
+        assert out["id"].to_list() == [1, 2, 3]
 
 
 class TestDeletionVectors:

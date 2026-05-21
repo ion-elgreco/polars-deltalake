@@ -216,7 +216,13 @@ impl DeltaSource {
         // reader can't resolve those column names.
         let mut data_conjuncts: Vec<Expr> = Vec::new();
         let mut partition_skip_conjuncts: Vec<Expr> = Vec::new();
+        // Mixed atomic conjuncts (OR / Function touching both partition and
+        // data cols) — applied post-`transform_to_logical` in `LogicalScanIter`,
+        // when partition columns are materialized and rows are available.
+        let mut orphan_conjuncts: Vec<Expr> = Vec::new();
         for c in &self.original_predicate {
+            let partition_only =
+                touches_partition_only(&c.expr, &table_logical_schema, &physical_schema);
             let for_polars_io = if column_mapped {
                 rewrite_predicate_to_physical(&c.expr, &table_logical_schema, &physical_schema)
             } else {
@@ -225,11 +231,15 @@ impl DeltaSource {
             };
             if let Some(e) = for_polars_io {
                 data_conjuncts.push(e);
-            } else if !c.kernel_translatable
-                && touches_partition_only(&c.expr, &table_logical_schema, &physical_schema)
-            {
+            } else if !c.kernel_translatable && partition_only {
                 partition_skip_conjuncts.push(c.expr.clone());
+            } else if !partition_only {
+                // Touches both partition and data cols → only evaluable once
+                // partition values are materialized post-read.
+                orphan_conjuncts.push(c.expr.clone());
             }
+            // Translatable + partition-only: kernel file-skips exactly. No
+            // post-read evaluation needed.
         }
 
         if !partition_skip_conjuncts.is_empty() {
@@ -286,6 +296,7 @@ impl DeltaSource {
             engine,
             physical_schema,
             logical_schema,
+            conjunction(orphan_conjuncts),
         );
         self.iter = Some(Box::new(logical_iter));
         self.rows_emitted = 0;
