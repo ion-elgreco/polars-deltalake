@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use delta_kernel::Engine;
 use delta_kernel::engine_data::EngineData;
-use delta_kernel::scan::state::transform_to_logical;
+use delta_kernel::expressions::ExpressionRef;
 use delta_kernel::schema::SchemaRef;
+use delta_kernel::ExpressionEvaluator;
 use polars::prelude::{DataFrame, Expr, IntoLazy};
 
 use crate::engine::PolarsEngineData;
@@ -26,6 +27,8 @@ pub(crate) struct LogicalScanIter {
     engine: Arc<dyn Engine>,
     physical_schema: SchemaRef,
     logical_schema: SchemaRef,
+    /// Parallel to `rewrites`. Reused across batches of the same file.
+    evaluator_cache: Vec<Option<Arc<dyn ExpressionEvaluator>>>,
     /// Mixed atomic conjuncts (touching both partition and data cols) —
     /// applied after `transform_to_logical` materializes partition values.
     orphan_predicate: Option<Expr>,
@@ -44,6 +47,7 @@ impl LogicalScanIter {
         logical_schema: SchemaRef,
         orphan_predicate: Option<Expr>,
     ) -> Self {
+        let n_files = rewrites.len();
         Self {
             source,
             path_index,
@@ -51,9 +55,28 @@ impl LogicalScanIter {
             engine,
             physical_schema,
             logical_schema,
+            evaluator_cache: vec![None; n_files],
             orphan_predicate,
             pending: VecDeque::new(),
         }
+    }
+
+    /// Cached per `idx`; building one parses kernel `Transform` into polars `Expr`s.
+    fn evaluator_for(
+        &mut self,
+        idx: usize,
+        transform: ExpressionRef,
+    ) -> Result<Arc<dyn ExpressionEvaluator>, delta_kernel::Error> {
+        if let Some(e) = &self.evaluator_cache[idx] {
+            return Ok(e.clone());
+        }
+        let evaluator = self.engine.evaluation_handler().new_expression_evaluator(
+            self.physical_schema.clone(),
+            transform,
+            self.logical_schema.as_ref().clone().into(),
+        )?;
+        self.evaluator_cache[idx] = Some(evaluator.clone());
+        Ok(evaluator)
     }
 
     /// Slice on file-id boundaries, push each per-file logical frame onto
@@ -118,13 +141,10 @@ impl LogicalScanIter {
             physical = physical.apply_selection_vector(sv)?;
         }
 
-        let logical = transform_to_logical(
-            self.engine.as_ref(),
-            physical,
-            &self.physical_schema,
-            &self.logical_schema,
-            transform,
-        )?;
+        let logical: Box<dyn EngineData> = match transform {
+            Some(t) => self.evaluator_for(idx, t)?.evaluate(physical.as_ref())?,
+            None => physical,
+        };
 
         let out = logical
             .into_any()
