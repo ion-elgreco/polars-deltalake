@@ -11,6 +11,7 @@ use polars_plan::dsl::Operator;
 use polars_utils::pl_str::PlSmallStr;
 use pyo3::prelude::*;
 
+use crate::scan::plan::ScanFileMeta;
 use crate::translation::schema::KernelDataTypeExt;
 
 /// Gnarly workaround:
@@ -91,14 +92,14 @@ pub(crate) fn predicate_only_touches_data_columns(
 /// whose partition values satisfy `partition_conjuncts`.
 pub(crate) fn file_skip_via_partition_eval(
     partition_conjuncts: &[Expr],
-    partition_values: &[HashMap<String, String>],
+    files: &[ScanFileMeta],
     logical_schema: &StructType,
 ) -> anyhow::Result<HashSet<usize>> {
     // BTreeSet for one-pass dedup with sorted iteration order.
     const FILE_IDX_COL: &str = "__pldl_file_idx__";
-    let partition_cols: BTreeSet<&str> = partition_values
+    let partition_cols: BTreeSet<&str> = files
         .iter()
-        .flat_map(|pv| pv.keys().map(String::as_str))
+        .flat_map(|f| f.partition_values.keys().map(String::as_str))
         .collect();
 
     let mut columns: Vec<Column> = Vec::with_capacity(partition_cols.len() + 1);
@@ -107,22 +108,22 @@ pub(crate) fn file_skip_via_partition_eval(
             .field(name)
             .ok_or_else(|| anyhow::anyhow!("partition column not in logical schema: {name}"))?;
         let polars_dtype = field.data_type.to_polars()?;
-        let vals: Vec<Option<&str>> = partition_values
+        let vals: Vec<Option<&str>> = files
             .iter()
-            .map(|pv| pv.get(*name).map(String::as_str))
+            .map(|f| f.partition_values.get(*name).map(String::as_str))
             .collect();
         let col = Column::new(PlSmallStr::from_str(name), vals.as_slice())
             .cast(&polars_dtype)
             .map_err(|e| anyhow::anyhow!("cast partition col {name} to dtype: {e:#}"))?;
         columns.push(col);
     }
-    let idx_vals: Vec<u32> = (0..partition_values.len() as u32).collect();
+    let idx_vals: Vec<u32> = (0..files.len() as u32).collect();
     columns.push(Column::new(
         PlSmallStr::from_static(FILE_IDX_COL),
         idx_vals.as_slice(),
     ));
 
-    let df = DataFrame::new(partition_values.len(), columns)
+    let df = DataFrame::new(files.len(), columns)
         .map_err(|e| anyhow::anyhow!("partition DF build: {e:#}"))?;
     let pred = conjunction(partition_conjuncts.to_vec())
         .ok_or_else(|| anyhow::anyhow!("file_skip_via_partition_eval: empty conjuncts"))?;

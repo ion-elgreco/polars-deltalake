@@ -29,17 +29,16 @@ pub(crate) struct DvState {
     pub(crate) cursor: u64,
 }
 
+pub(crate) struct ScanFileMeta {
+    pub(crate) path: PlRefPath,
+    pub(crate) rewrite: LogicalRewrite,
+    pub(crate) partition_values: HashMap<String, String>,
+}
+
 /// `Scan::scan_metadata` drained into bulk-read inputs.
 pub(crate) struct ResolvedScan {
-    /// Files in scan order.
-    pub(crate) paths: Vec<PlRefPath>,
-    /// Parallel to `paths`.
-    pub(crate) rewrites: Vec<LogicalRewrite>,
-    /// Parallel to `paths`. Used for predicate-driven file skipping via
-    /// polars (untranslatable partition conjuncts) before the bulk read.
-    pub(crate) partition_values: Vec<HashMap<String, String>>,
-    /// `FILE_ID_COL` value (= `PlRefPath::as_str()`) → index in `paths` /
-    /// `rewrites`.
+    pub(crate) files: Vec<ScanFileMeta>,
+    /// `FILE_ID_COL` value (= `PlRefPath::as_str()`) → index in `files`.
     pub(crate) path_index: HashMap<String, usize>,
 }
 
@@ -53,9 +52,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
     struct Ctx<'a> {
         engine: &'a dyn Engine,
         table_root: &'a Url,
-        paths: Vec<PlRefPath>,
-        rewrites: Vec<LogicalRewrite>,
-        partition_values: Vec<HashMap<String, String>>,
+        files: Vec<ScanFileMeta>,
         path_index: HashMap<String, usize>,
         err: Option<delta_kernel::Error>,
     }
@@ -80,14 +77,16 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
             None
         };
 
-        let idx = ctx.paths.len();
+        let idx = ctx.files.len();
         ctx.path_index.insert(pl_path.as_str().to_string(), idx);
-        ctx.paths.push(pl_path);
-        ctx.rewrites.push(LogicalRewrite {
-            transform: scan_file.transform,
-            dv,
+        ctx.files.push(ScanFileMeta {
+            path: pl_path,
+            rewrite: LogicalRewrite {
+                transform: scan_file.transform,
+                dv,
+            },
+            partition_values: scan_file.partition_values,
         });
-        ctx.partition_values.push(scan_file.partition_values);
         Ok(())
     }
 
@@ -106,9 +105,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
     let mut ctx = Ctx {
         engine,
         table_root: &table_root,
-        paths: Vec::new(),
-        rewrites: Vec::new(),
-        partition_values: Vec::new(),
+        files: Vec::new(),
         path_index: HashMap::new(),
         err: None,
     };
@@ -127,9 +124,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
     }
 
     Ok(ResolvedScan {
-        paths: ctx.paths,
-        rewrites: ctx.rewrites,
-        partition_values: ctx.partition_values,
+        files: ctx.files,
         path_index: ctx.path_index,
     })
 }

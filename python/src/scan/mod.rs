@@ -195,16 +195,14 @@ impl DeltaSource {
         let engine: Arc<dyn Engine> = self.engine.clone();
 
         let resolved = resolve_scan(&scan, engine.as_ref())?;
-        if resolved.paths.is_empty() {
+        if resolved.files.is_empty() {
             self.iter = Some(Box::new(std::iter::empty()));
             self.rows_emitted = 0;
             return Ok(());
         }
         let ResolvedScan {
-            mut paths,
-            mut rewrites,
+            mut files,
             mut path_index,
-            partition_values,
         } = resolved;
 
         let physical_schema = scan.physical_schema().clone();
@@ -237,7 +235,7 @@ impl DeltaSource {
         if !partition_skip_conjuncts.is_empty() {
             let surviving = file_skip_via_partition_eval(
                 &partition_skip_conjuncts,
-                &partition_values,
+                &files,
                 &table_logical_schema,
             )?;
             if surviving.is_empty() {
@@ -245,22 +243,24 @@ impl DeltaSource {
                 self.rows_emitted = 0;
                 return Ok(());
             }
-            if surviving.len() < paths.len() {
-                (paths, rewrites) = paths
+            if surviving.len() < files.len() {
+                files = files
                     .into_iter()
-                    .zip(rewrites)
                     .enumerate()
-                    .filter_map(|(i, pair)| surviving.contains(&i).then_some(pair))
-                    .unzip();
-                path_index = paths
+                    .filter_map(|(i, f)| surviving.contains(&i).then_some(f))
+                    .collect();
+                path_index = files
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| (p.as_str().to_string(), i))
+                    .map(|(i, f)| (f.path.as_str().to_string(), i))
                     .collect();
             }
         }
 
         let polars_predicate: Option<Expr> = conjunction(data_conjuncts);
+
+        let (paths, rewrites): (Vec<_>, Vec<_>) =
+            files.into_iter().map(|f| (f.path, f.rewrite)).unzip();
 
         let lazy = build_lazy_scan(
             paths,
