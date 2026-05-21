@@ -68,6 +68,7 @@ def _ids(out: pl.DataFrame) -> list[int]:
 
 # --- temporal -----------------------------------------------------------
 
+
 def test_temporal_year(date_table):
     out = scan_delta(str(date_table)).filter(pl.col("d").dt.year() == 2024).collect()
     assert _ids(out) == [3, 4]
@@ -80,6 +81,7 @@ def test_temporal_month(date_table):
 
 # --- bitwise ------------------------------------------------------------
 
+
 def test_bitwise_and(numeric_table):
     # `&` on integer Series is bitwise AND under the `bitwise` feature.
     out = scan_delta(str(numeric_table)).filter((pl.col("i") & 1) != 0).collect()
@@ -88,6 +90,7 @@ def test_bitwise_and(numeric_table):
 
 
 # --- arithmetic / abs / log / trig / sign / round_series ----------------
+
 
 def test_abs(numeric_table):
     out = scan_delta(str(numeric_table)).filter(pl.col("i").abs() >= 3).collect()
@@ -120,23 +123,35 @@ def test_round_series(numeric_table):
 
 # --- is_close, is_first_distinct, is_last_distinct ---------------------
 
+
 def test_is_close(numeric_table):
-    out = scan_delta(str(numeric_table)).filter(pl.col("p").is_close(1.0, abs_tol=0.01)).collect()
+    out = (
+        scan_delta(str(numeric_table))
+        .filter(pl.col("p").is_close(1.0, abs_tol=0.01))
+        .collect()
+    )
     assert _ids(out) == [3]
 
 
 def test_is_first_distinct(numeric_table):
     # All numeric values are unique here, so is_first_distinct → all true.
-    out = scan_delta(str(numeric_table)).filter(pl.col("id").is_first_distinct()).collect()
+    out = (
+        scan_delta(str(numeric_table))
+        .filter(pl.col("id").is_first_distinct())
+        .collect()
+    )
     assert _ids(out) == [1, 2, 3, 4, 5, 6]
 
 
 def test_is_last_distinct(numeric_table):
-    out = scan_delta(str(numeric_table)).filter(pl.col("id").is_last_distinct()).collect()
+    out = (
+        scan_delta(str(numeric_table)).filter(pl.col("id").is_last_distinct()).collect()
+    )
     assert _ids(out) == [1, 2, 3, 4, 5, 6]
 
 
 # --- strings / regex (extract_groups, find_many, string_*) -------------
+
 
 def test_concat_str(string_table):
     out = (
@@ -160,12 +175,20 @@ def test_string_pad(string_table):
 
 def test_string_normalize(string_table):
     # NFC of plain ASCII is idempotent; passes for every row.
-    out = scan_delta(str(string_table)).filter(pl.col("s").str.normalize("NFC") == pl.col("s")).collect()
+    out = (
+        scan_delta(str(string_table))
+        .filter(pl.col("s").str.normalize("NFC") == pl.col("s"))
+        .collect()
+    )
     assert _ids(out) == [1, 2, 3, 4]
 
 
 def test_string_reverse(string_table):
-    out = scan_delta(str(string_table)).filter(pl.col("s").str.reverse() == "cba").collect()
+    out = (
+        scan_delta(str(string_table))
+        .filter(pl.col("s").str.reverse() == "cba")
+        .collect()
+    )
     assert _ids(out) == [1]
 
 
@@ -182,7 +205,12 @@ def test_string_to_integer(string_table):
 def test_extract_groups(string_table):
     out = (
         scan_delta(str(string_table))
-        .filter(pl.col("s").str.extract_groups(r"(?<prefix>[A-Z]+)(?<num>\d+)").struct.field("prefix") == "FOO")
+        .filter(
+            pl.col("s")
+            .str.extract_groups(r"(?<prefix>[A-Z]+)(?<num>\d+)")
+            .struct.field("prefix")
+            == "FOO"
+        )
         .collect()
     )
     assert _ids(out) == [3]
@@ -198,6 +226,7 @@ def test_find_many(string_table):
 
 
 # --- JSON path ---------------------------------------------------------
+
 
 def test_extract_jsonpath(string_table):
     out = (

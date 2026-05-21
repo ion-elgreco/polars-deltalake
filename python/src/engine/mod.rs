@@ -16,8 +16,8 @@ mod handlers;
 
 pub(crate) use data::PolarsEngineData;
 
-pub(crate) use handlers::{parquet_options, path_for_polars_io, unified_scan_args};
 use handlers::{ObjectStoreStorageHandler, PolarsJsonHandler, PolarsParquetHandler};
+pub(crate) use handlers::{parquet_options, path_for_polars_io, unified_scan_args};
 
 use crate::translation::PolarsEvaluationHandler;
 

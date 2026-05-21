@@ -281,9 +281,7 @@ def test_predicate_pushdown_three_way_and(multi_file_partitioned):
     this is parsed as `((g == 'b') AND (id >= 3)) AND (id.abs() <= 5)`)."""
     out = (
         scan_delta(multi_file_partitioned)
-        .filter(
-            (pl.col("g") == "b") & (pl.col("id") >= 3) & (pl.col("id").abs() <= 5)
-        )
+        .filter((pl.col("g") == "b") & (pl.col("id") >= 3) & (pl.col("id").abs() <= 5))
         .collect()
         .sort("id")
     )
