@@ -15,8 +15,18 @@ use crate::engine::path_for_polars_io;
 pub(crate) struct LogicalRewrite {
     /// Physical → logical (column-mapping + partition values).
     pub(crate) transform: Option<ExpressionRef>,
-    /// DV keep-mask (true = keep), or `None` if the file has no DV.
-    pub(crate) selection_vector: Option<Vec<bool>>,
+    /// Per-file DV state — sorted deleted row indices + cursor of how many
+    /// rows of the file have been consumed by prior batches. `None` if the
+    /// file has no DV.
+    pub(crate) dv: Option<DvState>,
+}
+
+pub(crate) struct DvState {
+    /// Sorted ascending row indices to drop. Consumed entries are drained
+    /// off the front as batches are processed.
+    pub(crate) deleted: Vec<u64>,
+    /// Absolute row offset within the file already covered by past batches.
+    pub(crate) cursor: u64,
 }
 
 /// `Scan::scan_metadata` drained into bulk-read inputs.
@@ -54,10 +64,14 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
             ))
         })?;
         let pl_path = path_for_polars_io(&abs)?;
-        let sv = if scan_file.dv_info.has_vector() {
+        // `Vec<u64>` of deleted row indices is far smaller than a `Vec<bool>`
+        // keep-mask for sparse deletes — only ~8 bytes per delete vs. one byte
+        // per row in the file.
+        let dv = if scan_file.dv_info.has_vector() {
             scan_file
                 .dv_info
-                .get_selection_vector(ctx.engine, ctx.table_root)?
+                .get_row_indexes(ctx.engine, ctx.table_root)?
+                .map(|deleted| DvState { deleted, cursor: 0 })
         } else {
             None
         };
@@ -67,7 +81,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<R
         ctx.paths.push(pl_path);
         ctx.rewrites.push(LogicalRewrite {
             transform: scan_file.transform,
-            selection_vector: sv,
+            dv,
         });
         Ok(())
     }

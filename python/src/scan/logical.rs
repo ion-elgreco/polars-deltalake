@@ -11,7 +11,7 @@ use delta_kernel::schema::SchemaRef;
 use polars::prelude::DataFrame;
 
 use crate::engine::PolarsEngineData;
-use crate::scan::plan::LogicalRewrite;
+use crate::scan::plan::{DvState, LogicalRewrite};
 use crate::scan::read::FILE_ID_COL;
 
 /// Splits each bulk-read frame on `FILE_ID_COL` runs and applies the
@@ -103,9 +103,9 @@ impl LogicalScanIter {
         })?;
         let rewrite = &mut self.rewrites[idx];
         let sv_chunk = rewrite
-            .selection_vector
+            .dv
             .as_mut()
-            .map(|sv| consume_dv_prefix(sv, df.height()));
+            .map(|state| build_keep_mask(state, df.height()));
         let transform = rewrite.transform.clone();
 
         let mut physical: Box<dyn EngineData> = Box::new(PolarsEngineData::new(df));
@@ -133,16 +133,19 @@ impl LogicalScanIter {
     }
 }
 
-/// Pads with `true` (keep) if the DV is shorter than the batch — matches
-/// delta-rs's `consume_dv_mask` in `/scan/exec.rs`.
-fn consume_dv_prefix(sv: &mut Vec<bool>, batch_num_rows: usize) -> Vec<bool> {
-    if sv.len() >= batch_num_rows {
-        sv.drain(0..batch_num_rows).collect()
-    } else {
-        let mut out: Vec<bool> = std::mem::take(sv);
-        out.resize(batch_num_rows, true);
-        out
+/// Drains consumed entries off the front so per-file state shrinks as the
+/// file is read.
+fn build_keep_mask(state: &mut DvState, batch_num_rows: usize) -> Vec<bool> {
+    let range_end = state.cursor + batch_num_rows as u64;
+    let split = state.deleted.partition_point(|&i| i < range_end);
+    let mut mask = vec![true; batch_num_rows];
+    for i in state.deleted.drain(..split) {
+        // Every i here is in [cursor, range_end) — earlier batches already
+        // drained anything below cursor — so the subtraction can't underflow.
+        mask[(i - state.cursor) as usize] = false;
     }
+    state.cursor = range_end;
+    mask
 }
 
 impl Iterator for LogicalScanIter {
