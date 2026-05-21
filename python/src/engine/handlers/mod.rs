@@ -9,5 +9,6 @@ mod parquet;
 mod storage;
 
 pub(super) use json::PolarsJsonHandler;
+pub(crate) use parquet::{parquet_options, path_for_polars_io, unified_scan_args};
 pub(super) use parquet::PolarsParquetHandler;
 pub(super) use storage::ObjectStoreStorageHandler;

@@ -25,36 +25,90 @@ polars = { version = "0.53", default-features = false, features = [
     "parquet",
     "json",
     "lazy",
-    "dtype-struct",
-    "dtype-array",
+    "fmt",
+    "diagonal_concat",
+    "partition_by",
+    # Cloud backends for object_store-backed scans.
+    "cloud",
+    "aws",
+    "azure",
+    "gcp",
+    "http",
+    # Dtypes Delta surfaces.
+    "dtype-i8",
+    "dtype-i16",
     "dtype-decimal",
+    "dtype-struct",
     "dtype-date",
     "dtype-datetime",
-    "timezones",      # carry kernel `Timestamp` → polars `Datetime(µs, UTC)` through scalar literals
-    "dtype-time",
-    "dtype-duration",
-    "dtype-categorical",
-    "partition_by",   # DataFrame::partition_by — used by write path for partitioned writes
-    "cloud",          # LazyFrame::scan_parquet with cloud_options
-    "aws",            # CloudOptions::from_untyped_config for S3 URLs
-    "azure",          # ditto Azure
-    "gcp",            # ditto GCS
-    "http",           # ditto http:// URLs
-    "is_in",          # kernel BinaryPredicateOp::In → polars Expr::is_in
-    "is_between",     # polars→kernel pushdown for is_between → kernel AND of >= / <=
-    "strings",        # enables Expr::str() namespace
-    "regex",          # str.contains/starts_with/etc. — needed for full BooleanFunction enum
-    "list_eval",      # kernel MapToStruct → list.eval(...)
-    "list_drop_nulls", # list().drop_nulls() used by MapToStruct extraction
-    "diagonal_concat", # JsonHandler::write_json_file combines per-action frames
-    "extract_jsonpath", # kernel ParseJson expression → polars Expr::str().json_decode
-    "extract_groups",
-    "object",         # polars-ops 0.53 has an unconditional match on DataType::Object that breaks without this
-    "round_series",
+    "timezones",
+    # Polars-ops compile-required.
+    "dtype-u8",
+    "dtype-u16",
+    "dtype-i128",
+    "dtype-u128",
+    "object",
+    # Full DSL surface for predicate round-tripping (kernel doesn't surface
+    # most of these, but a user predicate's Expr serialization may reference
+    # them and we want the deserialize to succeed so pushdown / kernel
+    # file-skipping work everywhere they can).
+    "temporal",
+    "bitwise",
+    "strings",
+    "regex",
+    "is_in",
+    "is_between",
+    "is_close",
+    "is_first_distinct",
+    "is_last_distinct",
     "abs",
     "log",
     "trigonometry",
-    "fmt",
+    "round_series",
+    "sign",
+    "mode",
+    "moment",
+    "true_div",
+    "checked_arithmetic",
+    "rle",
+    "hist",
+    "pct_change",
+    "rank",
+    "replace",
+    "row_hash",
+    "search_sorted",
+    "approx_unique",
+    "list_eval",
+    "list_drop_nulls",
+    "list_count",
+    "list_sets",
+    "list_gather",
+    "list_sample",
+    "array_count",
+    "binary_encoding",
+    "extract_jsonpath",
+    "extract_groups",
+    "find_many",
+    "peaks",
+    "interpolate",
+    "interpolate_by",
+    "ewma",
+    "ewma_by",
+    "diff",
+    "cum_agg",
+    "cutqcut",
+    "asof_join",
+    "cross_join",
+    "iejoin",
+    "semi_anti_join",
+    "merge_sorted",
+    "top_k",
+    "repeat_by",
+    "concat_str",
+    "string_pad",
+    "string_normalize",
+    "string_reverse",
+    "string_to_integer",
 ] }
 polars-arrow = { version = "0.53", default-features = false }
 polars-utils = { version = "0.53", default-features = false }
@@ -102,16 +156,21 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
 pyo3-polars = { version = "0.26", features = [
     "lazy",
-    "dtype-decimal",   # surface kernel/polars Decimal columns to Python
-    "dtype-struct",
-    "dtype-array",
-    "dtype-categorical",
+    "dtype-decimal",   # Delta `decimal(p, s)` → polars Decimal across FFI
+    "dtype-struct",    # Delta `struct<…>` + our Map = List<Struct<key,value>>
 ] }
 
 anyhow = "1"
 bytes = "1"
 url = "2"
 tracing = "0.1"
+# JSON-deserialize the polars `Expr` we receive from Python instead of going
+# through pyo3-polars's bincode `PyExpr::extract`. Bincode encodes enum
+# variants by position; the Python wheel's polars-rs is built with the full
+# feature set and ours with a subset, so `#[cfg]`-gated `FunctionExpr`
+# variants shift discriminants and the round-trip miscompiles silently. The
+# JSON form is variant-name keyed and survives feature mismatches.
+serde_json = "1"
 
 [profile.release]
 lto = true

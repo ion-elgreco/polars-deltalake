@@ -1,14 +1,17 @@
-//! `delta_kernel::ParquetHandler` over polars-io. Files stream through
-//! `DslBuilder::scan_parquet` with the kernel physical schema attached and
-//! polars-io's `missing_struct_fields=Insert` / `extra_columns=Ignore`
-//! policies set, so reads come back already shaped to the kernel contract.
+//! `delta_kernel::ParquetHandler` over polars-io. Every `read_parquet_files`
+//! call hands the whole file batch to a single `DslBuilder::scan_parquet`
+//! plan with the kernel physical schema attached and polars-io's
+//! `missing_struct_fields=Insert` / `extra_columns=Ignore` policies set, so
+//! polars-io's multi-file scan does cross-file / row-group / column
+//! parallelism in its own scheduler and reads come back already shaped to
+//! the kernel contract.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::PredicateRef;
-use delta_kernel::schema::SchemaRef;
+use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
     StorageHandler,
@@ -16,6 +19,7 @@ use delta_kernel::{
 use polars::io::cloud::CloudOptions;
 use polars::io::parquet::read::{ParquetOptions, infer_schema};
 use polars::lazy::frame::LazyFrame;
+use polars::prelude::Expr;
 use polars_parquet::parquet::{FOOTER_SIZE, PARQUET_MAGIC, read::deserialize_metadata};
 use polars_plan::dsl::{
     CastColumnsPolicy, DslBuilder, ExtraColumnsPolicy, MissingColumnsPolicy, ScanSources,
@@ -34,7 +38,8 @@ use super::storage::ObjectStoreStorageHandler;
 
 pub(crate) struct PolarsParquetHandler {
     storage: Arc<ObjectStoreStorageHandler>,
-    /// Pre-built once per table; `None` for `file://`. Cloned per scan.
+    /// Pre-built once per table; `None` for `file://`. Cloned once per
+    /// `read_parquet_files` call into `UnifiedScanArgs`.
     cloud_opts: Option<CloudOptions>,
     rt: &'static Runtime,
 }
@@ -51,6 +56,11 @@ impl PolarsParquetHandler {
             cloud_opts,
             rt,
         })
+    }
+
+    /// Shared with the scan-driver's bulk-read path.
+    pub(crate) fn cloud_options(&self) -> Option<&CloudOptions> {
+        self.cloud_opts.as_ref()
     }
 }
 
@@ -91,28 +101,26 @@ impl ParquetHandler for PolarsParquetHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         // Translation failure is non-fatal: kernel already pruned files via
         // stats, so we just skip row-level pushdown and let polars filter.
-        let polars_predicate: Option<polars::prelude::Expr> = predicate.as_ref().and_then(|p| {
+        let polars_predicate: Option<Expr> = predicate.as_ref().and_then(|p| {
             crate::translation::from_kernel::translate_predicate(p.as_ref(), None).ok()
         });
 
-        let select_exprs: Vec<polars::prelude::Expr> = physical_schema
-            .fields()
-            .map(|f| polars::prelude::col(PlSmallStr::from_str(f.name.as_str())))
-            .collect();
+        let select_exprs = crate::scan::select_exprs_for_schema(physical_schema.as_ref());
 
-        let results: Vec<DeltaResult<Box<dyn EngineData>>> = files
+        let paths: Vec<PlRefPath> = files
             .iter()
-            .map(|file| {
-                self.read_one(
-                    file,
-                    &select_exprs,
-                    polars_predicate.as_ref(),
-                    physical_schema.as_ref(),
-                )
-            })
-            .collect();
+            .map(|f| path_for_polars_io(&f.location))
+            .collect::<DeltaResult<_>>()?;
 
-        Ok(Box::new(results.into_iter()))
+        let result = read_batch(
+            paths,
+            self.cloud_opts.as_ref(),
+            &select_exprs,
+            polars_predicate.as_ref(),
+            physical_schema.as_ref(),
+            self.rt,
+        );
+        Ok(Box::new(std::iter::once(result)))
     }
 
     fn write_parquet_file(
@@ -170,65 +178,74 @@ impl ParquetHandler for PolarsParquetHandler {
     }
 }
 
-impl PolarsParquetHandler {
-    fn read_one(
-        &self,
-        file: &FileMeta,
-        select_exprs: &[polars::prelude::Expr],
-        predicate: Option<&polars::prelude::Expr>,
-        physical_schema: &delta_kernel::schema::StructType,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        let target_schema = physical_schema.to_polars().map_err(to_kernel_err)?;
-        let parquet_options = ParquetOptions {
-            schema: Some(target_schema),
-            ..Default::default()
-        };
-        // `Insert` fills missing (top-level or nested) fields with nulls;
-        // `Ignore` drops file columns kernel didn't ask for (e.g. `txn` in
-        // checkpoints written with stats-as-struct disabled).
-        let unified_scan_args = UnifiedScanArgs {
-            cloud_options: self.cloud_opts.clone(),
-            // visit_rows requires a single chunk per frame.
-            rechunk: true,
-            glob: false,
-            hive_options: polars::prelude::HiveOptions::new_disabled(),
-            cast_columns_policy: CastColumnsPolicy {
-                missing_struct_fields: MissingColumnsPolicy::Insert,
-                extra_struct_fields: ExtraColumnsPolicy::Ignore,
-                ..CastColumnsPolicy::ERROR_ON_MISMATCH
-            },
-            missing_columns_policy: MissingColumnsPolicy::Insert,
-            extra_columns_policy: ExtraColumnsPolicy::Ignore,
-            ..Default::default()
-        };
+/// `ParquetOptions` shaped by the kernel-declared physical schema. Shared
+/// across the kernel `ParquetHandler` path and the scan-driver's bulk read.
+pub(crate) fn parquet_options(physical_schema: &StructType) -> DeltaResult<ParquetOptions> {
+    let target_schema = physical_schema.to_polars().map_err(to_kernel_err)?;
+    Ok(ParquetOptions {
+        schema: Some(target_schema),
+        ..Default::default()
+    })
+}
 
-        // polars-io builds object-store paths via `Path::parse` (no decoding),
-        // so Spark's double-encoded partition prefixes (`letter=%252F` in the
-        // log) would re-encode and miss storage. Decode once up front — same
-        // fix delta-rs applies in its DataFusion table provider.
-        let path = path_for_polars_io(&file.location)?;
-        let sources = ScanSources::Paths(vec![path].into());
-        let lazy: LazyFrame = DslBuilder::scan_parquet(sources, parquet_options, unified_scan_args)
-            .map_err(to_kernel_err)?
-            .build()
-            .into();
-
-        // Bind our runtime so polars' async tasks reuse it instead of spinning
-        // up a fresh per-call executor.
-        let _enter = self.rt.enter();
-        let mut plan = lazy.select(select_exprs);
-        if let Some(pred) = predicate {
-            plan = plan.filter(pred.clone());
-        }
-        let mut df = plan.collect().map_err(to_kernel_err)?;
-        df.rechunk_mut();
-        Ok(Box::new(PolarsEngineData::new(df)))
+/// `Insert` / `Ignore` policies are load-bearing for the kernel contract:
+/// null-fill missing fields, drop file columns kernel didn't ask for (e.g.
+/// `txn` in checkpoints written with stats-as-struct disabled).
+pub(crate) fn unified_scan_args(
+    cloud_opts: Option<&CloudOptions>,
+    include_file_paths: Option<PlSmallStr>,
+) -> UnifiedScanArgs {
+    UnifiedScanArgs {
+        cloud_options: cloud_opts.cloned(),
+        // visit_rows requires a single chunk per frame.
+        rechunk: true,
+        glob: false,
+        hive_options: polars::prelude::HiveOptions::new_disabled(),
+        cast_columns_policy: CastColumnsPolicy {
+            missing_struct_fields: MissingColumnsPolicy::Insert,
+            extra_struct_fields: ExtraColumnsPolicy::Ignore,
+            ..CastColumnsPolicy::ERROR_ON_MISMATCH
+        },
+        missing_columns_policy: MissingColumnsPolicy::Insert,
+        extra_columns_policy: ExtraColumnsPolicy::Ignore,
+        include_file_paths,
+        ..Default::default()
     }
 }
 
-/// Decode the URL once and rebuild a polars-io-friendly path: bare OS path
-/// for `file://`, scheme-qualified with the decoded storage key otherwise.
-fn path_for_polars_io(url: &Url) -> DeltaResult<PlRefPath> {
+fn read_batch(
+    paths: Vec<PlRefPath>,
+    cloud_opts: Option<&CloudOptions>,
+    select_exprs: &[Expr],
+    predicate: Option<&Expr>,
+    physical_schema: &StructType,
+    rt: &'static Runtime,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let parquet_options = parquet_options(physical_schema)?;
+    let unified_scan_args = unified_scan_args(cloud_opts, None);
+
+    let sources = ScanSources::Paths(paths.into());
+    let lazy: LazyFrame = DslBuilder::scan_parquet(sources, parquet_options, unified_scan_args)
+        .map_err(to_kernel_err)?
+        .build()
+        .into();
+
+    // Bind our runtime so polars' async tasks reuse it instead of spinning
+    // up a fresh per-call executor.
+    let _enter = rt.enter();
+    let mut plan = lazy.select(select_exprs);
+    if let Some(pred) = predicate {
+        plan = plan.filter(pred.clone());
+    }
+    let mut df = plan.collect().map_err(to_kernel_err)?;
+    df.rechunk_mut();
+    Ok(Box::new(PolarsEngineData::new(df)))
+}
+
+/// polars-io's `Path::parse` doesn't decode, so Spark-style double-encoded
+/// partition keys (`letter=%252F`) would re-encode and miss storage. Decode
+/// once up front. Same fix as delta-rs's DataFusion table provider.
+pub(crate) fn path_for_polars_io(url: &Url) -> DeltaResult<PlRefPath> {
     let decoded = object_store::path::Path::from_url_path(url.path())
         .map_err(|e| Error::Generic(format!("invalid object store path {url}: {e}")))?;
     let s = if url.scheme() == "file" {

@@ -16,6 +16,7 @@ mod handlers;
 
 pub(crate) use data::PolarsEngineData;
 
+pub(crate) use handlers::{parquet_options, path_for_polars_io, unified_scan_args};
 use handlers::{ObjectStoreStorageHandler, PolarsJsonHandler, PolarsParquetHandler};
 
 use crate::translation::PolarsEvaluationHandler;
@@ -73,6 +74,13 @@ impl PolarsEngine {
             parquet,
             evaluation,
         })
+    }
+
+    /// Pre-built cloud options the parquet handler holds, exposed so the
+    /// scan-driver's bulk-read path can reuse them without rebuilding from
+    /// `storage_options`.
+    pub(crate) fn cloud_options(&self) -> Option<&polars::io::cloud::CloudOptions> {
+        self.parquet.cloud_options()
     }
 }
 

@@ -245,6 +245,51 @@ def test_predicate_pushdown_is_in(multi_file_partitioned):
     assert out["g"].to_list() == ["a", "a", "c", "c"]
 
 
+def test_predicate_pushdown_mixed_untranslatable_data_leg(multi_file_partitioned):
+    """Mixed predicate where the data leg is untranslatable (`abs()`).
+    Before conjunct splitting the whole predicate would have been dropped
+    from polars-io (partition col present) AND kernel (untranslatable
+    conjunct present), forcing a full scan. With splitting:
+      - `g == 'b'` → kernel file-skip
+      - `id.abs() >= 4` → polars-io row-group skip
+    """
+    out = (
+        scan_delta(multi_file_partitioned)
+        .filter((pl.col("g") == "b") & (pl.col("id").abs() >= 4))
+        .collect()
+    )
+    assert out["id"].to_list() == [4]
+
+
+def test_predicate_pushdown_mixed_untranslatable_partition_leg(multi_file_partitioned):
+    """Mixed predicate where the partition leg is untranslatable
+    (`str.to_uppercase()`). The partition conjunct is orphaned (only
+    Python-side filter handles it); the data conjunct still gets pushed
+    to kernel and polars-io."""
+    out = (
+        scan_delta(multi_file_partitioned)
+        .filter((pl.col("g").str.to_uppercase() == "B") & (pl.col("id") >= 4))
+        .collect()
+    )
+    assert out["id"].to_list() == [4]
+
+
+def test_predicate_pushdown_three_way_and(multi_file_partitioned):
+    """Three-conjunct AND mixing partition, translatable data, and
+    untranslatable data — verifies the flatten walker recurses through
+    nested BinaryExpr::And nodes (polars associates left-to-right, so
+    this is parsed as `((g == 'b') AND (id >= 3)) AND (id.abs() <= 5)`)."""
+    out = (
+        scan_delta(multi_file_partitioned)
+        .filter(
+            (pl.col("g") == "b") & (pl.col("id") >= 3) & (pl.col("id").abs() <= 5)
+        )
+        .collect()
+        .sort("id")
+    )
+    assert out["id"].to_list() == [3, 4]
+
+
 def test_predicate_pushdown_bare_bool_column(tmp_path):
     """A bare bool column used as a filter (`lf.filter(pl.col("active"))`)
     pushes as kernel `Predicate::BooleanExpression(Column(...))` — exercises
