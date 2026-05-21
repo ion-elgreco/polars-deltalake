@@ -12,6 +12,81 @@ use polars_utils::pl_str::PlSmallStr;
 
 use super::expr::{column_path_to_expr, translate_expr};
 
+/// Per-output-slot intent produced by [`walk_transform_slots`]. Shared by
+/// the lazy [`translate_transform`] walker and the eager `build_transform_ops`
+/// planner so the Keep / KeepThenInsert / Drop / ReplaceWith dispatch lives
+/// in one place.
+pub(super) enum TransformSlot<'a> {
+    /// Carry the input field at `input_fields[input_idx]` into the output
+    /// slot. Consumers resolve the input however they need: top-level
+    /// `col(name)`, nested `root.struct.field_by_name(name)`, or a direct
+    /// DataFrame column index.
+    Passthrough {
+        input_idx: usize,
+        output: &'a StructField,
+    },
+    /// Emit `expr` as the next output slot.
+    Translated {
+        expr: &'a Expression,
+        output: &'a StructField,
+    },
+}
+
+/// Walk a Transform position-by-position over `input_fields` and emit one
+/// [`TransformSlot`] per output slot.
+pub(super) fn walk_transform_slots<'a>(
+    t: &'a Transform,
+    output_struct: &'a StructType,
+    input_fields: &[&'a StructField],
+) -> DeltaResult<Vec<TransformSlot<'a>>> {
+    let mut slots: Vec<TransformSlot<'a>> = Vec::with_capacity(output_struct.num_fields());
+    let mut output_iter = output_struct.fields();
+
+    for prep in &t.prepended_fields {
+        slots.push(TransformSlot::Translated {
+            expr: prep.as_ref(),
+            output: next_output(&mut output_iter)?,
+        });
+    }
+
+    for (input_idx, input_field) in input_fields.iter().enumerate() {
+        let op = classify_input_op(t.field_transforms.get(input_field.name.as_str()));
+        let (passes_through, inserts) = match op {
+            InputFieldOp::Keep => (true, &[][..]),
+            InputFieldOp::KeepThenInsert(exprs) => (true, exprs),
+            InputFieldOp::Drop => (false, &[][..]),
+            InputFieldOp::ReplaceWith(exprs) => (false, exprs),
+        };
+        if passes_through {
+            slots.push(TransformSlot::Passthrough {
+                input_idx,
+                output: next_output(&mut output_iter)?,
+            });
+        }
+        for expr in inserts {
+            slots.push(TransformSlot::Translated {
+                expr: expr.as_ref(),
+                output: next_output(&mut output_iter)?,
+            });
+        }
+    }
+
+    if output_iter.next().is_some() {
+        return Err(Error::Generic(
+            "Transform: too many fields in output schema (input + transforms didn't fill all slots)"
+                .into(),
+        ));
+    }
+    Ok(slots)
+}
+
+fn next_output<'a>(
+    iter: &mut impl Iterator<Item = &'a StructField>,
+) -> DeltaResult<&'a StructField> {
+    iter.next()
+        .ok_or_else(|| Error::Generic("Transform: ran out of output schema fields".into()))
+}
+
 /// Prepend computed fields, then walk input fields applying per-field
 /// replace/insert directives from `field_transforms`. Output ordering must
 /// match `output_struct` position-by-position — kernel consumes the output
@@ -33,59 +108,28 @@ pub(super) fn translate_transform(
         None => col(PlSmallStr::from_str(field_name)),
     };
 
-    let mut entries: Vec<Expr> = Vec::with_capacity(output_struct.fields().count());
-    let mut output_iter = output_struct.fields();
-
-    // Prepended fields fill leading output slots before any input field.
-    for prep in &t.prepended_fields {
-        push_translated(prep.as_ref(), input_schema, &mut output_iter, &mut entries)?;
-    }
-
-    // Walk the input schema; each input field maps to 0..N output slots
-    // depending on its FieldTransform (or pass-through if absent).
-    for input_field in &input_fields {
-        let input_name = input_field.name.as_str();
-        match classify_input_op(t.field_transforms.get(input_name)) {
-            InputFieldOp::Keep => {
-                push_to_next(lookup_input(input_name), &mut output_iter, &mut entries)?;
-            }
-            InputFieldOp::KeepThenInsert(exprs) => {
-                push_to_next(lookup_input(input_name), &mut output_iter, &mut entries)?;
-                for expr in exprs {
-                    push_translated(expr.as_ref(), input_schema, &mut output_iter, &mut entries)?;
+    let entries = walk_transform_slots(t, output_struct, &input_fields)?
+        .into_iter()
+        .map(|slot| -> DeltaResult<Expr> {
+            let (raw, output) = match slot {
+                TransformSlot::Passthrough { input_idx, output } => {
+                    (lookup_input(input_fields[input_idx].name.as_str()), output)
                 }
-            }
-            InputFieldOp::Drop => {}
-            InputFieldOp::ReplaceWith(exprs) => {
-                for expr in exprs {
-                    push_translated(expr.as_ref(), input_schema, &mut output_iter, &mut entries)?;
-                }
-            }
-        }
-    }
-
-    if output_iter.next().is_some() {
-        return Err(Error::Generic(
-            "Transform: too many fields in output schema (input + transforms didn't fill all slots)"
-                .into(),
-        ));
-    }
-
+                TransformSlot::Translated { expr, output } => (
+                    translate_expr(expr, Some(&output.data_type), Some(input_schema))?,
+                    output,
+                ),
+            };
+            Ok(raw.alias(PlSmallStr::from_str(output.name.as_str())))
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
     Ok(polars_as_struct(entries))
 }
 
-/// Classification of a single input field's `FieldTransform` for the
-/// translate_transform walk. Drop is implicit in the kernel encoding
-/// (`is_replace=true` with empty `exprs`); naming it explicitly here
-/// keeps the input-field loop a direct match on intent.
 enum InputFieldOp<'a> {
-    /// No `FieldTransform` — input column flows through to the next output slot.
     Keep,
-    /// `is_replace=false` — pass-through, then `exprs.len()` inserts follow.
     KeepThenInsert(&'a [ExpressionRef]),
-    /// `is_replace=true, exprs=[]` — input field consumes zero output slots.
     Drop,
-    /// `is_replace=true, exprs.len() >= 1` — input position expands to N slots.
     ReplaceWith(&'a [ExpressionRef]),
 }
 
@@ -96,32 +140,6 @@ fn classify_input_op(ft: Option<&FieldTransform>) -> InputFieldOp<'_> {
         Some(ft) if ft.exprs.is_empty() => InputFieldOp::Drop,
         Some(ft) => InputFieldOp::ReplaceWith(&ft.exprs),
     }
-}
-
-fn push_to_next<'a>(
-    expr: Expr,
-    output_iter: &mut impl Iterator<Item = &'a StructField>,
-    entries: &mut Vec<Expr>,
-) -> DeltaResult<()> {
-    let field = output_iter
-        .next()
-        .ok_or_else(|| Error::Generic("Transform: ran out of output schema fields".into()))?;
-    entries.push(expr.alias(PlSmallStr::from_str(field.name.as_str())));
-    Ok(())
-}
-
-fn push_translated<'a>(
-    expr: &Expression,
-    input_schema: &StructType,
-    output_iter: &mut impl Iterator<Item = &'a StructField>,
-    entries: &mut Vec<Expr>,
-) -> DeltaResult<()> {
-    let field = output_iter
-        .next()
-        .ok_or_else(|| Error::Generic("Transform: ran out of output schema fields".into()))?;
-    let inner = translate_expr(expr, Some(&field.data_type), Some(input_schema))?;
-    entries.push(inner.alias(PlSmallStr::from_str(field.name.as_str())));
-    Ok(())
 }
 
 fn descend_struct_path<'a>(root: &'a StructType, path: &ColumnName) -> DeltaResult<&'a StructType> {

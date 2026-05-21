@@ -5,10 +5,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use delta_kernel::Engine;
+use delta_kernel::ExpressionEvaluator;
 use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::ExpressionRef;
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::ExpressionEvaluator;
 use polars::prelude::{DataFrame, Expr, IntoLazy};
 
 use crate::engine::PolarsEngineData;

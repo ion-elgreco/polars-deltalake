@@ -7,8 +7,9 @@ use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, StructFiel
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{
-    DataFrame, DataType as PlDataType, Expr, Int128Chunked, IntoColumn, IntoLazy, IntoSeries,
-    NamedFrom, NewChunkedArray, Series, lit,
+    AnyValue, DataFrame, DataType as PlDataType, Expr, Int128Chunked, IntoColumn, IntoLazy,
+    IntoSeries, NamedFrom, NewChunkedArray, Scalar as PolarsScalar, Series, TimeUnit, TimeZone,
+    lit,
 };
 use polars_utils::pl_str::PlSmallStr;
 
@@ -56,6 +57,39 @@ pub(super) fn scalar_to_lit(scalar: &Scalar) -> Expr {
                 .unwrap_or_else(|_| lit(polars::prelude::LiteralValue::untyped_null()))
         }
     }
+}
+
+/// Primitive kernel scalars → polars `Scalar` carrying its own dtype, so
+/// `Column::new_scalar` can build a `ScalarColumn` without going through the
+/// lazy planner. Returns `None` for compound / binary scalars; callers fall
+/// back to the lazy `lit()` path.
+pub(crate) fn try_to_polars_scalar(scalar: &Scalar) -> Option<PolarsScalar> {
+    let s = match scalar {
+        Scalar::String(s) => PolarsScalar::new(
+            PlDataType::String,
+            AnyValue::StringOwned(PlSmallStr::from_str(s.as_str())),
+        ),
+        Scalar::Long(v) => PolarsScalar::new(PlDataType::Int64, AnyValue::Int64(*v)),
+        Scalar::Integer(v) => PolarsScalar::new(PlDataType::Int32, AnyValue::Int32(*v)),
+        Scalar::Short(v) => PolarsScalar::new(PlDataType::Int16, AnyValue::Int16(*v)),
+        Scalar::Byte(v) => PolarsScalar::new(PlDataType::Int8, AnyValue::Int8(*v)),
+        Scalar::Float(v) => PolarsScalar::new(PlDataType::Float32, AnyValue::Float32(*v)),
+        Scalar::Double(v) => PolarsScalar::new(PlDataType::Float64, AnyValue::Float64(*v)),
+        Scalar::Boolean(v) => PolarsScalar::new(PlDataType::Boolean, AnyValue::Boolean(*v)),
+        Scalar::Date(v) => PolarsScalar::new_date(*v),
+        Scalar::Timestamp(v) => {
+            PolarsScalar::new_datetime(*v, TimeUnit::Microseconds, Some(TimeZone::UTC))
+        }
+        Scalar::TimestampNtz(v) => PolarsScalar::new_datetime(*v, TimeUnit::Microseconds, None),
+        Scalar::Decimal(d) => {
+            PolarsScalar::new_decimal(d.bits(), d.precision() as usize, d.scale() as usize)
+        }
+        Scalar::Null(dt) => PolarsScalar::new(dt.to_polars().ok()?, AnyValue::Null),
+        // Binary, Array, Map, Struct go through build_series; not worth
+        // duplicating the per-row path for `Column::new_scalar`.
+        _ => return None,
+    };
+    Some(s)
 }
 
 /// Mismatched scalars panic — the kernel guarantees scalar-vs-schema
