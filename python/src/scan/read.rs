@@ -14,19 +14,22 @@ use polars_utils::pl_str::PlSmallStr;
 /// `LogicalRewrite`.
 pub(crate) const FILE_ID_COL: &str = "__pldl_file__";
 
-/// Single `scan_parquet` plan over all `paths`, with the file-id column
-/// appended to `select_exprs` so it survives projection.
+/// `scan_parquet` plan over `paths`. `include_file_id` injects FILE_ID_COL
+/// so the read path can slice rows back to source files for DV / Transform.
 pub(crate) fn build_lazy_scan(
     paths: Vec<PlRefPath>,
     cloud_opts: Option<&CloudOptions>,
     select_exprs: &[Expr],
     predicate: Option<&Expr>,
     physical_schema: &StructType,
+    include_file_id: bool,
 ) -> anyhow::Result<LazyFrame> {
     let parquet_options = crate::engine::parquet_options(physical_schema)
         .map_err(|e| anyhow::anyhow!("kernel→polars schema conversion failed: {e:#}"))?;
-    let unified_scan_args =
-        crate::engine::unified_scan_args(cloud_opts, Some(PlSmallStr::from_static(FILE_ID_COL)));
+    let unified_scan_args = crate::engine::unified_scan_args(
+        cloud_opts,
+        include_file_id.then(|| PlSmallStr::from_static(FILE_ID_COL)),
+    );
 
     let sources = ScanSources::Paths(paths.into());
     let lazy: LazyFrame = DslBuilder::scan_parquet(sources, parquet_options, unified_scan_args)
@@ -34,9 +37,11 @@ pub(crate) fn build_lazy_scan(
         .build()
         .into();
 
-    let mut select_with_file_id: Vec<Expr> = Vec::with_capacity(select_exprs.len() + 1);
-    select_with_file_id.extend(select_exprs.iter().cloned());
-    select_with_file_id.push(polars::prelude::col(PlSmallStr::from_static(FILE_ID_COL)));
+    let mut final_select: Vec<Expr> = Vec::with_capacity(select_exprs.len() + 1);
+    final_select.extend(select_exprs.iter().cloned());
+    if include_file_id {
+        final_select.push(polars::prelude::col(PlSmallStr::from_static(FILE_ID_COL)));
+    }
 
     // Filter sits directly above the scan node so polars-io's parquet
     // predicate pushdown can pick it up.
@@ -44,7 +49,7 @@ pub(crate) fn build_lazy_scan(
     if let Some(pred) = predicate {
         plan = plan.filter(pred.clone());
     }
-    Ok(plan.select(select_with_file_id))
+    Ok(plan.select(final_select))
 }
 
 /// `col(...)` per kernel physical-schema field. Caller appends file-id /

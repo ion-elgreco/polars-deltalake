@@ -36,6 +36,11 @@ use predicate::{
 
 type BatchIter = Box<dyn Iterator<Item = Result<DataFrame, delta_kernel::Error>> + Send>;
 
+/// Rows per morsel handed to the Python plugin. polars-stream's default is
+/// ~12.5k — too small; each batch pays the FFI crossing cost. 500k is the
+/// sweet spot for narrow tables; very wide schemas may want to lower it.
+const COLLECT_CHUNK_ROWS: usize = 500_000;
+
 // `unsendable` because the scan iterator is `Send` but not `Sync`; Python
 // only ever drives this from a single thread anyway (the one that holds the
 // GIL when entering the io-source generator).
@@ -273,33 +278,53 @@ impl DeltaSource {
         let (paths, rewrites): (Vec<_>, Vec<_>) =
             files.into_iter().map(|f| (f.path, f.rewrite)).unzip();
 
+        // Skip the file-id column + `LogicalScanIter` when no file needs
+        // DV/Transform — the common case (non-partitioned, non-DV, non-CM).
+        let needs_rewrite = rewrites
+            .iter()
+            .any(|r| r.transform.is_some() || r.dv.is_some());
+
         let lazy = build_lazy_scan(
             paths,
             self.engine.cloud_options(),
             &select_exprs,
             polars_predicate.as_ref(),
             &physical_schema,
+            needs_rewrite,
         )?;
 
         let rt: &'static Runtime = crate::engine::rt();
         let _enter = rt.enter();
         // `maintain_order=true` keeps file-id runs contiguous, which the
         // `rle` split + DV-prefix consumption in `LogicalScanIter` requires.
+        let chunk_size = std::num::NonZeroUsize::new(COLLECT_CHUNK_ROWS);
         let batches = lazy
-            .collect_batches(PolarsEngineMode::Streaming, true, None, false)
+            .collect_batches(PolarsEngineMode::Streaming, true, chunk_size, false)
             .map_err(|e| anyhow::anyhow!("collect_batches failed: {e:#}"))?;
         let source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send> =
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
-        let logical_iter = LogicalScanIter::new(
-            source,
-            path_index,
-            rewrites,
-            engine,
-            physical_schema,
-            logical_schema,
-            conjunction(routing.post_transform),
-        );
-        self.iter = Some(Box::new(logical_iter));
+
+        if needs_rewrite {
+            let logical_iter = LogicalScanIter::new(
+                source,
+                path_index,
+                rewrites,
+                engine,
+                physical_schema,
+                logical_schema,
+                conjunction(routing.post_transform),
+            );
+            self.iter = Some(Box::new(logical_iter));
+        } else {
+            debug_assert!(
+                routing.post_transform.is_empty(),
+                "post_transform requires Transform to materialize partition cols",
+            );
+            self.iter =
+                Some(Box::new(source.map(|r| {
+                    r.map_err(|e| delta_kernel::Error::Generic(format!("{e:#}")))
+                })));
+        }
         self.rows_emitted = 0;
         Ok(())
     }
