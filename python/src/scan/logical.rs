@@ -9,7 +9,7 @@ use delta_kernel::ExpressionEvaluator;
 use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::ExpressionRef;
 use delta_kernel::schema::SchemaRef;
-use polars::prelude::{DataFrame, Expr, IntoLazy};
+use polars::prelude::{DataFrame, Expr, IntoLazy, StringChunked};
 
 use crate::engine::PolarsEngineData;
 use crate::scan::plan::{DvState, LogicalRewrite};
@@ -80,54 +80,41 @@ impl LogicalScanIter {
     }
 
     /// Slice on file-id boundaries, push each per-file logical frame onto
-    /// `pending`. Boundary detection runs through polars' vectorized
-    /// `rle`, which returns one row per run with `{len, value}`.
+    /// `pending`. With `maintain_order=true` the file-id column is composed
+    /// of contiguous runs, so we binary-search the end of each run rather
+    /// than scanning row-by-row
     fn split_and_buffer(&mut self, df: DataFrame) -> Result<(), delta_kernel::Error> {
-        if df.height() == 0 {
+        let n = df.height();
+        if n == 0 {
             return Ok(());
         }
         let file_col = df
             .column(FILE_ID_COL)
             .map_err(|e| delta_kernel::Error::Generic(format!("file-id column missing: {e}")))?;
-
-        // Single-file batch: skip the per-row `rle` pass.
         let file_str = file_col
             .str()
             .map_err(|e| delta_kernel::Error::Generic(format!("file-id column not Utf8: {e}")))?;
+
         if let Some(first) = file_str.get(0)
-            && Some(first) == file_str.get(df.height() - 1)
+            && Some(first) == file_str.get(n - 1)
         {
-            // `first` borrows df; own only on the fast path so we can move df.
             let file_id = first.to_owned();
             let out = self.apply_rewrite(&file_id, df);
             self.pending.push_back(out);
             return Ok(());
         }
 
-        let runs = polars::prelude::rle(file_col).map_err(|e| {
-            delta_kernel::Error::Generic(format!("rle on file-id column failed: {e}"))
-        })?;
-        // `rle` returns `Struct{ len: u32, value: <input dtype> }` — fixed
-        // by polars contract, so post-rle field/type lookups are infallible.
-        let runs = runs.struct_().expect("rle returns Struct");
-        let lens = runs
-            .field_by_name(polars::prelude::RLE_LENGTH_COLUMN_NAME)
-            .expect("rle Struct has length field");
-        let vals = runs
-            .field_by_name(polars::prelude::RLE_VALUE_COLUMN_NAME)
-            .expect("rle Struct has value field");
-        let lens = lens.u32().expect("rle length is u32");
-        let vals = vals.str().expect("rle value is String");
-
-        let mut offset: usize = 0;
-        for (len_opt, val_opt) in lens.iter().zip(vals.iter()) {
-            let len = len_opt.unwrap_or(0) as usize;
-            if let Some(file_id) = val_opt {
-                let sub = df.slice(offset as i64, len);
-                let out = self.apply_rewrite(file_id, sub);
+        let mut start = 0usize;
+        while start < n {
+            let cur = file_str.get(start);
+            let end = find_run_end(file_str, start, n, cur);
+            if let Some(file_id) = cur {
+                let file_id = file_id.to_owned();
+                let sub = df.slice(start as i64, end - start);
+                let out = self.apply_rewrite(&file_id, sub);
                 self.pending.push_back(out);
             }
-            offset += len;
+            start = end;
         }
         Ok(())
     }
@@ -178,6 +165,28 @@ impl LogicalScanIter {
         }
         Ok(df)
     }
+}
+
+/// First index in `start..end` where `file_str.get(i) != value`, or `end`
+/// if the value extends all the way. Requires the column to be a single
+/// run within `[start, returned_end)`.
+fn find_run_end<'a>(
+    file_str: &'a StringChunked,
+    start: usize,
+    end: usize,
+    value: Option<&'a str>,
+) -> usize {
+    let mut lo = start + 1;
+    let mut hi = end;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if file_str.get(mid) == value {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 /// Drains consumed entries off the front so per-file state shrinks as the
