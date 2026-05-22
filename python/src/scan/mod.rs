@@ -3,7 +3,7 @@
 //! the Python `register_io_source` plugin.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use delta_kernel::expressions::{Predicate, PredicateRef};
 use delta_kernel::scan::Scan;
@@ -42,10 +42,7 @@ type BatchIter = Box<dyn Iterator<Item = Result<DataFrame, delta_kernel::Error>>
 /// big wins on many-file scans.
 const COLLECT_CHUNK_ROWS: usize = 100_000;
 
-// `unsendable` because the scan iterator is `Send` but not `Sync`; Python
-// only ever drives this from a single thread anyway (the one that holds the
-// GIL when entering the io-source generator).
-#[pyclass(module = "polars_deltalake._internal", unsendable)]
+#[pyclass(module = "polars_deltalake._internal")]
 pub struct DeltaSource {
     engine: Arc<PolarsEngine>,
     snapshot: SnapshotRef,
@@ -57,7 +54,12 @@ pub struct DeltaSource {
     /// User predicate, pre-split at top-level `AND`, each tagged with whether
     /// it was kernel-translatable. Empty when unset.
     original_predicate: Vec<Conjunct>,
-    iter: Option<BatchIter>,
+    /// `Mutex` to satisfy `pyclass`'s `Send + Sync` requirement — the iterator
+    /// itself is only `Send` (polars `CollectBatches` carries a `Box<dyn FnOnce
+    /// + Send>` so it isn't `Sync`). polars-stream parallelises multi-source
+    /// queries by sending source pyclasses between worker threads, so the
+    /// previous `unsendable` marker panicked on joins.
+    iter: Mutex<Option<BatchIter>>,
     rows_emitted: usize,
 }
 
@@ -125,7 +127,7 @@ impl DeltaSource {
                 self.original_predicate = conjuncts;
             }
         }
-        self.iter = None;
+        *self.iter.get_mut().expect("Mutex poisoned") = None;
         self.rows_emitted = 0;
         Ok(())
     }
@@ -197,7 +199,7 @@ impl DeltaSource {
             n_rows: None,
             kernel_predicate: None,
             original_predicate: Vec::new(),
-            iter: None,
+            iter: Mutex::new(None),
             rows_emitted: 0,
         })
     }
@@ -226,7 +228,7 @@ impl DeltaSource {
 
         let resolved = resolve_scan(&scan, engine.as_ref())?;
         if resolved.files.is_empty() {
-            self.iter = Some(Box::new(std::iter::empty()));
+            *self.iter.get_mut().expect("Mutex poisoned") = Some(Box::new(std::iter::empty()));
             self.rows_emitted = 0;
             return Ok(());
         }
@@ -256,7 +258,7 @@ impl DeltaSource {
                 &table_logical_schema,
             )?;
             if surviving.is_empty() {
-                self.iter = Some(Box::new(std::iter::empty()));
+                *self.iter.get_mut().expect("Mutex poisoned") = Some(Box::new(std::iter::empty()));
                 self.rows_emitted = 0;
                 return Ok(());
             }
@@ -305,8 +307,8 @@ impl DeltaSource {
         let source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send> =
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
 
-        if needs_rewrite {
-            let logical_iter = LogicalScanIter::new(
+        let new_iter: BatchIter = if needs_rewrite {
+            Box::new(LogicalScanIter::new(
                 source,
                 path_index,
                 rewrites,
@@ -314,24 +316,21 @@ impl DeltaSource {
                 physical_schema,
                 logical_schema,
                 conjunction(routing.post_transform),
-            );
-            self.iter = Some(Box::new(logical_iter));
+            ))
         } else {
             debug_assert!(
                 routing.post_transform.is_empty(),
                 "post_transform requires Transform to materialize partition cols",
             );
-            self.iter =
-                Some(Box::new(source.map(|r| {
-                    r.map_err(|e| delta_kernel::Error::Generic(format!("{e:#}")))
-                })));
-        }
+            Box::new(source.map(|r| r.map_err(|e| delta_kernel::Error::Generic(format!("{e:#}")))))
+        };
+        *self.iter.get_mut().expect("Mutex poisoned") = Some(new_iter);
         self.rows_emitted = 0;
         Ok(())
     }
 
     fn next_batch(&mut self) -> anyhow::Result<Option<PyDataFrame>> {
-        if self.iter.is_none() {
+        if self.iter.get_mut().expect("Mutex poisoned").is_none() {
             self.build_iter()?;
         }
 
@@ -342,7 +341,12 @@ impl DeltaSource {
                 return Ok(None);
             }
 
-            let it = self.iter.as_mut().expect("iter set above");
+            let it = self
+                .iter
+                .get_mut()
+                .expect("Mutex poisoned")
+                .as_mut()
+                .expect("iter set above");
             let Some(next) = it.next() else {
                 return Ok(None);
             };
