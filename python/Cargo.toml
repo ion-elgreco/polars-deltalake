@@ -118,6 +118,7 @@ polars-utils = { version = "0.53", default-features = false }
 # `FOOTER_SIZE` constants, used by the suffix-range footer reader to avoid
 # downloading the whole file for kernel's `read_parquet_footer`.
 polars-parquet = { version = "0.53", default-features = false }
+polars-ffi = { version = "0.53" }
 # polars-plan exposes Expr / Operator / FunctionExpr / BooleanFunction /
 # DynLiteralValue for the polars→kernel predicate pushdown translator.
 # Feature set must broadly match what the Python polars wheel exposes so the
@@ -166,6 +167,7 @@ anyhow = "1"
 bytes = "1"
 url = "2"
 tracing = "0.1"
+rayon = "1"
 # JSON-deserialize the polars `Expr` we receive from Python instead of going
 # through pyo3-polars's bincode `PyExpr::extract`. Bincode encodes enum
 # variants by position; the Python wheel's polars-rs is built with the full
@@ -179,6 +181,14 @@ lto = true
 strip = true
 codegen-units = 1
 opt-level = "s"
+
+# Release-quality optimisation + frame pointers + symbols so samply can
+# attribute time correctly. Selected via `PROFILE=profiling just develop`.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
 
 # CI profile — fast cold-start builds with cache-friendly artifacts.
 # Inherits dev so our crate compiles cheaply, but disables incremental

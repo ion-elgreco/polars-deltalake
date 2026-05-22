@@ -2,15 +2,19 @@
 //! [`TableScan`] = a scan handle for table snapshot
 
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::expressions::{Predicate, PredicateRef};
 use delta_kernel::scan::Scan;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use polars::prelude::{DataFrame, Expr, Schema as PlSchema};
+use polars_ffi::version_0::{SeriesExport, export_column};
 use polars_plan::dsl::Engine as PolarsEngineMode;
 use pyo3::prelude::*;
-use pyo3_polars::{PyDataFrame, PySchema};
+use pyo3::sync::PyOnceLock;
+use pyo3_polars::PySchema;
+use rayon::prelude::*;
 use tokio::runtime::Runtime;
 use url::Url;
 
@@ -40,6 +44,25 @@ type BatchIter = Box<dyn Iterator<Item = Result<DataFrame, delta_kernel::Error>>
 /// polars-stream more parallelism + keeps `split_and_buffer`'s single-file
 /// big wins on many-file scans.
 const COLLECT_CHUNK_ROWS: usize = 100_000;
+
+const PAR_EXPORT_THRESHOLD: usize = 32;
+
+static IMPORT_COLUMNS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn import_columns_fn(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    IMPORT_COLUMNS
+        .get_or_try_init(py, || {
+            py.import("polars")?
+                .getattr("DataFrame")?
+                .getattr("_import_columns")
+                .map(|m| m.unbind())
+        })
+        .map(|p| p.bind(py))
+}
+
+#[repr(transparent)]
+struct SendExport(ManuallyDrop<SeriesExport>);
+unsafe impl Send for SendExport {}
 
 #[pyclass(frozen, module = "polars_deltalake._internal")]
 pub struct TableState {
@@ -212,8 +235,16 @@ impl TableScan {
         Ok(())
     }
 
-    fn next(&self, py: Python<'_>) -> PyResult<Option<PyDataFrame>> {
-        py.detach(|| self.next_batch()).map_err(py_err)
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let exports = py.detach(|| self.next_exports()).map_err(py_err)?;
+        let Some(exports) = exports else {
+            return Ok(None);
+        };
+
+        let addr = exports.as_ptr() as usize;
+        import_columns_fn(py)?
+            .call1((addr, exports.len()))
+            .map(Some)
     }
 }
 
@@ -341,7 +372,7 @@ impl TableScan {
         Ok(())
     }
 
-    fn next_batch(&self) -> anyhow::Result<Option<PyDataFrame>> {
+    fn next_exports(&self) -> anyhow::Result<Option<Vec<SendExport>>> {
         let mut state = self.state.lock().expect("Mutex poisoned");
         if state.iter.is_none() {
             self.build_iter(&mut state)?;
@@ -371,11 +402,19 @@ impl TableScan {
                 }
             }
 
-            // Rechunking once here is cheaper than letting every consumer pay for it
+            // Rechunk once here saves every downstream consumer (hash
+            // joins especially) from rechunking per batch.
             df.rechunk_mut_par();
-
             state.rows_emitted += df.height();
-            return Ok(Some(PyDataFrame(df)));
+
+            let columns = df.columns();
+            let export = |c| SendExport(ManuallyDrop::new(export_column(c)));
+            let exports: Vec<SendExport> = if columns.len() >= PAR_EXPORT_THRESHOLD {
+                columns.par_iter().map(export).collect()
+            } else {
+                columns.iter().map(export).collect()
+            };
+            return Ok(Some(exports));
         }
     }
 }
