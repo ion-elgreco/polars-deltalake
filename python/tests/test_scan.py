@@ -9,7 +9,7 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from polars_deltalake import DeltaSource, scan_delta
+from polars_deltalake import TableState, scan_delta
 
 
 @pytest.fixture
@@ -385,7 +385,7 @@ class TestPredicateRouting:
 
     def test_translatable_data(self, multi_file_partitioned):
         """`id >= 3` — kernel file-stats + parquet row-group/row filter."""
-        src = DeltaSource(multi_file_partitioned)
+        src = TableState(multi_file_partitioned)
         assert src._classify_predicate(pl.col("id") >= 3) == {  # type: ignore
             "kernel": 1,
             "parquet_filter": 1,
@@ -395,7 +395,7 @@ class TestPredicateRouting:
 
     def test_translatable_partition(self, multi_file_partitioned):
         """`g == 'b'` — kernel exact-skips files; nothing else needed."""
-        src = DeltaSource(multi_file_partitioned)
+        src = TableState(multi_file_partitioned)
         assert src._classify_predicate(pl.col("g") == "b") == {  # type: ignore
             "kernel": 1,
             "parquet_filter": 0,
@@ -405,7 +405,7 @@ class TestPredicateRouting:
 
     def test_untranslatable_data(self, multi_file_partitioned):
         """`id.abs() >= 4` — only parquet_filter; kernel can't translate `abs`."""
-        src = DeltaSource(multi_file_partitioned)
+        src = TableState(multi_file_partitioned)
         assert src._classify_predicate(pl.col("id").abs() >= 4) == {  # type: ignore
             "kernel": 0,
             "parquet_filter": 1,
@@ -415,7 +415,7 @@ class TestPredicateRouting:
 
     def test_untranslatable_partition(self, multi_file_partitioned):
         """`g.str.to_uppercase() == 'B'` — option-2 partition prune only."""
-        src = DeltaSource(multi_file_partitioned)
+        src = TableState(multi_file_partitioned)
         assert src._classify_predicate(pl.col("g").str.to_uppercase() == "B") == {  # type: ignore
             "kernel": 0,
             "parquet_filter": 0,
@@ -426,7 +426,7 @@ class TestPredicateRouting:
     def test_translatable_mixed_atomic(self, multi_file_partitioned):
         """`(g == 'a') | (id == 3)` — kernel best-effort file-skips, but
         rows in surviving files need post-transform eval."""
-        src = DeltaSource(multi_file_partitioned)
+        src = TableState(multi_file_partitioned)
         assert src._classify_predicate(  # type: ignore
             (pl.col("g") == "a") | (pl.col("id") == 3)
         ) == {
@@ -439,7 +439,7 @@ class TestPredicateRouting:
     def test_untranslatable_mixed_atomic(self, multi_file_partitioned):
         """`(g.upper() == 'A') | (id == 3)` — kernel can't translate; only
         post-transform eval can handle it."""
-        src = DeltaSource(multi_file_partitioned)
+        src = TableState(multi_file_partitioned)
         assert src._classify_predicate(  # type: ignore
             (pl.col("g").str.to_uppercase() == "A") | (pl.col("id") == 3)
         ) == {
@@ -452,7 +452,7 @@ class TestPredicateRouting:
     def test_and_chain_routes_per_conjunct(self, multi_file_partitioned):
         """Top-level AND splits; both conjuncts are translatable so both go
         to kernel. `id >= 4` additionally goes to parquet_filter."""
-        src = DeltaSource(multi_file_partitioned)
+        src = TableState(multi_file_partitioned)
         assert src._classify_predicate((pl.col("g") == "b") & (pl.col("id") >= 4)) == {  # type: ignore
             "kernel": 2,
             "parquet_filter": 1,
@@ -462,7 +462,7 @@ class TestPredicateRouting:
 
     def test_three_way_and_routes_per_conjunct(self, multi_file_partitioned):
         """3 conjuncts: 2 translatable (kernel) + 2 data (parquet_filter)."""
-        src = DeltaSource(multi_file_partitioned)
+        src = TableState(multi_file_partitioned)
         assert src._classify_predicate(  # type: ignore
             (pl.col("g") == "b") & (pl.col("id") >= 3) & (pl.col("id").abs() <= 5)
         ) == {

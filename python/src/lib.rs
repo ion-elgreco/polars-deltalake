@@ -9,10 +9,11 @@ mod translation;
 
 use pyo3::prelude::*;
 
-use crate::scan::DeltaSource;
+use crate::scan::{TableScan, TableState};
 
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<DeltaSource>()?;
+    m.add_class::<TableState>()?;
+    m.add_class::<TableScan>()?;
     Ok(())
 }

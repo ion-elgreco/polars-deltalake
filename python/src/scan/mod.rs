@@ -1,6 +1,5 @@
-//! `DeltaSource` — pyclass driving `delta_kernel::Scan` against our engine.
-//! Each `next()` yields the next polars `DataFrame` as `PyDataFrame` for
-//! the Python `register_io_source` plugin.
+//! [`TableState`] = the opened table (snapshot + engine + schema).
+//! [`TableScan`] = a scan handle for table snapshot
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -42,29 +41,15 @@ type BatchIter = Box<dyn Iterator<Item = Result<DataFrame, delta_kernel::Error>>
 /// big wins on many-file scans.
 const COLLECT_CHUNK_ROWS: usize = 100_000;
 
-#[pyclass(module = "polars_deltalake._internal")]
-pub struct DeltaSource {
+#[pyclass(frozen, module = "polars_deltalake._internal")]
+pub struct TableState {
     engine: Arc<PolarsEngine>,
     snapshot: SnapshotRef,
     schema: Arc<PlSchema>,
-    projection: Option<Vec<String>>,
-    n_rows: Option<usize>,
-    /// File-level stats skipping in kernel.
-    kernel_predicate: Option<PredicateRef>,
-    /// User predicate, pre-split at top-level `AND`, each tagged with whether
-    /// it was kernel-translatable. Empty when unset.
-    original_predicate: Vec<Conjunct>,
-    /// `Mutex` to satisfy `pyclass`'s `Send + Sync` requirement — the iterator
-    /// itself is only `Send` (polars `CollectBatches` carries a `Box<dyn FnOnce
-    /// + Send>` so it isn't `Sync`). polars-stream parallelises multi-source
-    /// queries by sending source pyclasses between worker threads, so the
-    /// previous `unsendable` marker panicked on joins.
-    iter: Mutex<Option<BatchIter>>,
-    rows_emitted: usize,
 }
 
 #[pymethods]
-impl DeltaSource {
+impl TableState {
     #[new]
     #[pyo3(signature = (uri, version=None, storage_options=None))]
     fn new(
@@ -81,63 +66,8 @@ impl DeltaSource {
         PySchema(self.schema.clone())
     }
 
-    #[pyo3(signature = (with_columns=None, n_rows=None, predicate=None))]
-    fn configure(
-        &mut self,
-        with_columns: Option<Vec<String>>,
-        n_rows: Option<usize>,
-        predicate: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<()> {
-        self.projection = with_columns;
-        self.n_rows = n_rows;
-        match predicate {
-            None => {
-                self.kernel_predicate = None;
-                self.original_predicate.clear();
-            }
-            Some(p) => {
-                let expr = extract_expr_via_json(&p)?;
-                // Per-conjunct so one untranslatable term doesn't disable
-                // file-skipping for its siblings.
-                let mut translated: Vec<Predicate> = Vec::new();
-                let mut conjuncts: Vec<Conjunct> = Vec::new();
-                for c in flatten_and_conjuncts(&expr) {
-                    let kernel_translatable = match polars_expr_to_kernel_predicate(c) {
-                        Some(kp) => {
-                            translated.push(kp);
-                            true
-                        }
-                        None => {
-                            tracing::debug!(
-                                target: "polars_deltalake::pushdown",
-                                conjunct = ?c,
-                                "conjunct not translatable to kernel; \
-                                 relying on polars-io / Python-side filter",
-                            );
-                            false
-                        }
-                    };
-                    conjuncts.push(Conjunct {
-                        expr: c.clone(),
-                        kernel_translatable,
-                    });
-                }
-                self.kernel_predicate =
-                    (!translated.is_empty()).then(|| Arc::new(Predicate::and_from(translated)));
-                self.original_predicate = conjuncts;
-            }
-        }
-        *self.iter.get_mut().expect("Mutex poisoned") = None;
-        self.rows_emitted = 0;
-        Ok(())
-    }
-
-    fn next(&mut self) -> PyResult<Option<PyDataFrame>> {
-        self.next_batch().map_err(py_err)
-    }
-
     /// Test / debug helper: classify a predicate by where each conjunct
-    /// would be routed, without running a scan
+    /// would be routed, without running a scan.
     fn _classify_predicate(&self, predicate: Bound<'_, PyAny>) -> PyResult<HashMap<String, usize>> {
         let expr = extract_expr_via_json(&predicate)?;
         let conjuncts: Vec<Conjunct> = flatten_and_conjuncts(&expr)
@@ -169,7 +99,7 @@ impl DeltaSource {
     }
 }
 
-impl DeltaSource {
+impl TableState {
     fn open(
         uri: &str,
         version: Option<u64>,
@@ -195,18 +125,102 @@ impl DeltaSource {
             engine,
             snapshot,
             schema,
-            projection: None,
-            n_rows: None,
-            kernel_predicate: None,
-            original_predicate: Vec::new(),
-            iter: Mutex::new(None),
-            rows_emitted: 0,
         })
     }
+}
 
-    fn build_scan(&self) -> anyhow::Result<Scan> {
+#[pyclass(frozen, module = "polars_deltalake._internal")]
+pub struct TableScan {
+    engine: Arc<PolarsEngine>,
+    snapshot: SnapshotRef,
+    state: Mutex<ScanState>,
+}
+
+#[derive(Default)]
+struct ScanState {
+    projection: Option<Vec<String>>,
+    n_rows: Option<usize>,
+    /// File-level stats skipping in kernel.
+    kernel_predicate: Option<PredicateRef>,
+    /// User predicate, pre-split at top-level `AND`, each tagged with whether
+    /// it was kernel-translatable. Empty when unset.
+    original_predicate: Vec<Conjunct>,
+    iter: Option<BatchIter>,
+    rows_emitted: usize,
+}
+
+#[pymethods]
+impl TableScan {
+    #[new]
+    fn new(state: &TableState) -> Self {
+        Self {
+            engine: state.engine.clone(),
+            snapshot: state.snapshot.clone(),
+            state: Mutex::new(ScanState::default()),
+        }
+    }
+
+    #[pyo3(signature = (with_columns=None, n_rows=None, predicate=None))]
+    fn configure(
+        &self,
+        with_columns: Option<Vec<String>>,
+        n_rows: Option<usize>,
+        predicate: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let mut state = self.state.lock().expect("Mutex poisoned");
+        state.projection = with_columns;
+        state.n_rows = n_rows;
+        match predicate {
+            None => {
+                state.kernel_predicate = None;
+                state.original_predicate.clear();
+            }
+            Some(p) => {
+                let expr = extract_expr_via_json(&p)?;
+                // Per-conjunct so one untranslatable term doesn't disable
+                // file-skipping for its siblings.
+                let mut translated: Vec<Predicate> = Vec::new();
+                let mut conjuncts: Vec<Conjunct> = Vec::new();
+                for c in flatten_and_conjuncts(&expr) {
+                    let kernel_translatable = match polars_expr_to_kernel_predicate(c) {
+                        Some(kp) => {
+                            translated.push(kp);
+                            true
+                        }
+                        None => {
+                            tracing::debug!(
+                                target: "polars_deltalake::pushdown",
+                                conjunct = ?c,
+                                "conjunct not translatable to kernel; \
+                                 relying on polars-io / Python-side filter",
+                            );
+                            false
+                        }
+                    };
+                    conjuncts.push(Conjunct {
+                        expr: c.clone(),
+                        kernel_translatable,
+                    });
+                }
+                state.kernel_predicate =
+                    (!translated.is_empty()).then(|| Arc::new(Predicate::and_from(translated)));
+                state.original_predicate = conjuncts;
+            }
+        }
+        state.iter = None;
+        state.rows_emitted = 0;
+        Ok(())
+    }
+
+    fn next(&self, py: Python<'_>) -> PyResult<Option<PyDataFrame>> {
+        py.detach(|| self.next_batch()).map_err(py_err)
+    }
+}
+
+impl TableScan {
+    fn build_scan(&self, state: &ScanState) -> anyhow::Result<Scan> {
         let mut sb = self.snapshot.clone().scan_builder();
-        if let Some(cols) = &self.projection {
+        if let Some(cols) = &state.projection {
             let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
             let projected = self
                 .snapshot
@@ -215,21 +229,21 @@ impl DeltaSource {
                 .map_err(|e| anyhow::anyhow!("projection error: {e:#}"))?;
             sb = sb.with_schema(Arc::new(projected));
         }
-        if let Some(pred) = &self.kernel_predicate {
+        if let Some(pred) = &state.kernel_predicate {
             sb = sb.with_predicate(pred.clone());
         }
         sb.build()
             .map_err(|e| anyhow::anyhow!("failed to build scan: {e:#}"))
     }
 
-    fn build_iter(&mut self) -> anyhow::Result<()> {
-        let scan = self.build_scan()?;
+    fn build_iter(&self, state: &mut ScanState) -> anyhow::Result<()> {
+        let scan = self.build_scan(state)?;
         let engine: Arc<dyn Engine> = self.engine.clone();
 
         let resolved = resolve_scan(&scan, engine.as_ref())?;
         if resolved.files.is_empty() {
-            *self.iter.get_mut().expect("Mutex poisoned") = Some(Box::new(std::iter::empty()));
-            self.rows_emitted = 0;
+            state.iter = Some(Box::new(std::iter::empty()));
+            state.rows_emitted = 0;
             return Ok(());
         }
         let ResolvedScan {
@@ -245,7 +259,7 @@ impl DeltaSource {
         let table_logical_schema = self.snapshot.schema();
 
         let routing = classify_conjuncts(
-            &self.original_predicate,
+            &state.original_predicate,
             column_mapped,
             &table_logical_schema,
             &physical_schema,
@@ -258,8 +272,8 @@ impl DeltaSource {
                 &table_logical_schema,
             )?;
             if surviving.is_empty() {
-                *self.iter.get_mut().expect("Mutex poisoned") = Some(Box::new(std::iter::empty()));
-                self.rows_emitted = 0;
+                state.iter = Some(Box::new(std::iter::empty()));
+                state.rows_emitted = 0;
                 return Ok(());
             }
             if surviving.len() < files.len() {
@@ -324,29 +338,25 @@ impl DeltaSource {
             );
             Box::new(source.map(|r| r.map_err(|e| delta_kernel::Error::Generic(format!("{e:#}")))))
         };
-        *self.iter.get_mut().expect("Mutex poisoned") = Some(new_iter);
-        self.rows_emitted = 0;
+        state.iter = Some(new_iter);
+        state.rows_emitted = 0;
         Ok(())
     }
 
-    fn next_batch(&mut self) -> anyhow::Result<Option<PyDataFrame>> {
-        if self.iter.get_mut().expect("Mutex poisoned").is_none() {
-            self.build_iter()?;
+    fn next_batch(&self) -> anyhow::Result<Option<PyDataFrame>> {
+        let mut state = self.state.lock().expect("Mutex poisoned");
+        if state.iter.is_none() {
+            self.build_iter(&mut state)?;
         }
 
         loop {
-            if let Some(cap) = self.n_rows
-                && self.rows_emitted >= cap
+            if let Some(cap) = state.n_rows
+                && state.rows_emitted >= cap
             {
                 return Ok(None);
             }
 
-            let it = self
-                .iter
-                .get_mut()
-                .expect("Mutex poisoned")
-                .as_mut()
-                .expect("iter set above");
+            let it = state.iter.as_mut().expect("iter set above");
             let Some(next) = it.next() else {
                 return Ok(None);
             };
@@ -356,14 +366,14 @@ impl DeltaSource {
                 continue;
             }
 
-            if let Some(cap) = self.n_rows {
-                let remaining = cap.saturating_sub(self.rows_emitted);
+            if let Some(cap) = state.n_rows {
+                let remaining = cap.saturating_sub(state.rows_emitted);
                 if df.height() > remaining {
                     df = df.head(Some(remaining));
                 }
             }
 
-            self.rows_emitted += df.height();
+            state.rows_emitted += df.height();
             return Ok(Some(PyDataFrame(df)));
         }
     }

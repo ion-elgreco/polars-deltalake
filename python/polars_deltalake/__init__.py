@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 from polars.io.plugins import register_io_source
 
-from polars_deltalake._internal import DeltaSource
+from polars_deltalake._internal import TableScan, TableState
 
 if TYPE_CHECKING:
     pass
 
-__all__ = ["DeltaSource", "read_delta", "scan_delta"]
+__all__ = ["TableScan", "TableState", "read_delta", "scan_delta"]
 
 
 def read_delta(
@@ -53,12 +53,8 @@ def scan_delta(
         A Polars ``LazyFrame`` that streams the table's rows as
         ``pl.DataFrame`` batches when collected.
     """
-    # Snapshot the delta log once; reuse the same `DeltaSource` for the
-    # schema probe and every io-source invocation. `configure` resets all
-    # pushdown state per call so polars can re-collect the LazyFrame without
-    # bleeding state across invocations.
-    src = DeltaSource(uri, version, storage_options)
-    schema = src.schema()
+    table = TableState(uri, version, storage_options)
+    schema = table.schema()
 
     def source(
         with_columns: list[str] | None,
@@ -66,8 +62,9 @@ def scan_delta(
         n_rows: int | None,
         _batch_size_hint: int | None,
     ) -> Iterator[pl.DataFrame]:
-        src.configure(with_columns, n_rows, predicate)
-        while (df := src.next()) is not None:
+        scan = TableScan(table)
+        scan.configure(with_columns, n_rows, predicate)
+        while (df := scan.next()) is not None:
             yield df
 
     return register_io_source(source, schema=schema)

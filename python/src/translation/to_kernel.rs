@@ -1,6 +1,6 @@
 //! Polars `Expr` → delta-kernel `Predicate` translation, used by
-//! `DeltaSource::try_set_predicate` to push polars filters into the kernel
-//! scan (which then applies them to per-file parquet stats during planning).
+//! `TableScan::configure` to push polars filters into the kernel scan
+//! (which then applies them to per-file parquet stats during planning).
 //!
 //! The translator is best-effort and intentionally narrow: it recognises the
 //! subset of polars `Expr` shapes that have a 1:1 kernel equivalent (column
