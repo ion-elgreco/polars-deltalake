@@ -371,6 +371,9 @@ impl TableScan {
                 }
             }
 
+            // Rechunking once here is cheaper than letting every consumer pay for it
+            df.rechunk_mut_par();
+
             state.rows_emitted += df.height();
             return Ok(Some(PyDataFrame(df)));
         }
