@@ -312,8 +312,6 @@ impl TableScan {
 
         let rt: &'static Runtime = crate::engine::rt();
         let _enter = rt.enter();
-        // `maintain_order=true` keeps file-id runs contiguous, which the
-        // `rle` split + DV-prefix consumption in `LogicalScanIter` requires.
         let chunk_size = std::num::NonZeroUsize::new(COLLECT_CHUNK_ROWS);
         let batches = lazy
             .collect_batches(PolarsEngineMode::Streaming, true, chunk_size, false)
