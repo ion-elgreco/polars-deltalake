@@ -7,11 +7,14 @@ use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, ColumnName, Expression, ExpressionRef, UnaryExpression,
     UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
-use delta_kernel::schema::{DataType as KernelDataType, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, StructType};
+use delta_kernel::transform_output_type;
+use delta_kernel::transforms::SchemaTransform;
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{Expr, coalesce, col, lit, when};
 use polars_utils::pl_str::PlSmallStr;
+use std::borrow::Cow;
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::errors::to_kernel_err;
@@ -62,13 +65,49 @@ pub(super) fn translate_expr(
             "translate_expr: Unknown expression {s}"
         ))),
         Expression::ParseJson(p) => {
+            // polars's `json_decode` requires the JSON value type to already
+            // match the target; delta-rs writes Date/Timestamp stats as ISO
+            // strings, so decode them as String first and let the struct-wide
+            // cast lift each temporal field.
             let inner = translate_expr(&p.json_expr, None, input_schema)?;
-            let output_dt = KernelDataType::Struct(Box::new((*p.output_schema).clone()))
-                .to_polars()
-                .map_err(to_kernel_err)?;
-            Ok(inner.str().json_decode(output_dt))
+            let decoded = match StringifyTemporal.transform_struct(&p.output_schema) {
+                Cow::Borrowed(_) => {
+                    let dt = KernelDataType::Struct(Box::new((*p.output_schema).clone()))
+                        .to_polars()
+                        .map_err(to_kernel_err)?;
+                    inner.str().json_decode(dt)
+                }
+                Cow::Owned(decode_schema) => {
+                    let final_dt = KernelDataType::Struct(Box::new((*p.output_schema).clone()))
+                        .to_polars()
+                        .map_err(to_kernel_err)?;
+                    let decode_dt = KernelDataType::Struct(Box::new(decode_schema))
+                        .to_polars()
+                        .map_err(to_kernel_err)?;
+                    inner.str().json_decode(decode_dt).cast(final_dt)
+                }
+            };
+            Ok(decoded)
         }
         Expression::MapToStruct(m) => translate_map_to_struct(m, output_type, input_schema),
+    }
+}
+
+/// Schema rewrite that turns `Date` / `Timestamp` / `TimestampNtz` primitives
+/// into `String`. Used to relax the `json_decode` target so ISO-string stats
+/// from delta-rs decode cleanly; a follow-up struct-wide cast lifts them.
+struct StringifyTemporal;
+
+impl<'a> SchemaTransform<'a> for StringifyTemporal {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Cow<'a, PrimitiveType> {
+        match ptype {
+            PrimitiveType::Date | PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => {
+                Cow::Owned(PrimitiveType::String)
+            }
+            _ => Cow::Borrowed(ptype),
+        }
     }
 }
 

@@ -12,7 +12,7 @@ use delta_kernel::expressions::{
     BinaryPredicate, BinaryPredicateOp, ColumnName, Expression, JunctionPredicate,
     JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
-use polars::prelude::{AnyValue, Expr, LiteralValue, Operator};
+use polars::prelude::{AnyValue, Expr, LiteralValue, Operator, TimeUnit};
 use polars_plan::dsl::function_expr::{BooleanFunction, FunctionExpr};
 use polars_plan::plans::DynLiteralValue;
 
@@ -167,6 +167,24 @@ fn bounded_cmp(
     }
 }
 
+/// Kernel stores timestamps as microseconds-since-epoch and the stats
+/// column distinguishes `Timestamp` (tz-aware, treated as UTC) from
+/// `TimestampNtz`; emitting the wrong variant trips the comparison check at
+/// file-skipping time. Overflow on ms/ns → µs returns `None` so we skip
+/// pushdown rather than feed kernel a wrong stat value.
+fn datetime_scalar(v: i64, tu: TimeUnit, has_tz: bool) -> Option<Scalar> {
+    let micros = match tu {
+        TimeUnit::Microseconds => v,
+        TimeUnit::Milliseconds => v.checked_mul(1_000)?,
+        TimeUnit::Nanoseconds => v.checked_div(1_000)?,
+    };
+    Some(if has_tz {
+        Scalar::Timestamp(micros)
+    } else {
+        Scalar::TimestampNtz(micros)
+    })
+}
+
 /// `None` for nulls and any variant that has no signed-Long-or-narrower
 /// representation (e.g. UInt64 ≥ 2⁶³). The caller decides whether `None`
 /// is an error or a skip signal.
@@ -190,7 +208,8 @@ fn any_value_to_scalar(av: &AnyValue<'_>) -> Option<Scalar> {
         AnyValue::Binary(b) => Scalar::Binary(b.to_vec()),
         AnyValue::BinaryOwned(b) => Scalar::Binary(b.clone()),
         AnyValue::Date(d) => Scalar::Date(*d),
-        AnyValue::Datetime(v, _, _) | AnyValue::DatetimeOwned(v, _, _) => Scalar::Timestamp(*v),
+        AnyValue::Datetime(v, tu, tz) => datetime_scalar(*v, *tu, tz.is_some())?,
+        AnyValue::DatetimeOwned(v, tu, tz) => datetime_scalar(*v, *tu, tz.is_some())?,
         _ => return None,
     })
 }
