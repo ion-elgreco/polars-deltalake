@@ -37,9 +37,10 @@ use predicate::{
 type BatchIter = Box<dyn Iterator<Item = Result<DataFrame, delta_kernel::Error>> + Send>;
 
 /// Rows per morsel handed to the Python plugin. polars-stream's default is
-/// ~12.5k — too small; each batch pays the FFI crossing cost. 500k is the
-/// sweet spot for narrow tables; very wide schemas may want to lower it.
-const COLLECT_CHUNK_ROWS: usize = 500_000;
+/// ~12.5k — too small; each batch pays the FFI crossing cost. 100k gives
+/// polars-stream more parallelism + keeps `split_and_buffer`'s single-file
+/// big wins on many-file scans.
+const COLLECT_CHUNK_ROWS: usize = 100_000;
 
 // `unsendable` because the scan iterator is `Send` but not `Sync`; Python
 // only ever drives this from a single thread anyway (the one that holds the
