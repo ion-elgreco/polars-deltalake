@@ -197,8 +197,7 @@ pub(crate) fn unified_scan_args(
 ) -> UnifiedScanArgs {
     UnifiedScanArgs {
         cloud_options: cloud_opts.cloned(),
-        // visit_rows requires a single chunk per frame.
-        rechunk: true,
+        rechunk: false,
         glob: false,
         hive_options: polars::prelude::HiveOptions::new_disabled(),
         cast_columns_policy: CastColumnsPolicy {
