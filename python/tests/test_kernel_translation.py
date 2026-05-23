@@ -1,0 +1,384 @@
+"""Tests for `to_kernel`: classification (does each shape lower to a kernel
+`Predicate`?) and end-to-end correctness (do filter results match?).
+
+Classification asserts via `TableState._classify_predicate`, which counts
+kernel-translatable conjuncts in the ``"kernel"`` bucket.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+import polars as pl
+import pytest
+from deltalake import write_deltalake
+
+from polars_deltalake import TableState, scan_delta
+
+
+@pytest.fixture
+def rich_table(tmp_path: Path) -> str:
+    """Three rows (`id ∈ {1, 2, 3}`) covering every column type the
+    translator can produce a kernel literal for. End-to-end tests assert
+    surviving ids per shape."""
+    df = pl.DataFrame(
+        {
+            "id": pl.Series([1, 2, 3], dtype=pl.Int64),
+            "small": pl.Series([1, 2, 3], dtype=pl.Int32),
+            "u": pl.Series([1, 2, 3], dtype=pl.UInt32),
+            "f": pl.Series([0.5, 1.5, 2.5], dtype=pl.Float64),
+            "s": pl.Series(["a", "b", "c"], dtype=pl.String),
+            "b": pl.Series([True, False, True], dtype=pl.Boolean),
+            "d": pl.Series(
+                [date(2024, 1, 1), date(2024, 6, 1), date(2024, 12, 31)],
+                dtype=pl.Date,
+            ),
+            "t": pl.Series(
+                [
+                    datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    datetime(2024, 6, 1, tzinfo=timezone.utc),
+                    datetime(2024, 12, 31, tzinfo=timezone.utc),
+                ],
+                dtype=pl.Datetime("us", time_zone="UTC"),
+            ),
+            "t_ntz": pl.Series(
+                [
+                    datetime(2024, 1, 1),
+                    datetime(2024, 6, 1),
+                    datetime(2024, 12, 31),
+                ],
+                dtype=pl.Datetime("us"),
+            ),
+            "dec": pl.Series(
+                [Decimal("1.23"), Decimal("4.56"), Decimal("7.89")],
+                dtype=pl.Decimal(precision=10, scale=2),
+            ),
+        }
+    )
+    path = tmp_path / "rich"
+    write_deltalake(str(path), df.to_arrow())
+    return str(path)
+
+
+def _kernel_count(table: str, predicate: pl.Expr) -> int:
+    """Conjuncts (after top-level AND split) that reach the kernel bucket."""
+    return TableState(table)._classify_predicate(predicate)["kernel"]  # type: ignore[attr-defined]
+
+
+class TestComparisons:
+    """All six comparison operators against typed literals."""
+
+    @pytest.mark.parametrize(
+        ("col", "value"),
+        [
+            ("id", 1),
+            ("small", 1),
+            ("u", 1),
+            ("f", 1.5),
+            ("s", "a"),
+            ("b", True),
+            ("d", date(2024, 1, 1)),
+            ("t", datetime(2024, 1, 1, tzinfo=timezone.utc)),
+            ("t_ntz", datetime(2024, 1, 1)),
+            ("dec", Decimal("1.23")),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "op",
+        ["eq", "ne", "lt", "le", "gt", "ge"],
+    )
+    def test_binary_comparison(self, rich_table, col, value, op):
+        expr = getattr(pl.col(col), op)(value)
+        assert _kernel_count(rich_table, expr) == 1, f"{col} {op} {value!r}"
+
+    def test_null_aware_equality(self, rich_table):
+        """`eq_missing` / `ne_missing` lower to kernel's null-aware
+        `Distinct`."""
+        assert _kernel_count(rich_table, pl.col("id").eq_missing(1)) == 1
+        assert _kernel_count(rich_table, pl.col("id").ne_missing(1)) == 1
+
+
+class TestNullChecks:
+    def test_is_null(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("id").is_null()) == 1
+
+    def test_is_not_null(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("id").is_not_null()) == 1
+
+
+class TestIsIn:
+    """`col.is_in([…])` → flattened OR-chain of equalities."""
+
+    def test_int_list(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("id").is_in([1, 2, 3])) == 1
+
+    def test_string_list(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("s").is_in(["a", "b"])) == 1
+
+    def test_float_list(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("f").is_in([0.5, 1.5])) == 1
+
+    def test_single_value(self, rich_table):
+        # Optimizer doesn't fold `is_in([x])` → `==`, so we must handle it.
+        assert _kernel_count(rich_table, pl.col("id").is_in([1])) == 1
+
+    def test_empty_list(self, rich_table):
+        # `is_in([])` → `lit(false)` so kernel prunes the whole table.
+        assert _kernel_count(rich_table, pl.col("id").is_in([])) == 1
+
+    def test_below_cap_translates(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("id").is_in(list(range(512)))) == 1
+
+    def test_above_cap_falls_back(self, rich_table):
+        # Above the expansion cap polars-io handles the predicate row-wise.
+        assert _kernel_count(rich_table, pl.col("id").is_in(list(range(513)))) == 0
+
+
+class TestIsBetween:
+    """Every `closed=` variant decomposes into a strict-or-inclusive pair."""
+
+    @pytest.mark.parametrize("closed", ["both", "left", "right", "none"])
+    def test_closed_variants(self, rich_table, closed):
+        expr = pl.col("id").is_between(1, 5, closed=closed)
+        assert _kernel_count(rich_table, expr) == 1
+
+
+class TestNot:
+    """The optimizer folds `~(cmp)` and `~is_null()` before we see them;
+    only `~col_b` arrives as a raw `Function::Not`."""
+
+    def test_not_over_is_null(self, rich_table):
+        assert _kernel_count(rich_table, ~pl.col("id").is_null()) == 1
+
+    def test_not_over_eq_folds_to_ne(self, rich_table):
+        assert _kernel_count(rich_table, ~(pl.col("id") == 1)) == 1
+
+    def test_not_boolean_column(self, rich_table):
+        assert _kernel_count(rich_table, ~pl.col("b")) == 1
+
+
+class TestJunctions:
+    """Top-level AND splits per-conjunct; OR stays a single Junction."""
+
+    def test_and(self, rich_table):
+        expr = (pl.col("id") == 1) & (pl.col("f") < 2.0)
+        assert _kernel_count(rich_table, expr) == 2
+
+    def test_or(self, rich_table):
+        expr = (pl.col("id") == 1) | (pl.col("f") < 2.0)
+        assert _kernel_count(rich_table, expr) == 1
+
+    def test_or_chain(self, rich_table):
+        expr = (pl.col("id") == 1) | (pl.col("id") == 2) | (pl.col("id") == 3)
+        assert _kernel_count(rich_table, expr) == 1
+
+    def test_and_chain_three_way(self, rich_table):
+        expr = (pl.col("id") >= 1) & (pl.col("id") <= 10) & (pl.col("s") == "a")
+        assert _kernel_count(rich_table, expr) == 3
+
+
+class TestBooleanColumn:
+    def test_bare_boolean_column(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("b")) == 1
+
+    def test_boolean_column_and_comparison(self, rich_table):
+        expr = pl.col("b") & (pl.col("id") == 1)
+        assert _kernel_count(rich_table, expr) == 2
+
+
+class TestBooleanLiteral:
+    """Optimizer drops `expr & True` and `expr | False`, but keeps
+    `expr & False` and `expr | True` — both legs must lower."""
+
+    def test_lit_true_alone(self, rich_table):
+        assert _kernel_count(rich_table, pl.lit(True)) == 1
+
+    def test_lit_false_alone(self, rich_table):
+        assert _kernel_count(rich_table, pl.lit(False)) == 1
+
+    def test_and_false_kept_by_optimizer(self, rich_table):
+        expr = (pl.col("id") == 1) & pl.lit(False)
+        assert _kernel_count(rich_table, expr) == 2
+
+    def test_or_true_kept_by_optimizer(self, rich_table):
+        expr = (pl.col("id") == 1) | pl.lit(True)
+        assert _kernel_count(rich_table, expr) == 1
+
+
+class TestPredicateEqualsBool:
+    """`<pred> == lit(bool)` / `!=` — folded by the translator."""
+
+    def test_predicate_eq_true(self, rich_table):
+        expr = (pl.col("id") > 0) == True  # noqa: E712
+        assert _kernel_count(rich_table, expr) == 1
+
+    def test_predicate_eq_false(self, rich_table):
+        expr = (pl.col("id") > 0) == False  # noqa: E712
+        assert _kernel_count(rich_table, expr) == 1
+
+    def test_predicate_ne_true(self, rich_table):
+        expr = (pl.col("id") > 0) != True  # noqa: E712
+        assert _kernel_count(rich_table, expr) == 1
+
+    def test_predicate_ne_false(self, rich_table):
+        expr = (pl.col("id") > 0) != False  # noqa: E712
+        assert _kernel_count(rich_table, expr) == 1
+
+
+class TestCastUnwrap:
+    def test_cast_around_column(self, rich_table):
+        expr = pl.col("id").cast(pl.Int32) == 1
+        assert _kernel_count(rich_table, expr) == 1
+
+    def test_alias_around_predicate(self, rich_table):
+        expr = (pl.col("id") == 1).alias("masked")
+        assert _kernel_count(rich_table, expr) == 1
+
+
+class TestUntranslatable:
+    """Negative coverage — shapes that must stay out of the kernel bucket."""
+
+    def test_string_starts_with(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("s").str.starts_with("a")) == 0
+
+    def test_string_contains(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("s").str.contains("a")) == 0
+
+    def test_arithmetic_in_comparison(self, rich_table):
+        # Kernel doesn't use arithmetic expressions for stats pruning.
+        assert _kernel_count(rich_table, pl.col("id") + 1 < 5) == 0
+
+    def test_temporal_function(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("d").dt.year() == 2024) == 0
+
+    def test_abs(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("id").abs() >= 3) == 0
+
+
+# End-to-end correctness: catches lowerings that classify as kernel-
+# translatable but rewrite semantics incorrectly (is_in OR-chain,
+# <pred> == lit(bool) fold, is_between bound directions, …).
+
+_E2E_CASES = [
+    # Comparisons across dtypes
+    pytest.param(pl.col("id") == 1, [1], id="id-eq-1"),
+    pytest.param(pl.col("id") != 1, [2, 3], id="id-ne-1"),
+    pytest.param(pl.col("id") < 2, [1], id="id-lt-2"),
+    pytest.param(pl.col("id") <= 2, [1, 2], id="id-le-2"),
+    pytest.param(pl.col("id") > 2, [3], id="id-gt-2"),
+    pytest.param(pl.col("id") >= 2, [2, 3], id="id-ge-2"),
+    pytest.param(pl.col("small") == 2, [2], id="int32-eq"),
+    pytest.param(pl.col("u") >= 2, [2, 3], id="uint32-ge"),
+    pytest.param(pl.col("f") >= 1.5, [2, 3], id="float-ge"),
+    pytest.param(pl.col("s") == "a", [1], id="str-eq"),
+    pytest.param(pl.col("d") > date(2024, 6, 1), [3], id="date-gt"),
+    pytest.param(
+        pl.col("t") > datetime(2024, 6, 1, tzinfo=timezone.utc),
+        [3],
+        id="tz-datetime-gt",
+    ),
+    pytest.param(
+        pl.col("t_ntz") > datetime(2024, 6, 1),
+        [3],
+        id="naive-datetime-gt",
+    ),
+    pytest.param(pl.col("dec") > Decimal("3.00"), [2, 3], id="decimal-gt"),
+    # Null-aware equality (kernel `Distinct`)
+    pytest.param(pl.col("id").eq_missing(1), [1], id="eq-missing"),
+    pytest.param(pl.col("id").ne_missing(1), [2, 3], id="ne-missing"),
+    # IsNull / IsNotNull
+    pytest.param(pl.col("id").is_null(), [], id="is-null"),
+    pytest.param(pl.col("id").is_not_null(), [1, 2, 3], id="is-not-null"),
+    # IsIn — OR-chain flattening
+    pytest.param(pl.col("id").is_in([1, 3]), [1, 3], id="is-in-multi"),
+    pytest.param(pl.col("id").is_in([1]), [1], id="is-in-single"),
+    pytest.param(pl.col("id").is_in([]), [], id="is-in-empty"),
+    pytest.param(pl.col("s").is_in(["a", "c"]), [1, 3], id="is-in-strings"),
+    pytest.param(
+        pl.col("d").is_in([date(2024, 1, 1), date(2024, 12, 31)]),
+        [1, 3],
+        id="is-in-dates",
+    ),
+    # IsBetween — closed=Both/Left/Right/None
+    pytest.param(pl.col("id").is_between(1, 2), [1, 2], id="between-both"),
+    pytest.param(
+        pl.col("id").is_between(1, 3, closed="left"),
+        [1, 2],
+        id="between-left",
+    ),
+    pytest.param(
+        pl.col("id").is_between(1, 3, closed="right"),
+        [2, 3],
+        id="between-right",
+    ),
+    pytest.param(
+        pl.col("id").is_between(1, 3, closed="none"),
+        [2],
+        id="between-none",
+    ),
+    # NOT
+    pytest.param(~pl.col("b"), [2], id="not-bool-col"),
+    pytest.param(~pl.col("id").is_null(), [1, 2, 3], id="not-is-null"),
+    pytest.param(~(pl.col("id") == 1), [2, 3], id="not-eq-folded"),
+    # Boolean column as predicate
+    pytest.param(pl.col("b"), [1, 3], id="bool-col"),
+    pytest.param(pl.col("b") & (pl.col("id") <= 2), [1], id="bool-col-and-cmp"),
+    # Junctions
+    pytest.param(
+        (pl.col("id") == 1) & (pl.col("s") == "a"),
+        [1],
+        id="and-two",
+    ),
+    pytest.param(
+        (pl.col("id") == 1) | (pl.col("id") == 3),
+        [1, 3],
+        id="or-two",
+    ),
+    pytest.param(
+        (pl.col("id") >= 1) & (pl.col("id") <= 3) & (pl.col("s") != "b"),
+        [1, 3],
+        id="and-three",
+    ),
+    # Boolean literals — optimizer keeps `& False` / `| True`; both legs lower.
+    pytest.param(pl.lit(True), [1, 2, 3], id="lit-true"),
+    pytest.param(pl.lit(False), [], id="lit-false"),
+    pytest.param(
+        (pl.col("id") == 1) & pl.lit(False),
+        [],
+        id="and-lit-false",
+    ),
+    pytest.param(
+        (pl.col("id") == 1) | pl.lit(True),
+        [1, 2, 3],
+        id="or-lit-true",
+    ),
+    # `<pred> ==/!= lit(bool)` fold
+    pytest.param((pl.col("id") > 0) == True, [1, 2, 3], id="pred-eq-true"),  # noqa: E712
+    pytest.param((pl.col("id") > 0) == False, [], id="pred-eq-false"),  # noqa: E712
+    pytest.param((pl.col("id") > 0) != True, [], id="pred-ne-true"),  # noqa: E712
+    pytest.param(
+        (pl.col("id") > 0) != False,  # noqa: E712
+        [1, 2, 3],
+        id="pred-ne-false",
+    ),
+    # Cast unwrap
+    pytest.param(
+        pl.col("id").cast(pl.Int32) == 1,
+        [1],
+        id="cast-eq",
+    ),
+]
+
+
+class TestEndToEndFiltering:
+    @pytest.mark.parametrize(("predicate", "expected_ids"), _E2E_CASES)
+    def test_filter_returns_expected_ids(
+        self,
+        rich_table,
+        predicate: pl.Expr,
+        expected_ids: list[int],
+    ):
+        out = scan_delta(rich_table).filter(predicate).collect().sort("id")
+        assert out["id"].to_list() == expected_ids
