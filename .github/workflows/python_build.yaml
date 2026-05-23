@@ -82,6 +82,9 @@ jobs:
       - name: Build and install polars-deltalake
         run: just develop
 
+      - name: Run Rust unit tests
+        run: just test-rust
+
       - name: Run local tests
         run: just test-local
 

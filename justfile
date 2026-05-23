@@ -47,6 +47,10 @@ pre-commit-check:
 check:
     cd python && cargo check
 
+# cargo unit tests on the cdylib crate.
+test-rust:
+    cd python && cargo test --lib
+
 # Wipe build artifacts.
 clean:
     rm -rf python/target python/.venv

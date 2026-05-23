@@ -170,13 +170,18 @@ fn bounded_cmp(
 /// Kernel stores timestamps as microseconds-since-epoch and the stats
 /// column distinguishes `Timestamp` (tz-aware, treated as UTC) from
 /// `TimestampNtz`; emitting the wrong variant trips the comparison check at
-/// file-skipping time. Overflow on ms/ns → µs returns `None` so we skip
+/// file-skipping time. Overflow on ms → µs returns `None` so we skip
 /// pushdown rather than feed kernel a wrong stat value.
 fn datetime_scalar(v: i64, tu: TimeUnit, has_tz: bool) -> Option<Scalar> {
     let micros = match tu {
         TimeUnit::Microseconds => v,
         TimeUnit::Milliseconds => v.checked_mul(1_000)?,
-        TimeUnit::Nanoseconds => v.checked_div(1_000)?,
+        TimeUnit::Nanoseconds => {
+            if v % 1_000 != 0 {
+                return None;
+            }
+            v / 1_000
+        }
     };
     Some(if has_tz {
         Scalar::Timestamp(micros)
@@ -231,5 +236,61 @@ fn polars_expr_to_kernel_expression(expr: &Expr) -> Option<Expression> {
             _ => return None,
         })),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datetime_scalar_microseconds_passthrough() {
+        assert_eq!(
+            datetime_scalar(1_700_000_000_000_000, TimeUnit::Microseconds, true),
+            Some(Scalar::Timestamp(1_700_000_000_000_000))
+        );
+        assert_eq!(
+            datetime_scalar(1_700_000_000_000_000, TimeUnit::Microseconds, false),
+            Some(Scalar::TimestampNtz(1_700_000_000_000_000))
+        );
+    }
+
+    #[test]
+    fn datetime_scalar_milliseconds_scales_exactly() {
+        assert_eq!(
+            datetime_scalar(1_700_000_000_000, TimeUnit::Milliseconds, true),
+            Some(Scalar::Timestamp(1_700_000_000_000_000))
+        );
+    }
+
+    #[test]
+    fn datetime_scalar_nanoseconds_divisible_succeeds() {
+        // 1_700_000_000_000_000_000 ns = 1_700_000_000_000_000 µs exactly.
+        assert_eq!(
+            datetime_scalar(1_700_000_000_000_000_000, TimeUnit::Nanoseconds, true),
+            Some(Scalar::Timestamp(1_700_000_000_000_000))
+        );
+    }
+
+    #[test]
+    fn datetime_scalar_nanoseconds_subus_refuses_pushdown() {
+        // Bug A: a fixed rounding direction is unsound for one half of the
+        // operator-direction matrix (floor breaks `<` / `<=`, ceil breaks
+        // `>` / `>=`). Refuse pushdown rather than emit a possibly-wrong
+        // literal; polars-io still filters row-by-row.
+        assert_eq!(
+            datetime_scalar(1_700_000_000_000_000_999, TimeUnit::Nanoseconds, true),
+            None,
+        );
+        assert_eq!(datetime_scalar(-1_500, TimeUnit::Nanoseconds, false), None,);
+    }
+
+    #[test]
+    fn datetime_scalar_milliseconds_overflow_refuses_pushdown() {
+        // i64::MAX ms cannot be expressed as µs — `checked_mul` returns None.
+        assert_eq!(
+            datetime_scalar(i64::MAX, TimeUnit::Milliseconds, true),
+            None
+        );
     }
 }

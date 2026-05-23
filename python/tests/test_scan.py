@@ -326,6 +326,33 @@ class TestPredicatePushdown:
         )
         assert out["name"].to_list() == ["alice"]
 
+    @pytest.mark.xfail(
+        reason="polars optimizer floor-casts sub-µs Datetime(ns) literals to "
+        "the µs source-schema precision at plan time, so the predicate that "
+        "reaches our Rust callback is already lossy. Needs upstream polars "
+        "fix to operator-aware (or refuse) the implicit narrowing cast.",
+        strict=True,
+    )
+    def test_ns_subus_lt_keeps_matching_row(self, tmp_path):
+        """Sub-µs ns literal on `<` against a µs column. Row at 1_000 ns
+        satisfies `< 1_500 ns`; polars's plan-time floor-cast turns this into
+        `1 µs < 1 µs` (false) and drops the row."""
+        from deltalake import write_deltalake
+
+        table_path = str(tmp_path / "ns_subus")
+        df = pl.DataFrame(
+            {"id": [1], "ts": [1_000]},
+            schema={"id": pl.Int64, "ts": pl.Datetime("ns")},
+        )
+        write_deltalake(table_path, df.to_arrow())
+
+        out = (
+            scan_delta(table_path)
+            .filter(pl.col("ts") < pl.lit(1_500).cast(pl.Datetime("ns")))
+            .collect()
+        )
+        assert out["id"].to_list() == [1]
+
 
 class TestPartitionSkip:
     """Option-2 file skipping via polars evaluation of partition values for
