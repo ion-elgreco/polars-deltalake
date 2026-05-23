@@ -2,19 +2,20 @@
 //! `TableScan::configure` to push polars filters into the kernel scan
 //! (which then applies them to per-file parquet stats during planning).
 //!
-//! The translator is best-effort and intentionally narrow: it recognises the
-//! subset of polars `Expr` shapes that have a 1:1 kernel equivalent (column
-//! references, simple literals, comparison binops, AND/OR chains, IsNull,
-//! IsIn). Anything else returns `None` and the caller must fall back to
-//! polars-side filtering.
+//! Best-effort: recognises column refs, literals, comparisons, AND/OR,
+//! IsNull, IsBetween, IsIn, NOT, and boolean constants. Anything else
+//! returns `None` and the caller falls back to polars-side filtering.
 
 use delta_kernel::expressions::{
-    BinaryPredicate, BinaryPredicateOp, ColumnName, Expression, JunctionPredicate,
-    JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
+    ColumnName, DecimalData, Expression, JunctionPredicateOp, Predicate, Scalar,
 };
-use polars::prelude::{AnyValue, Expr, LiteralValue, Operator, TimeUnit};
+use delta_kernel::schema::DecimalType;
+use polars::prelude::{AnyValue, Expr, LiteralValue, Operator, Series, TimeUnit};
 use polars_plan::dsl::function_expr::{BooleanFunction, FunctionExpr};
 use polars_plan::plans::DynLiteralValue;
+
+/// Above this, refuse the IsIn → OR-chain rewrite
+const MAX_IN_LIST_KERNEL_EXPANSION: usize = 512;
 
 /// Try to translate a polars filter `Expr` into a kernel `Predicate`. Returns
 /// `None` if any sub-expression is outside the supported subset.
@@ -25,57 +26,85 @@ pub(crate) fn polars_expr_to_kernel_predicate(expr: &Expr) -> Option<Predicate> 
         // Drop the cast: kernel pruning isn't dtype-strict.
         Expr::Cast { expr: inner, .. } => polars_expr_to_kernel_predicate(inner),
         Expr::Alias(inner, _) => polars_expr_to_kernel_predicate(inner),
-        // Bare column reference filter — a bool column used as a predicate.
-        // Emit as `BooleanExpression(Column)` rather than synthesising
-        // `col == true`; both produce identical pruning in kernel's
-        // null-safe expansion (`eval_pred_sql_where`), and the direct
-        // variant matches the user's polars expression.
-        Expr::Column(name) => Some(Predicate::BooleanExpression(Expression::Column(
-            ColumnName::new([name.to_string()]),
-        ))),
+        Expr::Column(name) => Some(Predicate::column([name.to_string()])),
+        Expr::Literal(lit) => lit_bool(lit).map(Predicate::literal),
         _ => None,
     }
 }
 
+fn lit_bool(lit: &LiteralValue) -> Option<bool> {
+    let LiteralValue::Scalar(s) = lit else {
+        return None;
+    };
+    match s.as_any_value() {
+        AnyValue::Boolean(b) => Some(b),
+        _ => None,
+    }
+}
+
+/// Like [`lit_bool`] but peels Cast/Alias — the binary fold sees literals
+/// under inferred casts.
+fn extract_bool_literal(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Literal(lit) => lit_bool(lit),
+        Expr::Cast { expr: inner, .. } | Expr::Alias(inner, _) => extract_bool_literal(inner),
+        _ => None,
+    }
+}
+
+/// `expr == lit(true)` → `expr`; `expr == lit(false)` → `NOT expr`;
+/// `expr != lit(true)` → `NOT expr`; `expr != lit(false)` → `expr`.
+fn fold_boolean_equality(left: &Expr, right: &Expr, is_ne: bool) -> Option<Predicate> {
+    let (other, lit_val) = match (extract_bool_literal(left), extract_bool_literal(right)) {
+        (Some(b), None) => (right, b),
+        (None, Some(b)) => (left, b),
+        // Both literals or neither — let the regular comparison path handle it.
+        _ => return None,
+    };
+    let inner = polars_expr_to_kernel_predicate(other)?;
+    Some(if is_ne ^ lit_val {
+        inner
+    } else {
+        Predicate::not(inner)
+    })
+}
+
 fn translate_binary(left: &Expr, op: Operator, right: &Expr) -> Option<Predicate> {
-    // Logical AND/OR: both sides must translate.
     if let Some(junction_op) = match op {
         Operator::And | Operator::LogicalAnd => Some(JunctionPredicateOp::And),
         Operator::Or | Operator::LogicalOr => Some(JunctionPredicateOp::Or),
         _ => None,
     } {
-        return Some(Predicate::Junction(JunctionPredicate {
-            op: junction_op,
-            preds: vec![
+        return Some(Predicate::junction(
+            junction_op,
+            [
                 polars_expr_to_kernel_predicate(left)?,
                 polars_expr_to_kernel_predicate(right)?,
             ],
-        }));
+        ));
     }
 
-    // Comparisons: kernel only exposes Equal / LessThan / GreaterThan as
-    // primitives — `!=` and `<=` / `>=` are derived as `Not(strict opposite)`.
-    let left_kernel = polars_expr_to_kernel_expression(left)?;
-    let right_kernel = polars_expr_to_kernel_expression(right)?;
-    let binop = |op| {
-        Predicate::Binary(BinaryPredicate {
-            op,
-            left: Box::new(left_kernel.clone()),
-            right: Box::new(right_kernel.clone()),
-        })
-    };
+    // Optimizer doesn't fold `<pred> == lit(bool)` / `!=`, and a predicate
+    // can't sit on a comparison's expression side — fold here so e.g.
+    // `(col > 0) == pl.lit(True)` survives as `col > 0`.
+    if matches!(op, Operator::Eq | Operator::NotEq) {
+        if let Some(folded) = fold_boolean_equality(left, right, op == Operator::NotEq) {
+            return Some(folded);
+        }
+    }
+
+    let l = polars_expr_to_kernel_expression(left)?;
+    let r = polars_expr_to_kernel_expression(right)?;
     Some(match op {
-        Operator::Eq => binop(BinaryPredicateOp::Equal),
-        Operator::NotEq => Predicate::Not(Box::new(binop(BinaryPredicateOp::Equal))),
-        Operator::Lt => binop(BinaryPredicateOp::LessThan),
-        Operator::Gt => binop(BinaryPredicateOp::GreaterThan),
-        Operator::LtEq => Predicate::Not(Box::new(binop(BinaryPredicateOp::GreaterThan))),
-        Operator::GtEq => Predicate::Not(Box::new(binop(BinaryPredicateOp::LessThan))),
-        // Null-aware comparisons (`eq_missing` / `ne_missing` in polars):
-        // kernel's `Distinct` is null-aware NotEqual, so `ne_missing` is a
-        // direct emit and `eq_missing` is its negation.
-        Operator::NotEqValidity => binop(BinaryPredicateOp::Distinct),
-        Operator::EqValidity => Predicate::Not(Box::new(binop(BinaryPredicateOp::Distinct))),
+        Operator::Eq => Predicate::eq(l, r),
+        Operator::NotEq => Predicate::ne(l, r),
+        Operator::Lt => Predicate::lt(l, r),
+        Operator::Gt => Predicate::gt(l, r),
+        Operator::LtEq => Predicate::le(l, r),
+        Operator::GtEq => Predicate::ge(l, r),
+        // `ne_missing` / `eq_missing` — kernel's null-aware `Distinct`.
+        Operator::NotEqValidity => Predicate::distinct(l, r),
+        Operator::EqValidity => Predicate::not(Predicate::distinct(l, r)),
         _ => return None,
     })
 }
@@ -83,18 +112,39 @@ fn translate_binary(left: &Expr, op: Operator, right: &Expr) -> Option<Predicate
 fn translate_function(input: &[Expr], function: &FunctionExpr) -> Option<Predicate> {
     use polars::prelude::ClosedInterval;
     match function {
-        FunctionExpr::Boolean(BooleanFunction::IsNull) => {
-            Some(unary_pred(UnaryPredicateOp::IsNull, input.first()?))?
-        }
-        FunctionExpr::Boolean(BooleanFunction::IsNotNull) => Some(Predicate::Not(Box::new(
-            unary_pred(UnaryPredicateOp::IsNull, input.first()?)?,
-        ))),
+        FunctionExpr::Boolean(BooleanFunction::IsNull) => Some(Predicate::is_null(
+            polars_expr_to_kernel_expression(input.first()?)?,
+        )),
+        FunctionExpr::Boolean(BooleanFunction::IsNotNull) => Some(Predicate::is_not_null(
+            polars_expr_to_kernel_expression(input.first()?)?,
+        )),
         FunctionExpr::Boolean(BooleanFunction::IsIn { .. }) => {
-            Some(Predicate::Binary(BinaryPredicate {
-                op: BinaryPredicateOp::In,
-                left: Box::new(polars_expr_to_kernel_expression(input.first()?)?),
-                right: Box::new(polars_expr_to_kernel_expression(input.get(1)?)?),
-            }))
+            let lhs = input.first()?;
+            let rhs = input.get(1)?;
+            let elements = extract_set_elements(rhs)?;
+            // `x IN []` is vacuously false.
+            if elements.is_empty() {
+                return Some(Predicate::literal(false));
+            }
+            if elements.len() > MAX_IN_LIST_KERNEL_EXPANSION {
+                tracing::debug!(
+                    target: "polars_deltalake::pushdown",
+                    n = elements.len(),
+                    cap = MAX_IN_LIST_KERNEL_EXPANSION,
+                    "is_in list exceeds kernel expansion cap; \
+                     polars-io will handle row filtering without file pruning",
+                );
+                return None;
+            }
+            // Flatten to `lhs == v1 OR ...` rather than `BinaryPredicateOp::In`:
+            // kernel's `eval_pred_in` (kernel_predicates/mod.rs) is a `None //
+            //
+            // TODO: revert to `BinaryPredicateOp::In` once kernel's pruning
+            // evaluators implement `eval_pred_in`.
+            let lhs_kernel = polars_expr_to_kernel_expression(lhs)?;
+            Some(Predicate::or_from(elements.into_iter().map(|s| {
+                Predicate::eq(lhs_kernel.clone(), Expression::Literal(s))
+            })))
         }
         FunctionExpr::Boolean(BooleanFunction::IsBetween { closed }) => {
             // [value, low, high] → (value cmp low) AND (value cmp high) with
@@ -102,69 +152,45 @@ fn translate_function(input: &[Expr], function: &FunctionExpr) -> Option<Predica
             let value = polars_expr_to_kernel_expression(input.first()?)?;
             let low = polars_expr_to_kernel_expression(input.get(1)?)?;
             let high = polars_expr_to_kernel_expression(input.get(2)?)?;
-            let (lo_op, hi_op) = match closed {
-                ClosedInterval::Both => (None, None),
-                ClosedInterval::Left => (None, Some(BinaryPredicateOp::LessThan)),
-                ClosedInterval::Right => (Some(BinaryPredicateOp::GreaterThan), None),
+            let (lo, hi) = match closed {
+                ClosedInterval::Both => (
+                    Predicate::ge(value.clone(), low),
+                    Predicate::le(value, high),
+                ),
+                ClosedInterval::Left => (
+                    Predicate::ge(value.clone(), low),
+                    Predicate::lt(value, high),
+                ),
+                ClosedInterval::Right => (
+                    Predicate::gt(value.clone(), low),
+                    Predicate::le(value, high),
+                ),
                 ClosedInterval::None => (
-                    Some(BinaryPredicateOp::GreaterThan),
-                    Some(BinaryPredicateOp::LessThan),
+                    Predicate::gt(value.clone(), low),
+                    Predicate::lt(value, high),
                 ),
             };
-            Some(Predicate::Junction(JunctionPredicate {
-                op: JunctionPredicateOp::And,
-                preds: vec![
-                    bounded_cmp(value.clone(), low, lo_op, BinaryPredicateOp::LessThan),
-                    bounded_cmp(value, high, hi_op, BinaryPredicateOp::GreaterThan),
-                ],
-            }))
+            Some(Predicate::and(lo, hi))
         }
-        FunctionExpr::Boolean(BooleanFunction::Not) | FunctionExpr::Negate => Some(Predicate::Not(
-            Box::new(polars_expr_to_kernel_predicate(input.first()?)?),
+        FunctionExpr::Boolean(BooleanFunction::Not) | FunctionExpr::Negate => Some(Predicate::not(
+            polars_expr_to_kernel_predicate(input.first()?)?,
         )),
         FunctionExpr::Boolean(BooleanFunction::AllHorizontal) => {
-            Some(junction(JunctionPredicateOp::And, input)?)
+            translate_junction(input, JunctionPredicateOp::And)
         }
         FunctionExpr::Boolean(BooleanFunction::AnyHorizontal) => {
-            Some(junction(JunctionPredicateOp::Or, input)?)
+            translate_junction(input, JunctionPredicateOp::Or)
         }
         _ => None,
     }
 }
 
-fn unary_pred(op: UnaryPredicateOp, arg: &Expr) -> Option<Predicate> {
-    Some(Predicate::Unary(UnaryPredicate {
-        op,
-        expr: Box::new(polars_expr_to_kernel_expression(arg)?),
-    }))
-}
-
-fn junction(op: JunctionPredicateOp, args: &[Expr]) -> Option<Predicate> {
-    let preds: Option<Vec<Predicate>> = args.iter().map(polars_expr_to_kernel_predicate).collect();
-    Some(Predicate::Junction(JunctionPredicate { op, preds: preds? }))
-}
-
-/// One side of an `IsBetween` decomposition: `strict_op` (provided directly
-/// when `closed_op` is `Some`) or its `Not` negation (when `closed_op` is
-/// `None`, meaning the inclusive side).
-fn bounded_cmp(
-    value: Expression,
-    bound: Expression,
-    closed_op: Option<BinaryPredicateOp>,
-    strict_op: BinaryPredicateOp,
-) -> Predicate {
-    match closed_op {
-        Some(op) => Predicate::Binary(BinaryPredicate {
-            op,
-            left: Box::new(value),
-            right: Box::new(bound),
-        }),
-        None => Predicate::Not(Box::new(Predicate::Binary(BinaryPredicate {
-            op: strict_op,
-            left: Box::new(value),
-            right: Box::new(bound),
-        }))),
-    }
+fn translate_junction(args: &[Expr], op: JunctionPredicateOp) -> Option<Predicate> {
+    let preds: Vec<_> = args
+        .iter()
+        .map(polars_expr_to_kernel_predicate)
+        .collect::<Option<_>>()?;
+    Some(Predicate::junction(op, preds))
 }
 
 /// Kernel stores timestamps as microseconds-since-epoch and the stats
@@ -215,6 +241,11 @@ fn any_value_to_scalar(av: &AnyValue<'_>) -> Option<Scalar> {
         AnyValue::Date(d) => Scalar::Date(*d),
         AnyValue::Datetime(v, tu, tz) => datetime_scalar(*v, *tu, tz.is_some())?,
         AnyValue::DatetimeOwned(v, tu, tz) => datetime_scalar(*v, *tu, tz.is_some())?,
+        // Delta caps decimals at precision/scale 38, both fitting in u8.
+        AnyValue::Decimal(v, p, s) => {
+            let dt = DecimalType::try_new(u8::try_from(*p).ok()?, u8::try_from(*s).ok()?).ok()?;
+            Scalar::Decimal(DecimalData::try_new(*v, dt).ok()?)
+        }
         _ => return None,
     })
 }
@@ -237,6 +268,31 @@ fn polars_expr_to_kernel_expression(expr: &Expr) -> Option<Expression> {
         })),
         _ => None,
     }
+}
+
+/// `IsIn` set literal → kernel `Scalar`s. `None` for any null element
+/// (no null-safe equality to OR with) or unsupported element type.
+/// Empty list yields `Some(vec![])`; caller short-circuits to `lit(false)`.
+fn extract_set_elements(expr: &Expr) -> Option<Vec<Scalar>> {
+    match expr {
+        Expr::Cast { expr: inner, .. } | Expr::Alias(inner, _) => extract_set_elements(inner),
+        Expr::Literal(LiteralValue::Series(s)) => series_to_scalars(s),
+        Expr::Literal(LiteralValue::Scalar(s)) => match s.as_any_value() {
+            AnyValue::List(series) => series_to_scalars(&series),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn series_to_scalars(series: &Series) -> Option<Vec<Scalar>> {
+    series
+        .iter()
+        .map(|av| match av {
+            AnyValue::Null => None,
+            other => any_value_to_scalar(&other),
+        })
+        .collect()
 }
 
 #[cfg(test)]
