@@ -1,0 +1,70 @@
+name: "Setup Python and Rust Environment"
+description: "Set up just, uv, Python, and the Rust toolchain"
+
+inputs:
+  python-version:
+    description: "The Python version to set up"
+    required: false
+    default: "3.13"
+
+  rust-toolchain:
+    description: "The Rust toolchain to set up"
+    required: false
+    default: "stable"
+
+  cache:
+    description: "Enable Swatinem rust-cache via setup-rust-toolchain. Release workflows should set this to 'false'."
+    required: false
+    default: "true"
+
+  cross_compile:
+    description: "Install cargo-zigbuild + zig as the cross linker (release workflows that produce linux/amd64 + linux/arm64 from one runner set this to 'true')."
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+
+  # Third-party actions are pinned to full commit SHAs (not floating tags), so a
+  # compromised maintainer can't ship malicious code to our CI by force-pushing
+  # the tag. Comment after the SHA records the human-readable version we
+  # originally selected. Bumping = update both.
+
+  steps:
+    - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      with:
+        enable-cache: ${{ inputs.cache }}
+
+    - name: Install Python ${{ inputs.python-version }}
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: uv python install "${PYTHON_VERSION}"
+
+    - name: Setup sccache
+      if: inputs.cache == 'true'
+      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+    - name: Setup Rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        cache: ${{ inputs.cache }}
+        cache-on-failure: "true"
+
+    - name: Install cargo-zigbuild
+      if: inputs.cross_compile == 'true'
+      uses: taiki-e/install-action@f44ba2d13a74f48f97453869ad3244dae85c883c # main @ 2026-05-11
+      with:
+        tool: cargo-zigbuild
+
+    - name: Install zig
+      if: inputs.cross_compile == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        pipx install ziglang
+        ln -sf "$(command -v python-zig)" "$HOME/.local/bin/zig"

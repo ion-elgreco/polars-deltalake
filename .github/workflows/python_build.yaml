@@ -1,0 +1,93 @@
+name: python_build
+
+on:
+  merge_group:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (PR pushes, force-pushes, rapid main
+# commits). Release workflows opt out of this — see release-python.yaml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# Default to no permissions; each job opts in to whatever it actually needs.
+permissions: {}
+
+defaults:
+  run:
+    working-directory: .
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  # sccache silently no-ops when CARGO_INCREMENTAL=1 (its default). Force
+  # it off so dev-profile builds actually route through sccache.
+  CARGO_INCREMENTAL: "0"
+  # Selects `[profile.ci]` in python/Cargo.toml — dev-fast for our crate,
+  # release-opt + stripped for deps so the sccache blob stays small.
+  PROFILE: "ci"
+
+jobs:
+  linting:
+    name: Python linting (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: setup venv
+        run: just venv
+
+      - name: Run linting (ruff, typos, pyright)
+        run: just pre-commit-check
+
+  testing:
+    name: Python tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build and install polars-deltalake
+        run: just develop
+
+      - name: Run Rust unit tests
+        run: just test-rust
+
+      - name: Run local tests
+        run: just test-local
+
+      - name: Run integration tests
+        if: ${{ always() }}
+        run: just test-integration
