@@ -8,7 +8,7 @@ default:
 
 # Sync venv with all deps (without building rivers native extension)
 venv:
-    cd python && uv sync --no-install-project --all-extras
+    cd python && uv sync --no-install-project --all-groups
 
 # Use `PROFILE=release just develop` for an optimized build.
 develop: venv
