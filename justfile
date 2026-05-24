@@ -22,13 +22,17 @@ develop: venv
 test:
     cd python && uv run --no-sync pytest tests/
 
-# Non-Docker tests only: filters out anything tagged `integration`.
+# Non-Docker, non-Spark tests only.
 test-local:
-    cd python && uv run --no-sync pytest tests/ -m "not integration"
+    cd python && uv run --no-sync pytest tests/ -m "not integration and not spark"
 
 # Just the Docker-backed cloud integration suites (S3 / Azure / GCS).
 test-integration:
     cd python && uv run --no-sync pytest tests/ -m integration
+
+# PySpark-authored fixtures (column-mapped CDF etc). Requires JDK 17 or 21.
+test-spark:
+    cd python && uv run --no-sync pytest tests/ -m spark
 
 # Format + lint + type-check (writes fixes).
 pre-commit:

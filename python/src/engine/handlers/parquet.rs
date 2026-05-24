@@ -19,7 +19,8 @@ use delta_kernel::{
 use polars::io::cloud::CloudOptions;
 use polars::io::parquet::read::{ParquetOptions, infer_schema};
 use polars::lazy::frame::LazyFrame;
-use polars::prelude::Expr;
+use polars::prelude::{DataFrame, Expr};
+use polars_parquet::parquet::metadata::FileMetadata;
 use polars_parquet::parquet::{FOOTER_SIZE, PARQUET_MAGIC, read::deserialize_metadata};
 use polars_plan::dsl::{
     CastColumnsPolicy, DslBuilder, ExtraColumnsPolicy, MissingColumnsPolicy, ScanSources,
@@ -99,6 +100,20 @@ impl ParquetHandler for PolarsParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        // Empty projection (kernel needs only the row count so its
+        // logical-transform can emit literal columns — e.g. CDF metadata,
+        // all-partition projections): read `num_rows` from each footer and
+        // skip the data scan entirely
+        if physical_schema.fields().next().is_none() {
+            let total: usize = files
+                .iter()
+                .map(|f| fetch_parquet_metadata(self.storage.as_ref(), f).map(|m| m.num_rows))
+                .sum::<DeltaResult<usize>>()?;
+            let df = DataFrame::empty_with_height(total);
+            let result: DeltaResult<Box<dyn EngineData>> = Ok(Box::new(PolarsEngineData::new(df)));
+            return Ok(Box::new(std::iter::once(result)));
+        }
+
         // Translation failure is non-fatal: kernel already pruned files via
         // stats, so we just skip row-level pushdown and let polars filter.
         let polars_predicate: Option<Expr> = predicate.as_ref().and_then(|p| {
@@ -134,48 +149,52 @@ impl ParquetHandler for PolarsParquetHandler {
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
-        // Two range reads — the 8-byte trailer (footer length + PAR1 magic),
-        // then the exact footer thrift bytes. Two RTTs but minimal bandwidth;
-        // kernel calls this off the hot scan path.
-        if file.size < FOOTER_SIZE {
-            return Err(Error::Generic(format!(
-                "{}: too small ({} bytes) to be a parquet file",
-                file.location, file.size,
-            )));
-        }
-        let read_range = |range: std::ops::Range<u64>| -> DeltaResult<bytes::Bytes> {
-            self.storage
-                .read_files(vec![(file.location.clone(), Some(range))])?
-                .next()
-                .ok_or_else(|| Error::Generic(format!("{}: empty range read", file.location)))?
-        };
-
-        let trailer = read_range((file.size - FOOTER_SIZE)..file.size)?;
-        if trailer[4..] != PARQUET_MAGIC {
-            return Err(Error::Generic(format!(
-                "{}: missing PAR1 magic in trailer",
-                file.location,
-            )));
-        }
-        let footer_len = u32::from_le_bytes(trailer[..4].try_into().unwrap()) as u64;
-        if FOOTER_SIZE + footer_len > file.size {
-            return Err(Error::Generic(format!(
-                "{}: footer length ({}) exceeds file size ({})",
-                file.location, footer_len, file.size,
-            )));
-        }
-
-        let footer_thrift =
-            read_range((file.size - FOOTER_SIZE - footer_len)..(file.size - FOOTER_SIZE))?;
-        let max_size = footer_thrift.len() * 2 + 1024;
-        let metadata =
-            deserialize_metadata(footer_thrift.as_ref(), max_size).map_err(to_kernel_err)?;
+        let metadata = fetch_parquet_metadata(self.storage.as_ref(), file)?;
         let arrow_schema = infer_schema(&metadata).map_err(to_kernel_err)?;
         let kernel_schema = arrow_schema.to_kernel().map_err(to_kernel_err)?;
         Ok(ParquetFooter {
             schema: Arc::new(kernel_schema),
         })
     }
+}
+
+/// Fetch a parquet file's thrift footer via two range reads
+fn fetch_parquet_metadata(
+    storage: &ObjectStoreStorageHandler,
+    file: &FileMeta,
+) -> DeltaResult<FileMetadata> {
+    if file.size < FOOTER_SIZE {
+        return Err(Error::Generic(format!(
+            "{}: too small ({} bytes) to be a parquet file",
+            file.location, file.size,
+        )));
+    }
+    let read_range = |range: std::ops::Range<u64>| -> DeltaResult<bytes::Bytes> {
+        storage
+            .read_files(vec![(file.location.clone(), Some(range))])?
+            .next()
+            .ok_or_else(|| Error::Generic(format!("{}: empty range read", file.location)))?
+    };
+
+    let trailer = read_range((file.size - FOOTER_SIZE)..file.size)?;
+    if trailer[4..] != PARQUET_MAGIC {
+        return Err(Error::Generic(format!(
+            "{}: missing PAR1 magic in trailer",
+            file.location,
+        )));
+    }
+    let footer_len = u32::from_le_bytes(trailer[..4].try_into().unwrap()) as u64;
+    if FOOTER_SIZE + footer_len > file.size {
+        return Err(Error::Generic(format!(
+            "{}: footer length ({}) exceeds file size ({})",
+            file.location, footer_len, file.size,
+        )));
+    }
+
+    let footer_thrift =
+        read_range((file.size - FOOTER_SIZE - footer_len)..(file.size - FOOTER_SIZE))?;
+    let max_size = footer_thrift.len() * 2 + 1024;
+    deserialize_metadata(footer_thrift.as_ref(), max_size).map_err(to_kernel_err)
 }
 
 /// `ParquetOptions` shaped by the kernel-declared physical schema. Shared
