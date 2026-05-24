@@ -591,3 +591,12 @@ class TestEagerRead:
 
         v0 = read_delta(table_path, version=0)
         assert v0["x"].to_list() == [1]
+
+    @pytest.mark.parametrize("engine", ["auto", "in-memory", "streaming"])
+    def test_engine_arg(self, simple_table, engine):
+        """`read_delta` forwards `engine` to `LazyFrame.collect`."""
+        from polars_deltalake import read_delta
+
+        out = read_delta(str(simple_table), engine=engine).sort("id")
+        assert out.shape == (5, 3)
+        assert out["id"].to_list() == [1, 2, 3, 4, 5]
