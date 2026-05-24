@@ -10,6 +10,7 @@ use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::ExpressionRef;
 use delta_kernel::schema::SchemaRef;
 use polars::prelude::{DataFrame, Expr, IntoLazy, StringChunked};
+use polars_plan::dsl::Engine as PolarsEngineMode;
 
 use crate::engine::PolarsEngineData;
 use crate::scan::plan::{DvState, LogicalRewrite};
@@ -158,10 +159,11 @@ impl LogicalScanIter {
             })?;
         let mut df = out.into_inner();
         if let Some(pred) = &self.orphan_predicate {
-            df =
-                df.lazy().filter(pred.clone()).collect().map_err(|e| {
-                    delta_kernel::Error::Generic(format!("orphan predicate eval: {e}"))
-                })?;
+            df = df
+                .lazy()
+                .filter(pred.clone())
+                .collect_with_engine(PolarsEngineMode::Streaming)
+                .map_err(|e| delta_kernel::Error::Generic(format!("orphan predicate eval: {e}")))?;
         }
         Ok(df)
     }

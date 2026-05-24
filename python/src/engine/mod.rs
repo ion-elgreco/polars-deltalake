@@ -21,6 +21,12 @@ pub(crate) use handlers::{parquet_options, path_for_polars_io, unified_scan_args
 
 use crate::translation::PolarsEvaluationHandler;
 
+/// Rows per morsel handed downstream. polars-stream's default is ~12.5k —
+/// too small; each batch pays the FFI / kernel-handoff crossing cost. 100k
+/// gives polars-stream more parallelism + keeps `split_and_buffer`'s
+/// single-file big wins on many-file scans.
+pub(crate) const COLLECT_CHUNK_ROWS: usize = 100_000;
+
 /// Process-wide tokio runtime shared across every `PolarsEngine` instance.
 pub(crate) fn rt() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();

@@ -10,6 +10,7 @@ use delta_kernel::expressions::{
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error, PredicateEvaluator};
 use polars::prelude::{Expr, IntoLazy, lit};
+use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_str::PlSmallStr;
 
 use crate::consts::KERNEL_OUTPUT_COL;
@@ -35,7 +36,7 @@ impl PredicateEvaluator for PolarsPredicateEvaluator {
                     .clone()
                     .alias(PlSmallStr::from_static(KERNEL_OUTPUT_COL)),
             ])
-            .collect()
+            .collect_with_engine(PolarsEngineMode::Streaming)
             .map_err(to_kernel_err)?;
         Ok(Box::new(PolarsEngineData::new(result)))
     }

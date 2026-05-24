@@ -9,11 +9,13 @@ mod translation;
 
 use pyo3::prelude::*;
 
-use crate::scan::{TableScan, TableState};
+use crate::scan::{CdfTableScan, CdfTableState, TableScan, TableState};
 
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TableState>()?;
     m.add_class::<TableScan>()?;
+    m.add_class::<CdfTableState>()?;
+    m.add_class::<CdfTableScan>()?;
     Ok(())
 }

@@ -2,34 +2,34 @@
 //! [`TableScan`] = a scan handle for table snapshot
 
 use std::collections::HashMap;
-use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::expressions::{Predicate, PredicateRef};
 use delta_kernel::scan::Scan;
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use polars::prelude::{DataFrame, Expr, Schema as PlSchema};
-use polars_ffi::version_0::{SeriesExport, export_column};
 use polars_plan::dsl::Engine as PolarsEngineMode;
 use pyo3::prelude::*;
-use pyo3::sync::PyOnceLock;
 use pyo3_polars::PySchema;
-use rayon::prelude::*;
 use tokio::runtime::Runtime;
 use url::Url;
 
-use crate::engine::PolarsEngine;
+use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngine};
 use crate::errors::py_err;
 use crate::translation::schema::KernelSchemaExt;
 use crate::translation::to_kernel::polars_expr_to_kernel_predicate;
 
+mod cdf;
+mod ffi;
 mod logical;
 mod plan;
 mod predicate;
 mod read;
 
+pub(crate) use cdf::{CdfTableScan, CdfTableState};
 pub(crate) use read::{build_lazy_scan, select_exprs_for_schema};
 
+use ffi::{MorselState, SendExport, morsel_to_py, next_morsel};
 use logical::LogicalScanIter;
 use plan::{ResolvedScan, resolve_scan};
 use predicate::{
@@ -37,32 +37,7 @@ use predicate::{
     flatten_and_conjuncts, has_column_mapping,
 };
 
-type BatchIter = Box<dyn Iterator<Item = Result<DataFrame, delta_kernel::Error>> + Send>;
-
-/// Rows per morsel handed to the Python plugin. polars-stream's default is
-/// ~12.5k — too small; each batch pays the FFI crossing cost. 100k gives
-/// polars-stream more parallelism + keeps `split_and_buffer`'s single-file
-/// big wins on many-file scans.
-const COLLECT_CHUNK_ROWS: usize = 100_000;
-
-const PAR_EXPORT_THRESHOLD: usize = 32;
-
-static IMPORT_COLUMNS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
-
-fn import_columns_fn(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
-    IMPORT_COLUMNS
-        .get_or_try_init(py, || {
-            py.import("polars")?
-                .getattr("DataFrame")?
-                .getattr("_import_columns")
-                .map(|m| m.unbind())
-        })
-        .map(|p| p.bind(py))
-}
-
-#[repr(transparent)]
-struct SendExport(ManuallyDrop<SeriesExport>);
-unsafe impl Send for SendExport {}
+type BatchIter = Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>;
 
 #[pyclass(frozen, module = "polars_deltalake._internal")]
 pub struct TableState {
@@ -162,14 +137,13 @@ pub struct TableScan {
 #[derive(Default)]
 struct ScanState {
     projection: Option<Vec<String>>,
-    n_rows: Option<usize>,
+    morsel: MorselState,
     /// File-level stats skipping in kernel.
     kernel_predicate: Option<PredicateRef>,
     /// User predicate, pre-split at top-level `AND`, each tagged with whether
     /// it was kernel-translatable. Empty when unset.
     original_predicate: Vec<Conjunct>,
     iter: Option<BatchIter>,
-    rows_emitted: usize,
 }
 
 #[pymethods]
@@ -192,7 +166,7 @@ impl TableScan {
     ) -> PyResult<()> {
         let mut state = self.state.lock().expect("Mutex poisoned");
         state.projection = with_columns;
-        state.n_rows = n_rows;
+        state.morsel.n_rows = n_rows;
         match predicate {
             None => {
                 state.kernel_predicate = None;
@@ -231,20 +205,16 @@ impl TableScan {
             }
         }
         state.iter = None;
-        state.rows_emitted = 0;
+        state.morsel.reset();
         Ok(())
     }
 
     fn next<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         let exports = py.detach(|| self.next_exports()).map_err(py_err)?;
-        let Some(exports) = exports else {
-            return Ok(None);
-        };
-
-        let addr = exports.as_ptr() as usize;
-        import_columns_fn(py)?
-            .call1((addr, exports.len()))
-            .map(Some)
+        match exports {
+            Some(exports) => morsel_to_py(py, exports).map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -274,7 +244,7 @@ impl TableScan {
         let resolved = resolve_scan(&scan, engine.as_ref())?;
         if resolved.files.is_empty() {
             state.iter = Some(Box::new(std::iter::empty()));
-            state.rows_emitted = 0;
+            state.morsel.reset();
             return Ok(());
         }
         let ResolvedScan {
@@ -304,7 +274,7 @@ impl TableScan {
             )?;
             if surviving.is_empty() {
                 state.iter = Some(Box::new(std::iter::empty()));
-                state.rows_emitted = 0;
+                state.morsel.reset();
                 return Ok(());
             }
             if surviving.len() < files.len() {
@@ -351,24 +321,27 @@ impl TableScan {
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
 
         let new_iter: BatchIter = if needs_rewrite {
-            Box::new(LogicalScanIter::new(
-                source,
-                path_index,
-                rewrites,
-                engine,
-                physical_schema,
-                logical_schema,
-                conjunction(routing.post_transform),
-            ))
+            Box::new(
+                LogicalScanIter::new(
+                    source,
+                    path_index,
+                    rewrites,
+                    engine,
+                    physical_schema,
+                    logical_schema,
+                    conjunction(routing.post_transform),
+                )
+                .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
+            )
         } else {
             debug_assert!(
                 routing.post_transform.is_empty(),
                 "post_transform requires Transform to materialize partition cols",
             );
-            Box::new(source.map(|r| r.map_err(|e| delta_kernel::Error::Generic(format!("{e:#}")))))
+            source
         };
         state.iter = Some(new_iter);
-        state.rows_emitted = 0;
+        state.morsel.reset();
         Ok(())
     }
 
@@ -377,45 +350,8 @@ impl TableScan {
         if state.iter.is_none() {
             self.build_iter(&mut state)?;
         }
-
-        loop {
-            if let Some(cap) = state.n_rows
-                && state.rows_emitted >= cap
-            {
-                return Ok(None);
-            }
-
-            let it = state.iter.as_mut().expect("iter set above");
-            let Some(next) = it.next() else {
-                return Ok(None);
-            };
-            let mut df = next.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))?;
-
-            if df.height() == 0 {
-                continue;
-            }
-
-            if let Some(cap) = state.n_rows {
-                let remaining = cap.saturating_sub(state.rows_emitted);
-                if df.height() > remaining {
-                    df = df.head(Some(remaining));
-                }
-            }
-
-            // Rechunk once here saves every downstream consumer (hash
-            // joins especially) from rechunking per batch.
-            df.rechunk_mut_par();
-            state.rows_emitted += df.height();
-
-            let columns = df.columns();
-            let export = |c| SendExport(ManuallyDrop::new(export_column(c)));
-            let exports: Vec<SendExport> = if columns.len() >= PAR_EXPORT_THRESHOLD {
-                columns.par_iter().map(export).collect()
-            } else {
-                columns.iter().map(export).collect()
-            };
-            return Ok(Some(exports));
-        }
+        let ScanState { morsel, iter, .. } = &mut *state;
+        next_morsel(morsel, iter.as_mut().expect("iter set above").as_mut())
     }
 }
 
