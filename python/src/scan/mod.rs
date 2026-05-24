@@ -14,7 +14,7 @@ use pyo3_polars::PySchema;
 use tokio::runtime::Runtime;
 use url::Url;
 
-use crate::engine::PolarsEngine;
+use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngine};
 use crate::errors::py_err;
 use crate::translation::schema::KernelSchemaExt;
 use crate::translation::to_kernel::polars_expr_to_kernel_predicate;
@@ -38,12 +38,6 @@ use predicate::{
 };
 
 type BatchIter = Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>;
-
-/// Rows per morsel handed to the Python plugin. polars-stream's default is
-/// ~12.5k — too small; each batch pays the FFI crossing cost. 100k gives
-/// polars-stream more parallelism + keeps `split_and_buffer`'s single-file
-/// big wins on many-file scans.
-const COLLECT_CHUNK_ROWS: usize = 100_000;
 
 #[pyclass(frozen, module = "polars_deltalake._internal")]
 pub struct TableState {

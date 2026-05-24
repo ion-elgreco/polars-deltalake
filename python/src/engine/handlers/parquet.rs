@@ -23,15 +23,15 @@ use polars::prelude::{DataFrame, Expr};
 use polars_parquet::parquet::metadata::FileMetadata;
 use polars_parquet::parquet::{FOOTER_SIZE, PARQUET_MAGIC, read::deserialize_metadata};
 use polars_plan::dsl::{
-    CastColumnsPolicy, DslBuilder, ExtraColumnsPolicy, MissingColumnsPolicy, ScanSources,
-    UnifiedScanArgs,
+    CastColumnsPolicy, DslBuilder, Engine as PolarsEngineMode, ExtraColumnsPolicy,
+    MissingColumnsPolicy, ScanSources, UnifiedScanArgs,
 };
 use polars_utils::pl_path::{CloudScheme, PlRefPath};
 use polars_utils::pl_str::PlSmallStr;
 use tokio::runtime::Runtime;
 use url::Url;
 
-use crate::engine::PolarsEngineData;
+use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData};
 use crate::errors::to_kernel_err;
 use crate::translation::schema::{ArrowSchemaExt, KernelSchemaExt};
 
@@ -127,15 +127,14 @@ impl ParquetHandler for PolarsParquetHandler {
             .map(|f| path_for_polars_io(&f.location))
             .collect::<DeltaResult<_>>()?;
 
-        let result = read_batch(
+        read_batch(
             paths,
             self.cloud_opts.as_ref(),
             &select_exprs,
             polars_predicate.as_ref(),
             physical_schema.as_ref(),
             self.rt,
-        );
-        Ok(Box::new(std::iter::once(result)))
+        )
     }
 
     fn write_parquet_file(
@@ -238,7 +237,7 @@ fn read_batch(
     predicate: Option<&Expr>,
     physical_schema: &StructType,
     rt: &'static Runtime,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> DeltaResult<FileDataReadResultIterator> {
     let parquet_options = parquet_options(physical_schema)?;
     let unified_scan_args = unified_scan_args(cloud_opts, None);
 
@@ -255,9 +254,17 @@ fn read_batch(
     if let Some(pred) = predicate {
         plan = plan.filter(pred.clone());
     }
-    let mut df = plan.collect().map_err(to_kernel_err)?;
-    df.rechunk_mut();
-    Ok(Box::new(PolarsEngineData::new(df)))
+    let chunk_size = std::num::NonZeroUsize::new(COLLECT_CHUNK_ROWS);
+    let batches = plan
+        .collect_batches(PolarsEngineMode::Streaming, true, chunk_size, false)
+        .map_err(to_kernel_err)?;
+    Ok(Box::new(batches.map(
+        |r| -> DeltaResult<Box<dyn EngineData>> {
+            let mut df = r.map_err(to_kernel_err)?;
+            df.rechunk_mut();
+            Ok(Box::new(PolarsEngineData::new(df)))
+        },
+    )))
 }
 
 /// polars-io's `Path::parse` doesn't decode, so Spark-style double-encoded
