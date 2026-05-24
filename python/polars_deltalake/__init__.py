@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import polars as pl
 from polars.io.plugins import register_io_source
@@ -13,6 +14,9 @@ from polars_deltalake._internal import (
     TableScan,
     TableState,
 )
+
+if TYPE_CHECKING:
+    from polars._typing import EngineType
 
 __all__ = [
     "CdfTableScan",
@@ -31,14 +35,26 @@ def read_delta(
     *,
     version: int | None = None,
     storage_options: dict[str, str] | None = None,
+    engine: EngineType = "auto",
 ) -> pl.DataFrame:
     """Eagerly read a Delta Lake table into a Polars ``DataFrame``.
 
-    Equivalent to ``scan_delta(uri, ...).collect()``. Use ``scan_delta`` for
-    lazy evaluation when you need projection / predicate pushdown or to
-    chain further lazy operations.
+    Equivalent to ``scan_delta(uri, ...).collect(engine=engine)``. Use
+    ``scan_delta`` for lazy evaluation when you need projection / predicate
+    pushdown or to chain further lazy operations.
+
+    Args:
+        uri: Path or fully qualified URL of the Delta table.
+        version: Optional snapshot version for time travel.
+        storage_options: Cloud credentials forwarded to ``object_store``.
+        engine: Polars query engine to use when collecting. See
+            ``LazyFrame.collect`` for accepted values.
     """
-    return scan_delta(uri, version=version, storage_options=storage_options).collect()
+    return scan_delta(
+        uri,
+        version=version,
+        storage_options=storage_options,
+    ).collect(engine=engine)
 
 
 def scan_delta(
@@ -86,17 +102,26 @@ def read_cdf(
     start_version: int,
     end_version: int | None = None,
     storage_options: dict[str, str] | None = None,
+    engine: EngineType = "auto",
 ) -> pl.DataFrame:
     """Eagerly read a Delta Lake Change Data Feed into a Polars ``DataFrame``.
 
-    Equivalent to ``scan_cdf(uri, ...).collect()``.
+    Equivalent to ``scan_cdf(uri, ...).collect(engine=engine)``.
+
+    Args:
+        uri: Path or fully qualified URL of the Delta table.
+        start_version: First commit version to include (inclusive).
+        end_version: Last commit version to include (inclusive).
+        storage_options: Cloud credentials forwarded to ``object_store``.
+        engine: Polars query engine to use when collecting. See
+            ``LazyFrame.collect`` for accepted values.
     """
     return scan_cdf(
         uri,
         start_version=start_version,
         end_version=end_version,
         storage_options=storage_options,
-    ).collect()
+    ).collect(engine=engine)
 
 
 def scan_cdf(

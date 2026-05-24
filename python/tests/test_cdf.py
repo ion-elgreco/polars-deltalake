@@ -184,6 +184,13 @@ class TestVersionRange:
         )
         assert_frame_equal(out, expected)
 
+    @pytest.mark.parametrize("engine", ["auto", "in-memory", "streaming"])
+    def test_engine_arg(self, cdf_table, engine):
+        """`read_cdf` forwards `engine` to `LazyFrame.collect`."""
+        out = read_cdf(cdf_table, start_version=0, engine=engine)
+        assert isinstance(out, pl.DataFrame)
+        assert out.height == 6
+
 
 class TestProjection:
     def test_projection_pushdown(self, cdf_table):
