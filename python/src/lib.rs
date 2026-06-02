@@ -8,8 +8,14 @@ mod scan;
 mod translation;
 
 use pyo3::prelude::*;
+#[cfg(not(test))]
+use pyo3_polars::PolarsAllocator;
 
 use crate::scan::{CdfTableScan, CdfTableState, TableScan, TableState};
+
+#[cfg(not(test))]
+#[global_allocator]
+static ALLOC: PolarsAllocator = PolarsAllocator::new();
 
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
