@@ -274,9 +274,11 @@ pub(crate) fn path_for_polars_io(url: &Url) -> DeltaResult<PlRefPath> {
     let decoded = object_store::path::Path::from_url_path(url.path())
         .map_err(|e| Error::Generic(format!("invalid object store path {url}: {e}")))?;
     let s = if url.scheme() == "file" {
-        // polars-io treats the post-`file:` remainder as an OS path. Plain
-        // absolute path avoids `to_file_path`'s Windows-drive-letter quirks.
-        format!("/{decoded}")
+        if cfg!(windows) {
+            format!("{decoded}")
+        } else {
+            format!("/{decoded}")
+        }
     } else {
         let authority = url.authority();
         if authority.is_empty() {
