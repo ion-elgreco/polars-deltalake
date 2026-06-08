@@ -357,10 +357,40 @@ impl TableScan {
 
 pub(crate) fn parse_uri(uri: &str) -> anyhow::Result<Url> {
     if let Ok(url) = Url::parse(uri) {
-        return Ok(url);
+        if url.scheme().len() != 1 {
+            return Ok(url);
+        }
     }
     let abs = std::path::absolute(uri).map_err(|e| anyhow::anyhow!("resolve {uri} failed: {e}"))?;
     Url::from_directory_path(&abs)
         .or_else(|_| Url::from_file_path(&abs))
         .map_err(|_| anyhow::anyhow!("failed to build file:// URL from {}", abs.display()))
+}
+
+#[cfg(test)]
+mod parse_uri_tests {
+    use super::parse_uri;
+
+    #[test]
+    fn remote_urls_pass_through() {
+        assert_eq!(parse_uri("s3://bucket/key").unwrap().scheme(), "s3");
+        assert_eq!(parse_uri("memory:///x").unwrap().scheme(), "memory");
+        assert_eq!(parse_uri("file:///tmp/x").unwrap().scheme(), "file");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn unix_local_path_becomes_file_url() {
+        assert_eq!(parse_uri("/tmp/some/table").unwrap().scheme(), "file");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_drive_path_becomes_file_url() {
+        // `C:\...` parses as a URL whose scheme is the single-letter drive ("c");
+        // it must be converted to a file:// URL, not passed through as scheme "c".
+        let url = parse_uri("C:\\data\\tbl").unwrap();
+        assert_eq!(url.scheme(), "file");
+        assert!(url.as_str().starts_with("file:///C:/"), "{url}");
+    }
 }
