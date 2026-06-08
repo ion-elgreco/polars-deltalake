@@ -59,15 +59,22 @@ jobs:
         run: just pre-commit-check
 
   testing:
-    name: Python tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: Python tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      RUSTC_WRAPPER: ${{ matrix.os != 'windows-latest' && 'sccache' || '' }}
 
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.13"]
+        include:
+          - { os: ubuntu-latest, python-version: "3.10" }
+          - { os: ubuntu-latest, python-version: "3.13" }
+          # covers it.
+          - { os: windows-latest, python-version: "3.13" }
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -88,6 +95,7 @@ jobs:
       - name: Run local tests
         run: just test-local
 
+      # Docker-backed cloud emulators only run on the Linux runner.
       - name: Run integration tests
-        if: ${{ always() }}
+        if: ${{ always() && runner.os == 'Linux' }}
         run: just test-integration

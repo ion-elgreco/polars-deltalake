@@ -12,7 +12,7 @@ venv:
 
 # Use `PROFILE=release just develop` for an optimized build.
 develop: venv
-    cd python && VIRTUAL_ENV={{ justfile_directory() }}/python/.venv uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
+    cd python && VIRTUAL_ENV='{{ justfile_directory() }}/python/.venv' uvx --from 'maturin[zig]' maturin develop --profile {{ profile }}
 
 # Run the pytest suite. The `test_cloud_*` modules are tagged
 # `integration`; they boot emulator containers via `testcontainers` and
