@@ -221,6 +221,8 @@ pub(crate) fn unified_scan_args(
         cast_columns_policy: CastColumnsPolicy {
             missing_struct_fields: MissingColumnsPolicy::Insert,
             extra_struct_fields: ExtraColumnsPolicy::Ignore,
+            // INT96 downcast
+            datetime_nanoseconds_downcast: true,
             ..CastColumnsPolicy::ERROR_ON_MISMATCH
         },
         missing_columns_policy: MissingColumnsPolicy::Insert,
