@@ -27,8 +27,8 @@ use super::transform::translate_transform;
 /// `output_type` (when known) lets us name struct children correctly —
 /// without it polars assigns generic `field_N` names and kernel visitors
 /// that look up by name silently fail. `input_schema` is required by
-/// `Transform` to walk input fields.
-pub(super) fn translate_expr(
+/// `StructPatch` to walk input fields.
+pub(crate) fn translate_expr(
     expr: &Expression,
     output_type: Option<&KernelDataType>,
     input_schema: Option<&StructType>,
@@ -38,22 +38,27 @@ pub(super) fn translate_expr(
         Expression::Column(name) => Ok(column_path_to_expr(name)),
         Expression::Predicate(pred) => translate_predicate(pred, input_schema),
         Expression::Struct(children, _) => translate_struct(children, output_type, input_schema),
-        Expression::Transform(t) => {
+        Expression::StructPatch(t) => {
             let target = match output_type {
                 Some(KernelDataType::Struct(s)) => s,
                 _ => {
                     return Err(Error::Generic(
-                        "translate_expr: Transform requires a struct output_type".into(),
+                        "translate_expr: StructPatch requires a struct output_type".into(),
                     ));
                 }
             };
             let schema = input_schema.ok_or_else(|| {
                 Error::Generic(
-                    "translate_expr: Transform requires an input_schema (nested-Transform path)"
+                    "translate_expr: StructPatch requires an input_schema (nested-patch path)"
                         .into(),
                 )
             })?;
             translate_transform(t, target, schema)
+        }
+        Expression::Cast(c) => {
+            let inner = translate_expr(&c.expr, None, input_schema)?;
+            let target = c.target.to_polars().map_err(to_kernel_err)?;
+            Ok(inner.cast(target))
         }
         Expression::Unary(u) => translate_unary_expr(u, input_schema),
         Expression::Binary(b) => translate_binary_expr(b, input_schema),
@@ -111,7 +116,7 @@ impl<'a> SchemaTransform<'a> for StringifyTemporal {
     }
 }
 
-pub(super) fn column_path_to_expr(name: &ColumnName) -> Expr {
+pub(crate) fn column_path_to_expr(name: &ColumnName) -> Expr {
     let mut iter = name.iter();
     let first = iter.next().expect("ColumnName has at least one segment");
     let mut expr = col(PlSmallStr::from_str(first));
@@ -122,7 +127,10 @@ pub(super) fn column_path_to_expr(name: &ColumnName) -> Expr {
 }
 
 /// Maps are stored as `List<Struct<{key, value}>>`, so each output field
-/// list-evals the entry whose `key` matches and surfaces its `value`.
+/// list-evals the entry whose `key` matches, surfaces its `value`, and
+/// parses it into the field's target type per the kernel contract: empty
+/// string stays itself for string, becomes empty bytes for binary, and
+/// null for every other type.
 fn translate_map_to_struct(
     m: &delta_kernel::expressions::MapToStructExpression,
     output_type: Option<&KernelDataType>,
@@ -139,7 +147,7 @@ fn translate_map_to_struct(
     let map_expr = translate_expr(&m.map_expr, None, input_schema)?;
     let children: Vec<Expr> = target
         .fields()
-        .map(|f| {
+        .map(|f| -> DeltaResult<Expr> {
             let key_match = polars::prelude::Expr::Element
                 .struct_()
                 .field_by_name(MAP_KEY_FIELD)
@@ -151,18 +159,78 @@ fn translate_map_to_struct(
                         .field_by_name(MAP_VALUE_FIELD),
                 )
                 .otherwise(lit(polars::prelude::LiteralValue::untyped_null()));
-            map_expr
+            let raw = map_expr
                 .clone()
                 .list()
                 .eval(value_when_match)
                 .list()
                 .drop_nulls()
                 .list()
-                .first()
-                .alias(PlSmallStr::from_str(f.name.as_str()))
+                .first();
+            Ok(parse_partition_string(raw, &f.data_type)?
+                .alias(PlSmallStr::from_str(f.name.as_str())))
         })
-        .collect();
+        .collect::<DeltaResult<_>>()?;
     Ok(polars_as_struct(children))
+}
+
+/// Delta serialized-partition-value parse: `raw` is a nullable string expr.
+fn parse_partition_string(raw: Expr, target: &KernelDataType) -> DeltaResult<Expr> {
+    let polars_target = target.to_polars().map_err(to_kernel_err)?;
+    let parsed = match target {
+        KernelDataType::Primitive(PrimitiveType::String) => raw,
+        KernelDataType::Primitive(PrimitiveType::Binary) => raw.cast(polars_target),
+        // polars cannot cast String → Boolean; map the protocol's
+        // "true"/"false" spelling by hand (anything else → null).
+        KernelDataType::Primitive(PrimitiveType::Boolean) => when(raw.clone().eq(lit("true")))
+            .then(lit(true))
+            .when(raw.eq(lit("false")))
+            .then(lit(false))
+            .otherwise(lit(polars::prelude::LiteralValue::untyped_null()))
+            .cast(polars_target),
+        // Temporal strings need strptime — a polars cast from String to a
+        // temporal dtype yields null. Non-strict parsing turns the empty
+        // string (and garbage) into null, matching the kernel contract.
+        // Timestamps are serialized as naive wall-clock UTC
+        // ("1970-01-02 08:45:00"), so parse naive and attach UTC.
+        KernelDataType::Primitive(PrimitiveType::Timestamp) => raw
+            .str()
+            .to_datetime(
+                Some(polars::prelude::TimeUnit::Microseconds),
+                None,
+                lenient_strptime(),
+                lit("raise"),
+            )
+            .dt()
+            .replace_time_zone(
+                Some(polars::prelude::TimeZone::UTC),
+                lit("raise"),
+                polars::prelude::NonExistent::Raise,
+            ),
+        KernelDataType::Primitive(PrimitiveType::TimestampNtz) => raw.str().to_datetime(
+            Some(polars::prelude::TimeUnit::Microseconds),
+            None,
+            lenient_strptime(),
+            lit("raise"),
+        ),
+        KernelDataType::Primitive(PrimitiveType::Date) => raw.str().to_date(lenient_strptime()),
+        _ => when(raw.clone().eq(lit("")))
+            .then(lit(polars::prelude::LiteralValue::untyped_null()))
+            .otherwise(raw)
+            .cast(polars_target),
+    };
+    Ok(parsed)
+}
+
+/// Infer the format per value; unparseable input (incl. the empty string)
+/// becomes null instead of an error.
+fn lenient_strptime() -> polars::prelude::StrptimeOptions {
+    polars::prelude::StrptimeOptions {
+        format: None,
+        strict: false,
+        exact: true,
+        cache: true,
+    }
 }
 
 fn translate_struct(
@@ -238,5 +306,13 @@ fn translate_variadic_expr(
         .collect::<DeltaResult<_>>()?;
     match v.op {
         VariadicExpressionOp::Coalesce => Ok(coalesce(&children)),
+        VariadicExpressionOp::Array => {
+            if children.is_empty() {
+                return Err(Error::Unsupported(
+                    "translate_expr: Array expression with no elements".into(),
+                ));
+            }
+            polars::prelude::concat_list(children.as_slice()).map_err(to_kernel_err)
+        }
     }
 }

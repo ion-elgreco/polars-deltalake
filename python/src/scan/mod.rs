@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::expressions::{Predicate, PredicateRef};
-use delta_kernel::scan::Scan;
+use delta_kernel::scan::{PartitionValuesOptions, Scan};
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use polars::prelude::{DataFrame, Expr, Schema as PlSchema};
 use polars_plan::dsl::Engine as PolarsEngineMode;
@@ -220,7 +220,14 @@ impl TableScan {
 
 impl TableScan {
     fn build_scan(&self, state: &ScanState) -> anyhow::Result<Scan> {
-        let mut sb = self.snapshot.clone().scan_builder();
+        let mut sb = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            // The metadata plan parses partition values into a typed struct
+            // (`add.partitionValues_parsed`) the resolver turns into per-file
+            // literals.
+            .with_partition_values(PartitionValuesOptions::with_struct());
         if let Some(cols) = &state.projection {
             let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
             let projected = self
@@ -239,9 +246,8 @@ impl TableScan {
 
     fn build_iter(&self, state: &mut ScanState) -> anyhow::Result<()> {
         let scan = self.build_scan(state)?;
-        let engine: Arc<dyn Engine> = self.engine.clone();
 
-        let resolved = resolve_scan(&scan, engine.as_ref())?;
+        let resolved = resolve_scan(&scan, self.engine.as_ref())?;
         if resolved.files.is_empty() {
             state.iter = Some(Box::new(std::iter::empty()));
             state.morsel.reset();
@@ -253,7 +259,6 @@ impl TableScan {
         } = resolved;
 
         let physical_schema = scan.physical_schema().clone();
-        let logical_schema = scan.logical_schema().clone();
         let select_exprs = select_exprs_for_schema(&physical_schema);
 
         let column_mapped = has_column_mapping(self.snapshot.table_properties());
@@ -297,10 +302,10 @@ impl TableScan {
             files.into_iter().map(|f| (f.path, f.rewrite)).unzip();
 
         // Skip the file-id column + `LogicalScanIter` when no file needs
-        // DV/Transform — the common case (non-partitioned, non-DV, non-CM).
+        // DV/select — the common case (non-partitioned, non-DV, non-CM).
         let needs_rewrite = rewrites
             .iter()
-            .any(|r| r.transform.is_some() || r.dv.is_some());
+            .any(|r| r.select.is_some() || r.dv.is_some());
 
         let lazy = build_lazy_scan(
             paths,
@@ -326,9 +331,6 @@ impl TableScan {
                     source,
                     path_index,
                     rewrites,
-                    engine,
-                    physical_schema,
-                    logical_schema,
                     conjunction(routing.post_transform),
                 )
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
@@ -336,7 +338,7 @@ impl TableScan {
         } else {
             debug_assert!(
                 routing.post_transform.is_empty(),
-                "post_transform requires Transform to materialize partition cols",
+                "post_transform requires the select list to materialize partition cols",
             );
             source
         };

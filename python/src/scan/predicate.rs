@@ -120,7 +120,7 @@ pub(crate) fn conjunction(mut conjuncts: Vec<Expr>) -> Option<Expr> {
 /// underlying metadata key ourselves.
 const PHYSICAL_NAME_KEY: &str = "delta.columnMapping.physicalName";
 
-fn physical_name(field: &StructField) -> &str {
+pub(crate) fn physical_name(field: &StructField) -> &str {
     match field.metadata.get(PHYSICAL_NAME_KEY) {
         Some(MetadataValue::String(s)) => s.as_str(),
         _ => field.name.as_str(),

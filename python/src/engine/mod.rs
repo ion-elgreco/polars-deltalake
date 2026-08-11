@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use delta_kernel::plans::PlanExecutor;
 use delta_kernel::{
     DeltaResult, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
@@ -12,9 +13,12 @@ use tokio::runtime::Runtime;
 use url::Url;
 
 mod data;
+mod executor;
 mod handlers;
 
 pub(crate) use data::PolarsEngineData;
+pub(crate) use data::resolve_path as resolve_series_path;
+pub(crate) use executor::PolarsPlanExecutor;
 
 use handlers::{ObjectStoreStorageHandler, PolarsJsonHandler, PolarsParquetHandler};
 pub(crate) use handlers::{parquet_options, path_for_polars_io, unified_scan_args};
@@ -56,6 +60,7 @@ pub(crate) struct PolarsEngine {
     json: Arc<PolarsJsonHandler>,
     parquet: Arc<PolarsParquetHandler>,
     evaluation: Arc<PolarsEvaluationHandler>,
+    executor: Arc<PolarsPlanExecutor>,
 }
 
 impl PolarsEngine {
@@ -73,12 +78,18 @@ impl PolarsEngine {
         let json = Arc::new(PolarsJsonHandler::new(storage.clone()));
         let parquet = Arc::new(PolarsParquetHandler::new(storage.clone(), opts, rt)?);
         let evaluation = Arc::new(PolarsEvaluationHandler::new());
+        let executor = Arc::new(PolarsPlanExecutor::new(
+            storage.clone(),
+            parquet.cloud_options().cloned(),
+            rt,
+        ));
 
         Ok(Self {
             storage,
             json,
             parquet,
             evaluation,
+            executor,
         })
     }
 
@@ -105,5 +116,12 @@ impl Engine for PolarsEngine {
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
+    }
+
+    /// Opts kernel into declarative-plan execution: snapshot P&M replay and
+    /// (via `declarative_metadata_scan_plan`) scan-file log replay run as
+    /// polars queries instead of per-file handler calls.
+    fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
+        Some(self.executor.clone())
     }
 }

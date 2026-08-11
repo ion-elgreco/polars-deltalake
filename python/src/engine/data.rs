@@ -139,7 +139,7 @@ impl EngineData for PolarsEngineData {
 /// is a top-level column; each subsequent segment is a struct field on the
 /// preceding series — kernel only emits named paths through struct nesting
 /// (maps and lists are surfaced by their own getters, not path-walking).
-fn resolve_path(df: &DataFrame, name: &ColumnName) -> anyhow::Result<Series> {
+pub(crate) fn resolve_path(df: &DataFrame, name: &ColumnName) -> anyhow::Result<Series> {
     let mut iter = name.iter();
     let first = iter.next().expect("ColumnName is nonempty by construction");
 

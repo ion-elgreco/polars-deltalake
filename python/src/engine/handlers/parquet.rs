@@ -148,17 +148,26 @@ impl ParquetHandler for PolarsParquetHandler {
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
-        let metadata = fetch_parquet_metadata(self.storage.as_ref(), file)?;
-        let arrow_schema = infer_schema(&metadata).map_err(to_kernel_err)?;
-        let kernel_schema = arrow_schema.to_kernel().map_err(to_kernel_err)?;
-        Ok(ParquetFooter {
-            schema: Arc::new(kernel_schema),
-        })
+        kernel_parquet_footer(self.storage.as_ref(), file)
     }
 }
 
+/// Footer → kernel schema, shared by the `ParquetHandler` and the plan
+/// executor's `IoOperation::ParquetFooter` arm.
+pub(crate) fn kernel_parquet_footer(
+    storage: &ObjectStoreStorageHandler,
+    file: &FileMeta,
+) -> DeltaResult<ParquetFooter> {
+    let metadata = fetch_parquet_metadata(storage, file)?;
+    let arrow_schema = infer_schema(&metadata).map_err(to_kernel_err)?;
+    let kernel_schema = arrow_schema.to_kernel().map_err(to_kernel_err)?;
+    Ok(ParquetFooter {
+        schema: Arc::new(kernel_schema),
+    })
+}
+
 /// Fetch a parquet file's thrift footer via two range reads
-fn fetch_parquet_metadata(
+pub(crate) fn fetch_parquet_metadata(
     storage: &ObjectStoreStorageHandler,
     file: &FileMeta,
 ) -> DeltaResult<FileMetadata> {

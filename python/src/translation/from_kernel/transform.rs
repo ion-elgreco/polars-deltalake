@@ -1,9 +1,12 @@
-//! Kernel `Transform` → polars `as_struct(...)`. A `Transform` is a sparse
-//! schema rewrite: prepend new fields, then walk the input fields applying
-//! per-field replace/insert directives. Output ordering must match the
-//! declared output struct position-by-position — see [`translate_transform`].
+//! Kernel `ExpressionStructPatch` → polars `as_struct(...)`. A struct patch
+//! is a sparse schema rewrite: prepend new fields, walk the input fields
+//! applying per-field replace/insert directives, then append trailing
+//! fields. Output ordering must match the declared output struct
+//! position-by-position — see [`translate_transform`].
 
-use delta_kernel::expressions::{ColumnName, Expression, ExpressionRef, FieldTransform, Transform};
+use delta_kernel::expressions::{
+    ColumnName, Expression, ExpressionFieldPatch, ExpressionRef, ExpressionStructPatch,
+};
 use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::as_struct as polars_as_struct;
@@ -32,13 +35,23 @@ pub(super) enum TransformSlot<'a> {
     },
 }
 
-/// Walk a Transform position-by-position over `input_fields` and emit one
+/// Walk a struct patch position-by-position over `input_fields` and emit one
 /// [`TransformSlot`] per output slot.
 pub(super) fn walk_transform_slots<'a>(
-    t: &'a Transform,
+    t: &'a ExpressionStructPatch,
     output_struct: &'a StructType,
     input_fields: &[&'a StructField],
 ) -> DeltaResult<Vec<TransformSlot<'a>>> {
+    // A non-optional patch naming a field the input doesn't have is an error
+    // per the kernel contract; optional ones are silently skipped.
+    for (name, patch) in &t.field_patches {
+        if !patch.optional && !input_fields.iter().any(|f| f.name.as_str() == name) {
+            return Err(Error::Generic(format!(
+                "StructPatch: patched field '{name}' not found in input schema"
+            )));
+        }
+    }
+
     let mut slots: Vec<TransformSlot<'a>> = Vec::with_capacity(output_struct.num_fields());
     let mut output_iter = output_struct.fields();
 
@@ -50,7 +63,7 @@ pub(super) fn walk_transform_slots<'a>(
     }
 
     for (input_idx, input_field) in input_fields.iter().enumerate() {
-        let op = classify_input_op(t.field_transforms.get(input_field.name.as_str()));
+        let op = classify_input_op(t.field_patches.get(input_field.name.as_str()));
         let (passes_through, inserts) = match op {
             InputFieldOp::Keep => (true, &[][..]),
             InputFieldOp::KeepThenInsert(exprs) => (true, exprs),
@@ -69,6 +82,13 @@ pub(super) fn walk_transform_slots<'a>(
                 output: next_output(&mut output_iter)?,
             });
         }
+    }
+
+    for app in &t.appended_fields {
+        slots.push(TransformSlot::Translated {
+            expr: app.as_ref(),
+            output: next_output(&mut output_iter)?,
+        });
     }
 
     if output_iter.next().is_some() {
@@ -92,7 +112,7 @@ fn next_output<'a>(
 /// match `output_struct` position-by-position — kernel consumes the output
 /// schema in lockstep with prepends, pass-throughs, and inserts.
 pub(super) fn translate_transform(
-    t: &Transform,
+    t: &ExpressionStructPatch,
     output_struct: &StructType,
     input_schema: &StructType,
 ) -> DeltaResult<Expr> {
@@ -123,7 +143,18 @@ pub(super) fn translate_transform(
             Ok(raw.alias(PlSmallStr::from_str(output.name.as_str())))
         })
         .collect::<DeltaResult<Vec<_>>>()?;
-    Ok(polars_as_struct(entries))
+    let rebuilt = polars_as_struct(entries);
+    // A nested patch rewrites a struct-typed column; `as_struct` alone would
+    // make every row valid, and plan filters (`add IS NOT NULL`) select rows
+    // by exactly that outer validity.
+    Ok(match &root_expr {
+        Some(root) => polars::prelude::when(root.clone().is_not_null())
+            .then(rebuilt)
+            .otherwise(polars::prelude::lit(
+                polars::prelude::LiteralValue::untyped_null(),
+            )),
+        None => rebuilt,
+    })
 }
 
 enum InputFieldOp<'a> {
@@ -133,12 +164,12 @@ enum InputFieldOp<'a> {
     ReplaceWith(&'a [ExpressionRef]),
 }
 
-fn classify_input_op(ft: Option<&FieldTransform>) -> InputFieldOp<'_> {
-    match ft {
+fn classify_input_op(patch: Option<&ExpressionFieldPatch>) -> InputFieldOp<'_> {
+    match patch {
         None => InputFieldOp::Keep,
-        Some(ft) if !ft.is_replace => InputFieldOp::KeepThenInsert(&ft.exprs),
-        Some(ft) if ft.exprs.is_empty() => InputFieldOp::Drop,
-        Some(ft) => InputFieldOp::ReplaceWith(&ft.exprs),
+        Some(p) if p.keep_input => InputFieldOp::KeepThenInsert(&p.insertions),
+        Some(p) if p.insertions.is_empty() => InputFieldOp::Drop,
+        Some(p) => InputFieldOp::ReplaceWith(&p.insertions),
     }
 }
 

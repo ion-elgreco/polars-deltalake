@@ -201,6 +201,17 @@ impl StorageHandler for ObjectStoreStorageHandler {
         ))
     }
 
+    fn delete(&self, path: &Url) -> DeltaResult<()> {
+        let p = self.url_to_path(path)?;
+        let store = self.store.clone();
+        self.rt.block_on(async move {
+            store.delete(&p).await.map_err(|e| match e {
+                object_store::Error::NotFound { .. } => Error::FileNotFound(p.to_string()),
+                other => Error::Generic(format!("object_store delete failed: {other}")),
+            })
+        })
+    }
+
     fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
         let p = self.url_to_path(path)?;
         let store = self.store.clone();

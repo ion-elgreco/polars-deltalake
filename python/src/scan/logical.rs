@@ -1,18 +1,11 @@
 //! `LogicalScanIter` — splits bulk-read frames on file-id boundaries and
-//! applies the per-file DV + kernel `Transform`.
+//! applies the per-file DV keep-mask + physical→logical select list.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 
-use delta_kernel::Engine;
-use delta_kernel::ExpressionEvaluator;
-use delta_kernel::engine_data::EngineData;
-use delta_kernel::expressions::ExpressionRef;
-use delta_kernel::schema::SchemaRef;
-use polars::prelude::{DataFrame, Expr, IntoLazy, StringChunked};
+use polars::prelude::{BooleanChunked, DataFrame, Expr, IntoLazy, NamedFrom, StringChunked};
 use polars_plan::dsl::Engine as PolarsEngineMode;
 
-use crate::engine::PolarsEngineData;
 use crate::scan::plan::{DvState, LogicalRewrite};
 use crate::scan::read::FILE_ID_COL;
 
@@ -25,13 +18,8 @@ pub(crate) struct LogicalScanIter {
     /// `FILE_ID_COL` value → index in `rewrites`.
     path_index: HashMap<String, usize>,
     rewrites: Vec<LogicalRewrite>,
-    engine: Arc<dyn Engine>,
-    physical_schema: SchemaRef,
-    logical_schema: SchemaRef,
-    /// Parallel to `rewrites`. Reused across batches of the same file.
-    evaluator_cache: Vec<Option<Arc<dyn ExpressionEvaluator>>>,
     /// Mixed atomic conjuncts (touching both partition and data cols) —
-    /// applied after `transform_to_logical` materializes partition values.
+    /// applied after the select list materializes partition values.
     orphan_predicate: Option<Expr>,
     /// One inner frame may span multiple files; we slice into per-file
     /// frames here and drain before pulling the next inner frame.
@@ -43,41 +31,15 @@ impl LogicalScanIter {
         source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>,
         path_index: HashMap<String, usize>,
         rewrites: Vec<LogicalRewrite>,
-        engine: Arc<dyn Engine>,
-        physical_schema: SchemaRef,
-        logical_schema: SchemaRef,
         orphan_predicate: Option<Expr>,
     ) -> Self {
-        let n_files = rewrites.len();
         Self {
             source,
             path_index,
             rewrites,
-            engine,
-            physical_schema,
-            logical_schema,
-            evaluator_cache: vec![None; n_files],
             orphan_predicate,
             pending: VecDeque::new(),
         }
-    }
-
-    /// Cached per `idx`; building one parses kernel `Transform` into polars `Expr`s.
-    fn evaluator_for(
-        &mut self,
-        idx: usize,
-        transform: ExpressionRef,
-    ) -> Result<Arc<dyn ExpressionEvaluator>, delta_kernel::Error> {
-        if let Some(e) = &self.evaluator_cache[idx] {
-            return Ok(e.clone());
-        }
-        let evaluator = self.engine.evaluation_handler().new_expression_evaluator(
-            self.physical_schema.clone(),
-            transform,
-            self.logical_schema.as_ref().clone().into(),
-        )?;
-        self.evaluator_cache[idx] = Some(evaluator.clone());
-        Ok(evaluator)
     }
 
     /// Slice on file-id boundaries, push each per-file logical frame onto
@@ -120,7 +82,8 @@ impl LogicalScanIter {
         Ok(())
     }
 
-    /// Drop the file-id column, apply DV + `Transform`, return logical frame.
+    /// Drop the file-id column, apply the DV keep-mask and the
+    /// physical→logical select, return the logical frame.
     fn apply_rewrite(
         &mut self,
         file_id: &str,
@@ -133,37 +96,28 @@ impl LogicalScanIter {
             delta_kernel::Error::Generic(format!("unknown file_id from polars-io scan: {file_id}"))
         })?;
         let rewrite = &mut self.rewrites[idx];
-        let sv_chunk = rewrite
-            .dv
-            .as_mut()
-            .map(|state| build_keep_mask(state, df.height()));
-        let transform = rewrite.transform.clone();
 
-        let mut physical: Box<dyn EngineData> = Box::new(PolarsEngineData::new(df));
-        if let Some(sv) = sv_chunk {
-            physical = physical.apply_selection_vector(sv)?;
+        if let Some(state) = rewrite.dv.as_mut() {
+            let mask = build_keep_mask(state, df.height());
+            let mask = BooleanChunked::new("__pldl_dv__".into(), mask.as_slice());
+            df = df
+                .filter(&mask)
+                .map_err(|e| delta_kernel::Error::Generic(format!("DV filter: {e}")))?;
         }
 
-        let logical: Box<dyn EngineData> = match transform {
-            Some(t) => self.evaluator_for(idx, t)?.evaluate(physical.as_ref())?,
-            None => physical,
-        };
-
-        let out = logical
-            .into_any()
-            .downcast::<PolarsEngineData>()
-            .map_err(|_| {
-                delta_kernel::Error::Generic(
-                    "transform_to_logical returned non-PolarsEngineData".into(),
-                )
-            })?;
-        let mut df = out.into_inner();
-        if let Some(pred) = &self.orphan_predicate {
-            df = df
-                .lazy()
-                .filter(pred.clone())
+        if rewrite.select.is_some() || self.orphan_predicate.is_some() {
+            let mut lazy = df.lazy();
+            if let Some(select) = &rewrite.select {
+                lazy = lazy.select(select.clone());
+            }
+            if let Some(pred) = &self.orphan_predicate {
+                lazy = lazy.filter(pred.clone());
+            }
+            df = lazy
                 .collect_with_engine(PolarsEngineMode::Streaming)
-                .map_err(|e| delta_kernel::Error::Generic(format!("orphan predicate eval: {e}")))?;
+                .map_err(|e| {
+                    delta_kernel::Error::Generic(format!("logical rewrite eval: {e}"))
+                })?;
         }
         Ok(df)
     }

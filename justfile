@@ -51,9 +51,11 @@ pre-commit-check:
 check:
     cd python && cargo check
 
-# cargo unit tests on the cdylib crate.
-test-rust:
-    cd python && cargo test --lib
+# cargo unit tests on the cdylib crate. `--no-default-features` drops
+# pyo3/extension-module so the test binary links libpython — pointed at the
+# venv interpreter, since the system python3 can predate abi3-py310.
+test-rust: venv
+    cd python && PYO3_PYTHON='{{ justfile_directory() }}/python/.venv/bin/python3' cargo test --lib --no-default-features
 
 # Wipe build artifacts.
 clean:

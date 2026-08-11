@@ -16,7 +16,9 @@ use delta_kernel::{
 use polars::io::SerReader;
 use polars::io::json::{JsonFormat, JsonReader};
 use polars::prelude::as_struct as polars_as_struct;
-use polars::prelude::{DataFrame, DataType as PlDataType, Expr, IntoLazy, col, concat_list, lit};
+use polars::prelude::{
+    DataFrame, DataType as PlDataType, Expr, IntoLazy, col, concat_list, lit, when,
+};
 use polars_utils::pl_str::PlSmallStr;
 use url::Url;
 
@@ -106,7 +108,7 @@ impl JsonHandler for PolarsJsonHandler {
     }
 }
 
-fn parse_ndjson_inferred(bytes: &[u8]) -> DeltaResult<DataFrame> {
+pub(crate) fn parse_ndjson_inferred(bytes: &[u8]) -> DeltaResult<DataFrame> {
     let mut df = JsonReader::new(Cursor::new(bytes))
         .with_json_format(JsonFormat::JsonLines)
         .infer_schema_len(NonZeroUsize::new(usize::MAX))
@@ -119,7 +121,7 @@ fn parse_ndjson_inferred(bytes: &[u8]) -> DeltaResult<DataFrame> {
 /// Reshape an inferred polars DataFrame to the kernel-declared layout:
 /// missing fields → null columns, inferred `Struct{...}` map fields →
 /// `List<Struct<{key, value}>>`, struct children recurse.
-fn align_dataframe(
+pub(crate) fn align_dataframe(
     df: DataFrame,
     kernel_schema: &delta_kernel::schema::StructType,
 ) -> DeltaResult<DataFrame> {
@@ -156,6 +158,10 @@ fn align(source: Expr, field: &StructField, inferred: Option<&PlDataType>) -> De
         // reshape into our `List<Struct<{key,value}>>` representation.
         (KernelDataType::Map(_), PlDataType::Struct(fs)) => map_from_struct_expr(source, fs),
         // A Struct may contain a Map at any depth, so recurse and rebuild.
+        // The rebuild must keep the source's outer validity: `as_struct`
+        // alone yields a valid struct of null children for a null row, and
+        // plan aggregates (`max_non_null_by(protocol, ...)`) select rows by
+        // exactly that struct-level nullity.
         (KernelDataType::Struct(struct_type), PlDataType::Struct(fs)) => {
             let inferred_by_name: std::collections::HashMap<&str, &PlDataType> =
                 fs.iter().map(|f| (f.name.as_str(), &f.dtype)).collect();
@@ -170,7 +176,9 @@ fn align(source: Expr, field: &StructField, inferred: Option<&PlDataType>) -> De
                     .map(|e| e.alias(PlSmallStr::from_str(child.name.as_str())))
                 })
                 .collect::<DeltaResult<_>>()?;
-            Ok(polars_as_struct(children))
+            Ok(when(source.clone().is_not_null())
+                .then(polars_as_struct(children))
+                .otherwise(lit(polars::prelude::LiteralValue::untyped_null())))
         }
         // Primitives, Arrays, and any shape mismatch — let polars cast the
         // inferred column to the kernel-declared type.

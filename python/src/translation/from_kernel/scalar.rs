@@ -20,7 +20,7 @@ use crate::translation::schema::KernelDataTypeExt;
 /// Compound scalars (Array/Map/Struct/Decimal) round-trip through
 /// `build_series` so an empty list stays `[]` instead of collapsing to null
 /// — non-null typed empties are load-bearing for Delta log replay.
-pub(super) fn scalar_to_lit(scalar: &Scalar) -> Expr {
+pub(crate) fn scalar_to_lit(scalar: &Scalar) -> Expr {
     match scalar {
         Scalar::String(s) => lit(s.as_str()),
         Scalar::Long(v) => lit(*v),
@@ -51,6 +51,15 @@ pub(super) fn scalar_to_lit(scalar: &Scalar) -> Expr {
             Ok(polars_dt) => lit(polars::prelude::LiteralValue::untyped_null()).cast(polars_dt),
             Err(_) => lit(polars::prelude::LiteralValue::untyped_null()),
         },
+        // Intervals only occur in kernel-side expression evaluation, never in
+        // Delta data. Day-time is µs → Duration; year-month is a month count
+        // with no polars dtype, kept as Int32 so same-kind comparisons stay
+        // consistent.
+        Scalar::IntervalDayTime(v) => lit(PolarsScalar::new(
+            PlDataType::Duration(TimeUnit::Microseconds),
+            AnyValue::Duration(*v, TimeUnit::Microseconds),
+        )),
+        Scalar::IntervalYearMonth(v) => lit(*v),
         Scalar::Array(_) | Scalar::Map(_) | Scalar::Struct(_) | Scalar::Decimal(_) => {
             build_series("__lit__", &scalar.data_type(), &[scalar])
                 .map(lit)
@@ -81,6 +90,11 @@ pub(crate) fn try_to_polars_scalar(scalar: &Scalar) -> Option<PolarsScalar> {
             PolarsScalar::new_datetime(*v, TimeUnit::Microseconds, Some(TimeZone::UTC))
         }
         Scalar::TimestampNtz(v) => PolarsScalar::new_datetime(*v, TimeUnit::Microseconds, None),
+        Scalar::IntervalDayTime(v) => PolarsScalar::new(
+            PlDataType::Duration(TimeUnit::Microseconds),
+            AnyValue::Duration(*v, TimeUnit::Microseconds),
+        ),
+        Scalar::IntervalYearMonth(v) => PolarsScalar::new(PlDataType::Int32, AnyValue::Int32(*v)),
         Scalar::Decimal(d) => {
             PolarsScalar::new_decimal(d.bits(), d.precision() as usize, d.scale() as usize)
         }
@@ -253,6 +267,41 @@ pub(crate) fn build_series(
                     )
                     .into_series())
             }
+            IntervalDayTime => {
+                let v: Vec<Option<i64>> = values
+                    .iter()
+                    .map(|s| match s {
+                        Scalar::IntervalDayTime(v) => Some(*v),
+                        Scalar::Null(_) => None,
+                        other => panic_mismatch(name, "IntervalDayTime", other),
+                    })
+                    .collect();
+                Series::new(name_pl, v)
+                    .cast(&PlDataType::Duration(TimeUnit::Microseconds))
+                    .map_err(to_kernel_err)
+            }
+            IntervalYearMonth => Ok(Series::new(
+                name_pl,
+                values
+                    .iter()
+                    .map(|s| match s {
+                        Scalar::IntervalYearMonth(v) => Some(*v),
+                        Scalar::Null(_) => None,
+                        other => panic_mismatch(name, "IntervalYearMonth", other),
+                    })
+                    .collect::<Vec<Option<i32>>>(),
+            )),
+            Void => {
+                // Void is inhabited only by NULL, and polars' Null dtype is
+                // the exact match — but a mismatched scalar still panics
+                // like every other arm.
+                for s in values {
+                    if !matches!(s, Scalar::Null(_)) {
+                        panic_mismatch(name, "Void", s);
+                    }
+                }
+                Ok(Series::new_null(name_pl, values.len()))
+            }
         },
         KernelDataType::Struct(struct_type) => {
             use polars::prelude::IntoSeries;
@@ -419,4 +468,64 @@ fn panic_mismatch(name: &str, expected: &str, got: &Scalar) -> ! {
     panic!(
         "PolarsEvaluationHandler::create_many: column {name} expected {expected} scalars, got {got:?}",
     );
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+    use delta_kernel::schema::DataType as KernelDataType;
+
+    #[test]
+    fn day_time_interval_builds_duration_series() {
+        let a = Scalar::IntervalDayTime(90_000_000);
+        let null = Scalar::Null(KernelDataType::Primitive(PrimitiveType::IntervalDayTime));
+        let s = build_series(
+            "iv",
+            &KernelDataType::Primitive(PrimitiveType::IntervalDayTime),
+            &[&a, &null],
+        )
+        .unwrap();
+        assert_eq!(s.dtype(), &PlDataType::Duration(TimeUnit::Microseconds));
+        let physical = s.duration().unwrap().physical();
+        assert_eq!(physical.get(0), Some(90_000_000));
+        assert_eq!(physical.get(1), None);
+    }
+
+    #[test]
+    fn year_month_interval_builds_month_count_series() {
+        let a = Scalar::IntervalYearMonth(14);
+        let s = build_series(
+            "iv",
+            &KernelDataType::Primitive(PrimitiveType::IntervalYearMonth),
+            &[&a],
+        )
+        .unwrap();
+        assert_eq!(s.dtype(), &PlDataType::Int32);
+        assert_eq!(s.i32().unwrap().get(0), Some(14));
+    }
+
+    #[test]
+    fn void_builds_null_dtype_series() {
+        let null = Scalar::Null(KernelDataType::Primitive(PrimitiveType::Void));
+        let s = build_series(
+            "v",
+            &KernelDataType::Primitive(PrimitiveType::Void),
+            &[&null, &null],
+        )
+        .unwrap();
+        assert_eq!(s.dtype(), &PlDataType::Null);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.null_count(), 2);
+    }
+
+    #[test]
+    fn interval_scalars_convert_to_typed_polars_scalars() {
+        let day_time = try_to_polars_scalar(&Scalar::IntervalDayTime(5)).unwrap();
+        assert_eq!(
+            day_time.dtype(),
+            &PlDataType::Duration(TimeUnit::Microseconds)
+        );
+        let year_month = try_to_polars_scalar(&Scalar::IntervalYearMonth(7)).unwrap();
+        assert_eq!(year_month.dtype(), &PlDataType::Int32);
+    }
 }

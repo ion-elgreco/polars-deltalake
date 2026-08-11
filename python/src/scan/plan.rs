@@ -1,20 +1,40 @@
-//! `Scan::scan_metadata` → resolved file list + per-file rewrites.
+//! Declarative metadata scan plan → resolved file list + per-file rewrites.
+//!
+//! `Scan::declarative_metadata_scan_plan` hands back a kernel plan whose
+//! rows are the scan's live `add` actions — log replay, stats skipping, and
+//! kernel-predicate partition pruning already applied. The plan runs on the
+//! `PolarsPlanExecutor`; each output row becomes one [`ScanFileMeta`]: the
+//! data-file path, the physical→logical select list (column-mapping renames
+//! + typed partition literals), and the materialized deletion vector.
 
 use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::OnceLock;
 
-use delta_kernel::Engine;
-use delta_kernel::expressions::ExpressionRef;
+use delta_kernel::actions::deletion_vector::{
+    DeletionVectorDescriptor, DeletionVectorStorageType,
+};
+use delta_kernel::engine_data::{GetData, RowVisitor};
+use delta_kernel::expressions::ColumnName;
+use delta_kernel::plans::Operation;
 use delta_kernel::scan::Scan;
-use delta_kernel::scan::state::ScanFile;
+use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, StructType};
+use delta_kernel::{DeltaResult, Engine};
+use polars::prelude::{DataFrame, Expr, col, lit};
 use polars_utils::pl_path::PlRefPath;
-use url::Url;
+use polars_utils::pl_str::PlSmallStr;
 
-use crate::engine::path_for_polars_io;
+use crate::engine::{PolarsEngine, PolarsEngineData, path_for_polars_io, resolve_series_path};
+use crate::scan::predicate::physical_name;
+use crate::translation::schema::KernelDataTypeExt;
 
-/// Per-file work to apply post-read: kernel `Transform` + DV keep-mask.
+/// Per-file work to apply post-read: physical→logical select + DV keep-mask.
 pub(crate) struct LogicalRewrite {
-    /// Physical → logical (column-mapping + partition values).
-    pub(crate) transform: Option<ExpressionRef>,
+    /// Select list producing the logical frame from the physical read:
+    /// `col(physical).alias(logical)` renames plus typed partition-value
+    /// literals, in logical-schema order. `None` when the physical frame is
+    /// already logical (non-partitioned, non-column-mapped).
+    pub(crate) select: Option<Vec<Expr>>,
     /// Per-file DV state — sorted deleted row indices + cursor of how many
     /// rows of the file have been consumed by prior batches. `None` if the
     /// file has no DV.
@@ -35,96 +55,307 @@ pub(crate) struct ScanFileMeta {
     pub(crate) partition_values: HashMap<String, String>,
 }
 
-/// `Scan::scan_metadata` drained into bulk-read inputs.
+/// The metadata plan drained into bulk-read inputs.
 pub(crate) struct ResolvedScan {
     pub(crate) files: Vec<ScanFileMeta>,
     /// `FILE_ID_COL` value (= `PlRefPath::as_str()`) → index in `files`.
     pub(crate) path_index: HashMap<String, usize>,
 }
 
-/// Drain `scan.scan_metadata` into a `ResolvedScan`. Materializes each DV
-/// eagerly so the read path doesn't need the engine handle.
-///
-/// Kernel's `ScanCallback` is `fn(&mut T, ScanFile)` (no `Result`), so
-/// callback errors are stashed on the context and surfaced after each
-/// `visit_scan_files` call.
-pub(crate) fn resolve_scan(scan: &Scan, engine: &dyn Engine) -> anyhow::Result<ResolvedScan> {
-    struct Ctx<'a> {
-        engine: &'a dyn Engine,
-        table_root: &'a Url,
-        files: Vec<ScanFileMeta>,
-        path_index: HashMap<String, usize>,
-        err: Option<delta_kernel::Error>,
-    }
+/// One `add` row pulled out of a plan output batch via the row visitor.
+struct AddRow {
+    path: String,
+    dv: Option<DeletionVectorDescriptor>,
+    partition_values: HashMap<String, String>,
+}
 
-    fn visit_one(ctx: &mut Ctx<'_>, scan_file: ScanFile) -> Result<(), delta_kernel::Error> {
-        let abs = ctx.table_root.join(&scan_file.path).map_err(|e| {
-            delta_kernel::Error::Generic(format!(
-                "failed to resolve scan file path {}: {e}",
-                scan_file.path
-            ))
-        })?;
-        let pl_path = path_for_polars_io(&abs)?;
-        // `Vec<u64>` of deleted row indices is far smaller than a `Vec<bool>`
-        // keep-mask for sparse deletes — only ~8 bytes per delete vs. one byte
-        // per row in the file.
-        let dv = if scan_file.dv_info.has_vector() {
-            scan_file
-                .dv_info
-                .get_row_indexes(ctx.engine, ctx.table_root)?
-                .map(|deleted| DvState { deleted, cursor: 0 })
-        } else {
-            None
-        };
+/// A projected logical field's physical source: the next physical column
+/// (rename) or a per-file partition literal (looked up in
+/// `add.partitionValues_parsed` by physical partition name).
+enum FieldSource {
+    Data { physical: String },
+    Partition { physical: String },
+}
 
-        let idx = ctx.files.len();
-        ctx.path_index.insert(pl_path.as_str().to_string(), idx);
-        ctx.files.push(ScanFileMeta {
-            path: pl_path,
-            rewrite: LogicalRewrite {
-                transform: scan_file.transform,
-                dv,
-            },
-            partition_values: scan_file.partition_values,
+pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result<ResolvedScan> {
+    let executor = engine
+        .plan_executor()
+        .expect("PolarsEngine always provides a plan executor");
+
+    let plan = scan
+        .declarative_metadata_scan_plan(engine as &dyn Engine)
+        .map_err(|e| anyhow::anyhow!("declarative_metadata_scan_plan failed: {e:#}"))?;
+    let Some(plan) = plan else {
+        return Ok(ResolvedScan {
+            files: Vec::new(),
+            path_index: HashMap::new(),
         });
-        Ok(())
-    }
-
-    // `ScanCallback` is a bare `fn` pointer with no `Result` return, so
-    // bubble visitor errors through the context.
-    fn callback(ctx: &mut Ctx<'_>, scan_file: ScanFile) {
-        if ctx.err.is_some() {
-            return;
-        }
-        if let Err(e) = visit_one(ctx, scan_file) {
-            ctx.err = Some(e);
-        }
-    }
-
-    let table_root = scan.table_root().clone();
-    let mut ctx = Ctx {
-        engine,
-        table_root: &table_root,
-        files: Vec::new(),
-        path_index: HashMap::new(),
-        err: None,
     };
 
-    for res in scan
-        .scan_metadata(engine)
-        .map_err(|e| anyhow::anyhow!("scan_metadata failed: {e:#}"))?
-    {
-        let metadata = res.map_err(|e| anyhow::anyhow!("scan_metadata item failed: {e:#}"))?;
-        ctx = metadata
-            .visit_scan_files(ctx, callback)
-            .map_err(|e| anyhow::anyhow!("visit_scan_files failed: {e:#}"))?;
-        if let Some(e) = ctx.err.take() {
-            return Err(anyhow::anyhow!("scan_metadata callback failed: {e:#}"));
+    let batches = executor
+        .execute_op(Operation::QueryPlan(plan))
+        .and_then(|r| r.into_data())
+        .map_err(|e| anyhow::anyhow!("metadata plan execution failed: {e:#}"))?;
+
+    let table_root = scan.table_root().clone();
+    let sources = field_sources(scan.logical_schema(), scan.physical_schema());
+    // Identity frames need no per-file select at all.
+    let needs_select = sources.iter().any(|(f, s)| match s {
+        FieldSource::Partition { .. } => true,
+        FieldSource::Data { physical } => physical != f.name.as_str(),
+    });
+
+    let storage = engine.storage_handler();
+    let mut files: Vec<ScanFileMeta> = Vec::new();
+    let mut path_index: HashMap<String, usize> = HashMap::new();
+
+    for batch in batches {
+        let batch = batch.map_err(|e| anyhow::anyhow!("metadata plan batch failed: {e:#}"))?;
+        let rows = visit_add_rows(batch.as_ref())?;
+        let polars_batch = batch
+            .any_ref()
+            .downcast_ref::<PolarsEngineData>()
+            .ok_or_else(|| anyhow::anyhow!("metadata plan returned non-PolarsEngineData"))?;
+        let partition_lits = partition_literals(polars_batch.dataframe(), &sources, rows.len())?;
+
+        for (row, lits) in rows.into_iter().zip(partition_lits) {
+            let abs = table_root
+                .join(&row.path)
+                .map_err(|e| anyhow::anyhow!("failed to resolve add path {}: {e}", row.path))?;
+            let pl_path = path_for_polars_io(&abs)?;
+
+            // `Vec<u64>` of deleted row indices is far smaller than a
+            // `Vec<bool>` keep-mask for sparse deletes.
+            let dv = row
+                .dv
+                .map(|descriptor| -> anyhow::Result<DvState> {
+                    let deleted = descriptor
+                        .row_indexes(storage.clone(), &table_root)
+                        .map_err(|e| anyhow::anyhow!("deletion vector read failed: {e:#}"))?;
+                    Ok(DvState { deleted, cursor: 0 })
+                })
+                .transpose()?;
+
+            let select = needs_select.then(|| build_select(&sources, lits));
+
+            let idx = files.len();
+            path_index.insert(pl_path.as_str().to_string(), idx);
+            files.push(ScanFileMeta {
+                path: pl_path,
+                rewrite: LogicalRewrite { select, dv },
+                partition_values: row.partition_values,
+            });
         }
     }
 
-    Ok(ResolvedScan {
-        files: ctx.files,
-        path_index: ctx.path_index,
-    })
+    Ok(ResolvedScan { files, path_index })
+}
+
+/// Pair each projected logical field with its physical source. Partition
+/// columns are exactly the logical fields whose physical name is absent
+/// from the physical (file) schema.
+fn field_sources<'a>(
+    logical: &'a StructType,
+    physical: &StructType,
+) -> Vec<(&'a StructField, FieldSource)> {
+    let physical_names: std::collections::HashSet<&str> =
+        physical.fields().map(|f| f.name.as_str()).collect();
+    logical
+        .fields()
+        .map(|f| {
+            let phys = physical_name(f).to_string();
+            let source = if physical_names.contains(phys.as_str()) {
+                FieldSource::Data { physical: phys }
+            } else {
+                FieldSource::Partition { physical: phys }
+            };
+            (f, source)
+        })
+        .collect()
+}
+
+/// Per-row typed partition literals, one `Vec<Expr>` per add row, aligned
+/// with `sources` (empty per-row vec when the table is unpartitioned). The
+/// values come from `add.partitionValues_parsed`, which the metadata plan
+/// populates via `MapToStruct` with the physical partition schema.
+fn partition_literals(
+    df: &DataFrame,
+    sources: &[(&StructField, FieldSource)],
+    row_count: usize,
+) -> anyhow::Result<Vec<Vec<Expr>>> {
+    let partition_fields: Vec<(&StructField, &str)> = sources
+        .iter()
+        .filter_map(|(f, s)| match s {
+            FieldSource::Partition { physical } => Some((*f, physical.as_str())),
+            FieldSource::Data { .. } => None,
+        })
+        .collect();
+    if partition_fields.is_empty() {
+        return Ok(vec![Vec::new(); row_count]);
+    }
+
+    let series_per_field = partition_fields
+        .iter()
+        .map(|(f, phys)| {
+            let path = ColumnName::new(["add", "partitionValues_parsed", phys]);
+            resolve_series_path(df, &path).map_err(|e| {
+                anyhow::anyhow!(
+                    "partition column '{}' missing from parsed partition values: {e:#}",
+                    f.name
+                )
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    (0..row_count)
+        .map(|row| {
+            partition_fields
+                .iter()
+                .zip(series_per_field.iter())
+                .map(|((field, _), series)| -> anyhow::Result<Expr> {
+                    let value = series
+                        .get(row)
+                        .map_err(|e| anyhow::anyhow!("partition value read: {e:#}"))?
+                        .into_static();
+                    let scalar = polars::prelude::Scalar::new(series.dtype().clone(), value);
+                    let target = field.data_type.to_polars()?;
+                    Ok(lit(scalar)
+                        .cast(target)
+                        .alias(PlSmallStr::from_str(field.name.as_str())))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Logical-order select list: partition literals in place, physical→logical
+/// renames for data columns.
+fn build_select(sources: &[(&StructField, FieldSource)], mut lits: Vec<Expr>) -> Vec<Expr> {
+    let mut lit_iter = lits.drain(..);
+    sources
+        .iter()
+        .map(|(field, source)| match source {
+            FieldSource::Partition { .. } => lit_iter
+                .next()
+                .expect("one literal per partition field by construction"),
+            FieldSource::Data { physical } => col(PlSmallStr::from_str(physical.as_str()))
+                .alias(PlSmallStr::from_str(field.name.as_str())),
+        })
+        .collect()
+}
+
+/// Extract (path, DV descriptor, partition-values map) per add row through
+/// the kernel row-visitor machinery — the same getters kernel's own log
+/// replay uses.
+fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<AddRow>> {
+    struct Visitor {
+        rows: Vec<AddRow>,
+        err: Option<anyhow::Error>,
+    }
+
+    fn names_and_types() -> &'static (Vec<ColumnName>, Vec<KernelDataType>) {
+        static CELL: OnceLock<(Vec<ColumnName>, Vec<KernelDataType>)> = OnceLock::new();
+        CELL.get_or_init(|| {
+            (
+                vec![
+                    ColumnName::new(["add", "path"]),
+                    ColumnName::new(["add", "partitionValues"]),
+                    ColumnName::new(["add", "deletionVector", "storageType"]),
+                    ColumnName::new(["add", "deletionVector", "pathOrInlineDv"]),
+                    ColumnName::new(["add", "deletionVector", "offset"]),
+                    ColumnName::new(["add", "deletionVector", "sizeInBytes"]),
+                    ColumnName::new(["add", "deletionVector", "cardinality"]),
+                ],
+                vec![
+                    KernelDataType::STRING,
+                    MapType::new(KernelDataType::STRING, KernelDataType::STRING, true).into(),
+                    KernelDataType::STRING,
+                    KernelDataType::STRING,
+                    KernelDataType::INTEGER,
+                    KernelDataType::INTEGER,
+                    KernelDataType::LONG,
+                ],
+            )
+        })
+    }
+
+    impl RowVisitor for Visitor {
+        fn selected_column_names_and_types(
+            &self,
+        ) -> (&'static [ColumnName], &'static [KernelDataType]) {
+            let (names, types) = names_and_types();
+            (names.as_slice(), types.as_slice())
+        }
+
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            for i in 0..row_count {
+                let path: Option<&str> = getters[0].get_str(i, "add.path")?;
+                let Some(path) = path else {
+                    self.err = Some(anyhow::anyhow!("metadata plan emitted a null add.path"));
+                    return Ok(());
+                };
+                let partition_values = getters[1]
+                    .get_map(i, "add.partitionValues")?
+                    .map(|m| m.materialize())
+                    .unwrap_or_default();
+
+                let storage_type: Option<&str> = getters[2].get_str(i, "storageType")?;
+                let dv = match storage_type {
+                    None => None,
+                    Some(st) => {
+                        let path_or_inline: &str =
+                            getters[3].get_str(i, "pathOrInlineDv")?.ok_or_else(|| {
+                                delta_kernel::Error::Generic(
+                                    "deletionVector.pathOrInlineDv is null".into(),
+                                )
+                            })?;
+                        let offset: Option<i32> = getters[4].get_int(i, "offset")?;
+                        let size_in_bytes: i32 =
+                            getters[5].get_int(i, "sizeInBytes")?.ok_or_else(|| {
+                                delta_kernel::Error::Generic(
+                                    "deletionVector.sizeInBytes is null".into(),
+                                )
+                            })?;
+                        let cardinality: i64 =
+                            getters[6].get_long(i, "cardinality")?.ok_or_else(|| {
+                                delta_kernel::Error::Generic(
+                                    "deletionVector.cardinality is null".into(),
+                                )
+                            })?;
+                        Some(DeletionVectorDescriptor::try_new(
+                            DeletionVectorStorageType::from_str(st)?,
+                            path_or_inline,
+                            offset,
+                            size_in_bytes,
+                            cardinality,
+                        )?)
+                    }
+                };
+
+                self.rows.push(AddRow {
+                    path: path.to_string(),
+                    dv,
+                    partition_values,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    let mut visitor = Visitor {
+        rows: Vec::with_capacity(batch.len()),
+        err: None,
+    };
+    let (names, _) = names_and_types();
+    batch
+        .visit_rows(names.as_slice(), &mut visitor)
+        .map_err(|e| anyhow::anyhow!("add-row visit failed: {e:#}"))?;
+    if let Some(e) = visitor.err {
+        return Err(e);
+    }
+    Ok(visitor.rows)
 }

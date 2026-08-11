@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use delta_kernel::engine_data::EngineData;
-use delta_kernel::expressions::{Expression, ExpressionRef, Scalar, Transform};
+use delta_kernel::expressions::{Expression, ExpressionRef, ExpressionStructPatch, Scalar};
 use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
 use delta_kernel::{
     DeltaResult, Error, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
@@ -30,13 +30,25 @@ mod predicate;
 mod scalar;
 mod transform;
 
+pub(crate) use expr::{column_path_to_expr, translate_expr};
 pub(crate) use predicate::translate_predicate;
-pub(crate) use scalar::{build_series, empty_typed_list_expr};
+pub(crate) use scalar::{build_series, empty_typed_list_expr, scalar_to_lit};
 
-use expr::translate_expr;
 use predicate::PolarsPredicateEvaluator;
 use scalar::try_to_polars_scalar;
 use transform::{TransformSlot, translate_transform, walk_transform_slots};
+
+/// Select-list for evaluating `expression` (with struct `output_type`) over a
+/// frame shaped like `input_schema` — one aliased polars `Expr` per output
+/// field. Shared by the `Project` plan node and the expression evaluator.
+pub(crate) fn projection_exprs(
+    input_schema: &StructType,
+    expression: &Expression,
+    output_type: &KernelDataType,
+) -> DeltaResult<Vec<Expr>> {
+    let ops = build_column_ops(input_schema, expression, output_type)?;
+    Ok(ops.iter().map(op_to_expr).collect())
+}
 
 pub(crate) struct PolarsEvaluationHandler;
 
@@ -214,7 +226,7 @@ fn build_column_ops(
     output_type: &KernelDataType,
 ) -> DeltaResult<Vec<ColumnOp>> {
     match (output_type, expression) {
-        (KernelDataType::Struct(output_struct), Expression::Transform(t)) => {
+        (KernelDataType::Struct(output_struct), Expression::StructPatch(t)) => {
             build_transform_ops(t, output_struct, input_schema)
         }
         (KernelDataType::Struct(output_struct), Expression::Struct(children, _)) => {
@@ -247,10 +259,10 @@ fn build_column_ops(
     }
 }
 
-/// Nested `input_path` Transforms (rare) fall back to the lazy path wholesale
+/// Nested `input_path` patches (rare) fall back to the lazy path wholesale
 /// — `ColumnOp::Passthrough` can't address columns inside a struct projection.
 fn build_transform_ops(
-    t: &Transform,
+    t: &ExpressionStructPatch,
     output_struct: &StructType,
     input_schema: &StructType,
 ) -> DeltaResult<Vec<ColumnOp>> {

@@ -14,9 +14,15 @@ crate-type = ["cdylib"]
 [dependencies]
 # Kernel — protocol only; we provide our own Engine implementation backed by
 # polars-io, so the default-engine feature is intentionally NOT enabled.
-# `internal-api` exposes the create_table transaction-builder module that the
-# write path needs.
-delta_kernel = { version = "0.23", default-features = false, features = ["internal-api"] }
+# Pinned to a main-branch rev for the declarative-plans execution path
+# (PlanExecutor + Scan::declarative_metadata_scan_plan), which is not in a
+# tagged release yet. `vendored-protoc` supplies the protoc binary the
+# declarative-plans proto codegen runs at build time.
+delta_kernel = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "64fe8e992695a0ea5141642484ff45cbe24d06e4", default-features = false, features = [
+    "internal-api",
+    "declarative-plans",
+    "vendored-protoc",
+] }
 
 # Polars — parquet + ndjson readers, plus the lazy DSL for the expression
 # translator. `polars-arrow` exposes the ArrowSchema/Field/StructArray types
@@ -43,6 +49,8 @@ polars = { version = "0.53", default-features = false, features = [
     "dtype-struct",
     "dtype-date",
     "dtype-datetime",
+    # Kernel IntervalDayTime maps onto Duration(µs).
+    "dtype-duration",
     "timezones",
     # Polars-ops compile-required.
     "dtype-u8",
@@ -156,7 +164,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # PyO3 boundary — polars-native types crossing into Python.
 # pyo3 pinned to 0.27 to match pyo3-polars 0.26 (the latest release).
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
+# `extension-module` lives behind a default cargo feature: wheel builds keep
+# it, while `cargo test --no-default-features` links libpython so test
+# binaries resolve the pyo3 symbols that polars-utils' numpy glue pulls in.
+pyo3 = { version = "0.27", features = ["abi3-py310"] }
 pyo3-polars = { version = "0.26", features = [
     "lazy",
     "dtype-decimal",   # Delta `decimal(p, s)` → polars Decimal across FFI
@@ -175,6 +186,10 @@ rayon = "1"
 # variants shift discriminants and the round-trip miscompiles silently. The
 # JSON form is variant-name keyed and survives feature mismatches.
 serde_json = "1"
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [profile.release]
 lto = true

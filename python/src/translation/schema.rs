@@ -114,6 +114,13 @@ fn primitive_to_polars(p: &PrimitiveType) -> anyhow::Result<PlDataType> {
         ),
         TimestampNtz => PlDataType::Datetime(polars::prelude::TimeUnit::Microseconds, None),
         Decimal(d) => PlDataType::Decimal(d.precision() as usize, d.scale() as usize),
+        Void => PlDataType::Null,
+        // Kernel-side expression-eval types; Delta table schemas can't
+        // contain interval columns. Day-time is µs → Duration(µs); polars
+        // has no year-month dtype, so it stays the Spark-Catalyst physical
+        // representation: a signed month count.
+        IntervalDayTime => PlDataType::Duration(polars::prelude::TimeUnit::Microseconds),
+        IntervalYearMonth => PlDataType::Int32,
     })
 }
 
