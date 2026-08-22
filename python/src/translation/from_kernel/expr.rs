@@ -7,12 +7,13 @@ use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, ColumnName, Expression, ExpressionRef, UnaryExpression,
     UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
+use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, StructType};
 use delta_kernel::transform_output_type;
 use delta_kernel::transforms::SchemaTransform;
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::as_struct as polars_as_struct;
-use polars::prelude::{Expr, coalesce, col, lit, when};
+use polars::prelude::{Column, Expr, Field, Schema, coalesce, col, lit, when};
 use polars_utils::pl_str::PlSmallStr;
 use std::borrow::Cow;
 
@@ -21,7 +22,7 @@ use crate::errors::to_kernel_err;
 use crate::translation::schema::KernelDataTypeExt;
 
 use super::predicate::translate_predicate;
-use super::scalar::scalar_to_lit;
+use super::scalar::{build_series, scalar_to_lit};
 use super::transform::translate_transform;
 
 /// `output_type` (when known) lets us name struct children correctly —
@@ -175,62 +176,66 @@ fn translate_map_to_struct(
 }
 
 /// Delta serialized-partition-value parse: `raw` is a nullable string expr.
+///
+/// Defers to the kernel's own [`PrimitiveType::parse_scalar`], which the
+/// `MapToStruct` contract names as the reference, so every spelling it accepts
+/// and every `ParseError` it raises match exactly. Reimplementing that grammar
+/// out of polars cast and strptime rules cannot: kernel accepts spellings
+/// polars rejects (unpadded dates, `%+` offsets) and its lenient counterparts
+/// null unparseable values instead of failing the scan.
+///
+/// The empty string is the contract's one exception and never reaches
+/// `parse_scalar`: it stays itself for string, becomes empty bytes for binary
+/// and null for every other type.
 fn parse_partition_string(raw: Expr, target: &KernelDataType) -> DeltaResult<Expr> {
-    let polars_target = target.to_polars().map_err(to_kernel_err)?;
-    let parsed = match target {
-        KernelDataType::Primitive(PrimitiveType::String) => raw,
-        KernelDataType::Primitive(PrimitiveType::Binary) => raw.cast(polars_target),
-        // polars cannot cast String → Boolean; map the protocol's
-        // "true"/"false" spelling by hand (anything else → null).
-        KernelDataType::Primitive(PrimitiveType::Boolean) => when(raw.clone().eq(lit("true")))
-            .then(lit(true))
-            .when(raw.eq(lit("false")))
-            .then(lit(false))
-            .otherwise(lit(polars::prelude::LiteralValue::untyped_null()))
-            .cast(polars_target),
-        // Temporal strings need strptime — a polars cast from String to a
-        // temporal dtype yields null. Non-strict parsing turns the empty
-        // string (and garbage) into null, matching the kernel contract.
-        // Timestamps are serialized as naive wall-clock UTC
-        // ("1970-01-02 08:45:00"), so parse naive and attach UTC.
-        KernelDataType::Primitive(PrimitiveType::Timestamp) => raw
-            .str()
-            .to_datetime(
-                Some(polars::prelude::TimeUnit::Microseconds),
-                None,
-                lenient_strptime(),
-                lit("raise"),
-            )
-            .dt()
-            .replace_time_zone(
-                Some(polars::prelude::TimeZone::UTC),
-                lit("raise"),
-                polars::prelude::NonExistent::Raise,
-            ),
-        KernelDataType::Primitive(PrimitiveType::TimestampNtz) => raw.str().to_datetime(
-            Some(polars::prelude::TimeUnit::Microseconds),
-            None,
-            lenient_strptime(),
-            lit("raise"),
-        ),
-        KernelDataType::Primitive(PrimitiveType::Date) => raw.str().to_date(lenient_strptime()),
-        _ => when(raw.clone().eq(lit("")))
-            .then(lit(polars::prelude::LiteralValue::untyped_null()))
-            .otherwise(raw)
-            .cast(polars_target),
+    let KernelDataType::Primitive(prim) = target else {
+        return Err(Error::Generic(format!(
+            "MapToStruct: partition column of type {target:?} is not a primitive"
+        )));
     };
-    Ok(parsed)
+    let polars_target = target.to_polars().map_err(to_kernel_err)?;
+    match prim {
+        // Identity under `parse_scalar`, so skip the per-row round trip that
+        // partition columns of these two types would spend rebuilding.
+        PrimitiveType::String => Ok(raw),
+        PrimitiveType::Binary => Ok(raw.cast(polars_target)),
+        _ => {
+            let prim = prim.clone();
+            let kernel_target = target.clone();
+            let output = polars_target;
+            Ok(raw.map(
+                move |column| parse_partition_column(&column, &prim, &kernel_target),
+                move |_: &Schema, field: &Field| {
+                    Ok(Field::new(field.name().clone(), output.clone()))
+                },
+            ))
+        }
+    }
 }
 
-/// Infer the format per value; unparseable input (incl. the empty string)
-/// becomes null instead of an error.
-fn lenient_strptime() -> polars::prelude::StrptimeOptions {
-    polars::prelude::StrptimeOptions {
-        format: None,
-        strict: false,
-        exact: true,
-        cache: true,
-    }
+/// One `parse_scalar` per value, so a value no kernel-accepted spelling
+/// matches fails the scan the way a broken table should.
+fn parse_partition_column(
+    column: &Column,
+    prim: &PrimitiveType,
+    target: &KernelDataType,
+) -> polars::prelude::PolarsResult<Column> {
+    let scalars = column
+        .str()?
+        .iter()
+        .map(|value| match value {
+            None => Ok(Scalar::Null(target.clone())),
+            // The empty string has no representation in the types that
+            // reach here; string and binary keep it via the arms above.
+            Some("") => Ok(Scalar::Null(target.clone())),
+            Some(value) => prim
+                .parse_scalar(value)
+                .map_err(|e| polars::prelude::PolarsError::ComputeError(e.to_string().into())),
+        })
+        .collect::<polars::prelude::PolarsResult<Vec<Scalar>>>()?;
+    let series = build_series(column.name().as_str(), target, &scalars.iter().collect::<Vec<_>>())
+        .map_err(|e| polars::prelude::PolarsError::ComputeError(e.to_string().into()))?;
+    Ok(Column::from(series))
 }
 
 fn translate_struct(
