@@ -139,12 +139,13 @@ impl CdfTableScan {
 
         if let Some(p) = predicate {
             let expr = extract_expr_via_json(&p)?;
+            let schema = self.table_changes.schema();
             let mut translated: Vec<Predicate> = Vec::new();
             for c in flatten_and_conjuncts(&expr) {
                 if touches_cdf_metadata(c) {
                     continue;
                 }
-                if let Some(kp) = polars_expr_to_kernel_predicate(c) {
+                if let Some(kp) = polars_expr_to_kernel_predicate(c, &schema) {
                     translated.push(kp);
                 }
             }

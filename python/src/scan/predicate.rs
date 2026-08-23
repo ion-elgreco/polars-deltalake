@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use delta_kernel::schema::{MetadataValue, StructField, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, MetadataValue, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::table_properties::TableProperties;
 use polars::prelude::{Column, DataFrame, Expr, IntoLazy};
@@ -127,6 +127,20 @@ pub(crate) fn physical_name(field: &StructField) -> &str {
     }
 }
 
+/// True when column mapping renames anything below the top level of `dtype`.
+pub(crate) fn renames_nested_fields(dtype: &KernelDataType) -> bool {
+    match dtype {
+        KernelDataType::Struct(fields) => fields
+            .fields()
+            .any(|f| physical_name(f) != f.name.as_str() || renames_nested_fields(&f.data_type)),
+        KernelDataType::Array(array) => renames_nested_fields(array.element_type()),
+        KernelDataType::Map(map) => {
+            renames_nested_fields(map.key_type()) || renames_nested_fields(map.value_type())
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn has_column_mapping(props: &TableProperties) -> bool {
     matches!(
         props.column_mapping_mode,
@@ -208,12 +222,14 @@ pub(crate) fn touches_partition_only(
     physical_schema: &StructType,
 ) -> bool {
     let phys_names: HashSet<&str> = physical_schema.fields().map(|f| f.name.as_str()).collect();
-    let logical_names: HashSet<&str> = logical_schema.fields().map(|f| f.name.as_str()).collect();
     let referenced = polars_plan::utils::expr_to_leaf_column_names(expr);
+    // Physical names: under column mapping no logical name is in the file
+    // schema, so every column would look like a partition column.
     !referenced.is_empty()
         && referenced.iter().all(|n| {
-            let s = n.as_str();
-            logical_names.contains(s) && !phys_names.contains(s)
+            logical_schema
+                .field(n.as_str())
+                .is_some_and(|f| !phys_names.contains(physical_name(f)))
         })
 }
 
@@ -229,7 +245,10 @@ pub(crate) fn rewrite_predicate_to_physical(
     let mut logical_to_phys: HashMap<String, PlSmallStr> = HashMap::new();
     for field in logical_schema.fields() {
         let phys = physical_name(field);
-        if phys_names.contains(phys) {
+        // A flat name rewrite fixes only the root, so nested-renamed columns
+        // stay out: the check below then declines the whole predicate, which
+        // runs after `transform_to_logical` on logical names instead.
+        if phys_names.contains(phys) && !renames_nested_fields(&field.data_type) {
             logical_to_phys.insert(field.name.to_string(), PlSmallStr::from_str(phys));
         }
     }

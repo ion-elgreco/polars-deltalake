@@ -30,9 +30,10 @@ test-local:
 test-integration:
     cd python && uv run --no-sync pytest tests/ -m integration
 
-# PySpark-authored fixtures (column-mapped CDF etc). Requires JDK 17 or 21.
+# PySpark-authored fixtures (column-mapped tables, complex CDF shapes). Spark 4
+# needs JDK 17 or 21; macOS `java` usually points at a newer one.
 test-spark:
-    cd python && uv run --no-sync pytest tests/ -m spark
+    cd python && JAVA_HOME="${JAVA_HOME:-$(/usr/libexec/java_home -v 21 2>/dev/null || /usr/libexec/java_home -v 17 2>/dev/null)}" uv run --no-sync pytest tests/ -m spark
 
 # Format + lint + type-check (writes fixes).
 pre-commit:

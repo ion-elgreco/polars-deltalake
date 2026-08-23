@@ -7,6 +7,7 @@ kernel-translatable conjuncts in the ``"kernel"`` bucket.
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -382,3 +383,105 @@ class TestEndToEndFiltering:
     ):
         out = scan_delta(rich_table).filter(predicate).collect().sort("id")
         assert out["id"].to_list() == expected_ids
+
+
+@pytest.fixture
+def nested_table(tmp_path: Path) -> str:
+    """Two files with disjoint `person.age` ranges, plus non-primitive columns.
+
+    `deltalake` writes nested `minValues` / `maxValues`, so kernel can skip a
+    whole file on `person.age` alone.
+    """
+
+    def rows(ids: list[int], ages: list[int]):
+        return pl.DataFrame(
+            {
+                "id": ids,
+                "person": [{"name": f"n{a}", "age": a} for a in ages],
+                "tags": [["t"] for _ in ids],
+            }
+        ).to_arrow()
+
+    path = tmp_path / "nested"
+    write_deltalake(str(path), rows([1, 2], [10, 20]))
+    write_deltalake(str(path), rows([3, 4], [90, 95]), mode="append")
+    return str(path)
+
+
+class TestNestedColumns:
+    """`struct.field(...)` chains lower to multi-segment kernel column names."""
+
+    def test_nested_comparison(self, nested_table):
+        assert (
+            _kernel_count(nested_table, pl.col("person").struct.field("age") > 50) == 1
+        )
+
+    def test_nested_is_null(self, nested_table):
+        assert (
+            _kernel_count(nested_table, pl.col("person").struct.field("name").is_null())
+            == 1
+        )
+
+    def test_nested_is_in(self, nested_table):
+        assert (
+            _kernel_count(
+                nested_table, pl.col("person").struct.field("age").is_in([10])
+            )
+            == 1
+        )
+
+    def test_nested_filter_returns_expected_ids(self, nested_table):
+        out = scan_delta(nested_table).filter(pl.col("person").struct.field("age") > 50)
+        assert out.collect().sort("id")["id"].to_list() == [3, 4]
+
+    def test_nested_stats_skip_a_whole_file(self, nested_table):
+        """Delete the low-age file: the query only succeeds if kernel skipped it."""
+        adds = [
+            json.loads(line)["add"]
+            for log in sorted(Path(nested_table, "_delta_log").glob("*.json"))
+            for line in log.read_text().splitlines()
+            if "add" in json.loads(line)
+        ]
+        low = next(
+            a["path"]
+            for a in adds
+            if json.loads(a["stats"])["maxValues"]["person"]["age"] < 50
+        )
+        Path(nested_table, low).unlink()
+
+        out = scan_delta(nested_table).filter(pl.col("person").struct.field("age") > 50)
+        assert out.collect().sort("id")["id"].to_list() == [3, 4]
+
+
+class TestNonPrimitiveReferences:
+    """Kernel fails the whole scan on a predicate column it cannot resolve, and
+    it resolves only primitive leaves — `person` and `tags` are containers, so
+    they would abort the query. The translator must decline them and let polars
+    filter."""
+
+    @pytest.mark.parametrize(
+        ("predicate", "expected_ids"),
+        [
+            pytest.param(pl.col("person").is_null(), [], id="struct-is-null"),
+            pytest.param(
+                pl.col("person").is_not_null(), [1, 2, 3, 4], id="struct-is-not-null"
+            ),
+            pytest.param(pl.col("tags").is_null(), [], id="list-is-null"),
+            pytest.param(
+                pl.col("tags").is_not_null(), [1, 2, 3, 4], id="list-is-not-null"
+            ),
+        ],
+    )
+    def test_declines_and_still_scans(
+        self, nested_table, predicate: pl.Expr, expected_ids: list[int]
+    ):
+        assert _kernel_count(nested_table, predicate) == 0
+        out = scan_delta(nested_table).filter(predicate).collect().sort("id")
+        assert out["id"].to_list() == expected_ids
+
+    def test_struct_path_declines(self, nested_table):
+        """`person` alone is a struct — a path stopping there has no stats."""
+        assert _kernel_count(nested_table, pl.col("person") == pl.col("person")) == 0
+
+    def test_unknown_column_declines(self, nested_table):
+        assert _kernel_count(nested_table, pl.col("nope") == 1) == 0

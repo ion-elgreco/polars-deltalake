@@ -68,11 +68,12 @@ impl TableState {
     /// would be routed, without running a scan.
     fn _classify_predicate(&self, predicate: Bound<'_, PyAny>) -> PyResult<HashMap<String, usize>> {
         let expr = extract_expr_via_json(&predicate)?;
+        let schema = self.snapshot.schema();
         let conjuncts: Vec<Conjunct> = flatten_and_conjuncts(&expr)
             .into_iter()
             .map(|c| Conjunct {
                 expr: c.clone(),
-                kernel_translatable: polars_expr_to_kernel_predicate(c).is_some(),
+                kernel_translatable: polars_expr_to_kernel_predicate(c, &schema).is_some(),
             })
             .collect();
         let scan = self
@@ -174,12 +175,13 @@ impl TableScan {
             }
             Some(p) => {
                 let expr = extract_expr_via_json(&p)?;
+                let schema = self.snapshot.schema();
                 // Per-conjunct so one untranslatable term doesn't disable
                 // file-skipping for its siblings.
                 let mut translated: Vec<Predicate> = Vec::new();
                 let mut conjuncts: Vec<Conjunct> = Vec::new();
                 for c in flatten_and_conjuncts(&expr) {
-                    let kernel_translatable = match polars_expr_to_kernel_predicate(c) {
+                    let kernel_translatable = match polars_expr_to_kernel_predicate(c, &schema) {
                         Some(kp) => {
                             translated.push(kp);
                             true

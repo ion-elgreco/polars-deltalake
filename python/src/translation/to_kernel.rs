@@ -9,25 +9,69 @@
 use delta_kernel::expressions::{
     ColumnName, DecimalData, Expression, JunctionPredicateOp, Predicate, Scalar,
 };
-use delta_kernel::schema::DecimalType;
+use delta_kernel::schema::{DataType as KernelDataType, DecimalType, StructType};
 use polars::prelude::{AnyValue, Expr, LiteralValue, Operator, Series, TimeUnit};
-use polars_plan::dsl::function_expr::{BooleanFunction, FunctionExpr};
+use polars_plan::dsl::function_expr::{BooleanFunction, FunctionExpr, StructFunction};
 use polars_plan::plans::DynLiteralValue;
+use polars_utils::pl_str::PlSmallStr;
 
 /// Above this, refuse the IsIn → OR-chain rewrite
 const MAX_IN_LIST_KERNEL_EXPANSION: usize = 512;
 
 /// Try to translate a polars filter `Expr` into a kernel `Predicate`. Returns
 /// `None` if any sub-expression is outside the supported subset.
-pub(crate) fn polars_expr_to_kernel_predicate(expr: &Expr) -> Option<Predicate> {
+pub(crate) fn polars_expr_to_kernel_predicate(
+    expr: &Expr,
+    schema: &StructType,
+) -> Option<Predicate> {
+    if let Some(name) = column_ref(expr, schema) {
+        return Some(Predicate::from_expr(name));
+    }
     match expr {
-        Expr::BinaryExpr { left, op, right } => translate_binary(left, *op, right),
-        Expr::Function { input, function } => translate_function(input, function),
+        Expr::BinaryExpr { left, op, right } => translate_binary(left, *op, right, schema),
+        Expr::Function { input, function } => translate_function(input, function, schema),
         // Drop the cast: kernel pruning isn't dtype-strict.
-        Expr::Cast { expr: inner, .. } => polars_expr_to_kernel_predicate(inner),
-        Expr::Alias(inner, _) => polars_expr_to_kernel_predicate(inner),
-        Expr::Column(name) => Some(Predicate::column([name.to_string()])),
+        Expr::Cast { expr: inner, .. } => polars_expr_to_kernel_predicate(inner, schema),
+        Expr::Alias(inner, _) => polars_expr_to_kernel_predicate(inner, schema),
         Expr::Literal(lit) => lit_bool(lit).map(Predicate::literal),
+        _ => None,
+    }
+}
+
+/// Kernel column reference for `expr`, following `struct.field(...)` chains.
+///
+/// `None` unless the path ends at a primitive leaf: kernel's
+/// `PhysicalPredicate::try_new` resolves nothing else, and *errors the whole
+/// scan* on a reference it cannot resolve.
+fn column_ref(expr: &Expr, schema: &StructType) -> Option<ColumnName> {
+    let path = column_path(expr)?;
+    let (leaf, parents) = path.split_last()?;
+    let mut level = schema;
+    for segment in parents {
+        match &level.field(segment.as_str())?.data_type {
+            KernelDataType::Struct(inner) => level = inner,
+            _ => return None,
+        }
+    }
+    let leaf_type = &level.field(leaf.as_str())?.data_type;
+    matches!(leaf_type, KernelDataType::Primitive(_))
+        .then(|| ColumnName::new(path.iter().map(|s| s.to_string())))
+}
+
+/// `SelectFields` is excluded: its selector expands to names later, so it is
+/// not a path yet.
+fn column_path(expr: &Expr) -> Option<Vec<PlSmallStr>> {
+    match expr {
+        Expr::Column(name) => Some(vec![name.clone()]),
+        Expr::Alias(inner, _) => column_path(inner),
+        Expr::Function {
+            input,
+            function: FunctionExpr::StructExpr(StructFunction::FieldByName(name)),
+        } => {
+            let mut path = column_path(input.first()?)?;
+            path.push(name.clone());
+            Some(path)
+        }
         _ => None,
     }
 }
@@ -54,14 +98,19 @@ fn extract_bool_literal(expr: &Expr) -> Option<bool> {
 
 /// `expr == lit(true)` → `expr`; `expr == lit(false)` → `NOT expr`;
 /// `expr != lit(true)` → `NOT expr`; `expr != lit(false)` → `expr`.
-fn fold_boolean_equality(left: &Expr, right: &Expr, is_ne: bool) -> Option<Predicate> {
+fn fold_boolean_equality(
+    left: &Expr,
+    right: &Expr,
+    is_ne: bool,
+    schema: &StructType,
+) -> Option<Predicate> {
     let (other, lit_val) = match (extract_bool_literal(left), extract_bool_literal(right)) {
         (Some(b), None) => (right, b),
         (None, Some(b)) => (left, b),
         // Both literals or neither — let the regular comparison path handle it.
         _ => return None,
     };
-    let inner = polars_expr_to_kernel_predicate(other)?;
+    let inner = polars_expr_to_kernel_predicate(other, schema)?;
     Some(if is_ne ^ lit_val {
         inner
     } else {
@@ -69,7 +118,12 @@ fn fold_boolean_equality(left: &Expr, right: &Expr, is_ne: bool) -> Option<Predi
     })
 }
 
-fn translate_binary(left: &Expr, op: Operator, right: &Expr) -> Option<Predicate> {
+fn translate_binary(
+    left: &Expr,
+    op: Operator,
+    right: &Expr,
+    schema: &StructType,
+) -> Option<Predicate> {
     if let Some(junction_op) = match op {
         Operator::And | Operator::LogicalAnd => Some(JunctionPredicateOp::And),
         Operator::Or | Operator::LogicalOr => Some(JunctionPredicateOp::Or),
@@ -78,8 +132,8 @@ fn translate_binary(left: &Expr, op: Operator, right: &Expr) -> Option<Predicate
         return Some(Predicate::junction(
             junction_op,
             [
-                polars_expr_to_kernel_predicate(left)?,
-                polars_expr_to_kernel_predicate(right)?,
+                polars_expr_to_kernel_predicate(left, schema)?,
+                polars_expr_to_kernel_predicate(right, schema)?,
             ],
         ));
     }
@@ -88,13 +142,13 @@ fn translate_binary(left: &Expr, op: Operator, right: &Expr) -> Option<Predicate
     // can't sit on a comparison's expression side — fold here so e.g.
     // `(col > 0) == pl.lit(True)` survives as `col > 0`.
     if matches!(op, Operator::Eq | Operator::NotEq) {
-        if let Some(folded) = fold_boolean_equality(left, right, op == Operator::NotEq) {
+        if let Some(folded) = fold_boolean_equality(left, right, op == Operator::NotEq, schema) {
             return Some(folded);
         }
     }
 
-    let l = polars_expr_to_kernel_expression(left)?;
-    let r = polars_expr_to_kernel_expression(right)?;
+    let l = polars_expr_to_kernel_expression(left, schema)?;
+    let r = polars_expr_to_kernel_expression(right, schema)?;
     Some(match op {
         Operator::Eq => Predicate::eq(l, r),
         Operator::NotEq => Predicate::ne(l, r),
@@ -109,14 +163,18 @@ fn translate_binary(left: &Expr, op: Operator, right: &Expr) -> Option<Predicate
     })
 }
 
-fn translate_function(input: &[Expr], function: &FunctionExpr) -> Option<Predicate> {
+fn translate_function(
+    input: &[Expr],
+    function: &FunctionExpr,
+    schema: &StructType,
+) -> Option<Predicate> {
     use polars::prelude::ClosedInterval;
     match function {
         FunctionExpr::Boolean(BooleanFunction::IsNull) => Some(Predicate::is_null(
-            polars_expr_to_kernel_expression(input.first()?)?,
+            polars_expr_to_kernel_expression(input.first()?, schema)?,
         )),
         FunctionExpr::Boolean(BooleanFunction::IsNotNull) => Some(Predicate::is_not_null(
-            polars_expr_to_kernel_expression(input.first()?)?,
+            polars_expr_to_kernel_expression(input.first()?, schema)?,
         )),
         FunctionExpr::Boolean(BooleanFunction::IsIn { .. }) => {
             let lhs = input.first()?;
@@ -141,7 +199,7 @@ fn translate_function(input: &[Expr], function: &FunctionExpr) -> Option<Predica
             //
             // TODO: revert to `BinaryPredicateOp::In` once kernel's pruning
             // evaluators implement `eval_pred_in`.
-            let lhs_kernel = polars_expr_to_kernel_expression(lhs)?;
+            let lhs_kernel = polars_expr_to_kernel_expression(lhs, schema)?;
             Some(Predicate::or_from(elements.into_iter().map(|s| {
                 Predicate::eq(lhs_kernel.clone(), Expression::Literal(s))
             })))
@@ -149,9 +207,9 @@ fn translate_function(input: &[Expr], function: &FunctionExpr) -> Option<Predica
         FunctionExpr::Boolean(BooleanFunction::IsBetween { closed }) => {
             // [value, low, high] → (value cmp low) AND (value cmp high) with
             // strict vs non-strict picked from the interval shape.
-            let value = polars_expr_to_kernel_expression(input.first()?)?;
-            let low = polars_expr_to_kernel_expression(input.get(1)?)?;
-            let high = polars_expr_to_kernel_expression(input.get(2)?)?;
+            let value = polars_expr_to_kernel_expression(input.first()?, schema)?;
+            let low = polars_expr_to_kernel_expression(input.get(1)?, schema)?;
+            let high = polars_expr_to_kernel_expression(input.get(2)?, schema)?;
             let (lo, hi) = match closed {
                 ClosedInterval::Both => (
                     Predicate::ge(value.clone(), low),
@@ -173,22 +231,26 @@ fn translate_function(input: &[Expr], function: &FunctionExpr) -> Option<Predica
             Some(Predicate::and(lo, hi))
         }
         FunctionExpr::Boolean(BooleanFunction::Not) | FunctionExpr::Negate => Some(Predicate::not(
-            polars_expr_to_kernel_predicate(input.first()?)?,
+            polars_expr_to_kernel_predicate(input.first()?, schema)?,
         )),
         FunctionExpr::Boolean(BooleanFunction::AllHorizontal) => {
-            translate_junction(input, JunctionPredicateOp::And)
+            translate_junction(input, JunctionPredicateOp::And, schema)
         }
         FunctionExpr::Boolean(BooleanFunction::AnyHorizontal) => {
-            translate_junction(input, JunctionPredicateOp::Or)
+            translate_junction(input, JunctionPredicateOp::Or, schema)
         }
         _ => None,
     }
 }
 
-fn translate_junction(args: &[Expr], op: JunctionPredicateOp) -> Option<Predicate> {
+fn translate_junction(
+    args: &[Expr],
+    op: JunctionPredicateOp,
+    schema: &StructType,
+) -> Option<Predicate> {
     let preds: Vec<_> = args
         .iter()
-        .map(polars_expr_to_kernel_predicate)
+        .map(|a| polars_expr_to_kernel_predicate(a, schema))
         .collect::<Option<_>>()?;
     Some(Predicate::junction(op, preds))
 }
@@ -253,11 +315,13 @@ fn any_value_to_scalar(av: &AnyValue<'_>) -> Option<Scalar> {
 /// Translate a polars `Expr` into a kernel `Expression` (the operand-side,
 /// not predicate-side). Only column references and concrete literals are
 /// supported — anything else aborts pushdown.
-fn polars_expr_to_kernel_expression(expr: &Expr) -> Option<Expression> {
+fn polars_expr_to_kernel_expression(expr: &Expr, schema: &StructType) -> Option<Expression> {
+    if let Some(name) = column_ref(expr, schema) {
+        return Some(Expression::Column(name));
+    }
     match expr {
-        Expr::Column(name) => Some(Expression::Column(ColumnName::new([name.to_string()]))),
-        Expr::Alias(inner, _) => polars_expr_to_kernel_expression(inner),
-        Expr::Cast { expr: inner, .. } => polars_expr_to_kernel_expression(inner),
+        Expr::Alias(inner, _) => polars_expr_to_kernel_expression(inner, schema),
+        Expr::Cast { expr: inner, .. } => polars_expr_to_kernel_expression(inner, schema),
         Expr::Literal(lit) => Some(Expression::Literal(match lit {
             LiteralValue::Scalar(s) => any_value_to_scalar(&s.as_any_value())?,
             LiteralValue::Dyn(DynLiteralValue::Str(s)) => Scalar::String(s.to_string()),

@@ -20,12 +20,14 @@ use delta_kernel::plans::Operation;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, StructType};
 use delta_kernel::{DeltaResult, Engine};
-use polars::prelude::{DataFrame, Expr, col, lit};
+use polars::prelude::as_struct as polars_as_struct;
+use polars::prelude::{DataFrame, Expr, LiteralValue, col, lit, when};
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
 
+use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::engine::{PolarsEngine, PolarsEngineData, path_for_polars_io, resolve_series_path};
-use crate::scan::predicate::physical_name;
+use crate::scan::predicate::{physical_name, renames_nested_fields};
 use crate::translation::schema::KernelDataTypeExt;
 
 /// Per-file work to apply post-read: physical→logical select + DV keep-mask.
@@ -230,6 +232,56 @@ fn partition_literals(
 
 /// Logical-order select list: partition literals in place, physical→logical
 /// renames for data columns.
+/// Rename nested struct fields to their logical names; `None` if nothing
+/// below `dtype` is renamed.
+///
+/// Polars names struct fields from the data, so `alias` reaches only the top
+/// level. Kernel's engine has no plan node for this either — its evaluator's
+/// `apply_schema` renames every level as a side effect.
+fn logical_names(expr: Expr, dtype: &KernelDataType) -> Option<Expr> {
+    if !renames_nested_fields(dtype) {
+        return None;
+    }
+    let renamed = match dtype {
+        KernelDataType::Struct(fields) => {
+            let children: Vec<Expr> = fields
+                .fields()
+                .map(|f| {
+                    let child = expr.clone().struct_().field_by_name(physical_name(f));
+                    logical_names(child.clone(), &f.data_type)
+                        .unwrap_or(child)
+                        .alias(PlSmallStr::from_str(f.name.as_str()))
+                })
+                .collect();
+            // `as_struct` alone makes every row valid; downstream filters
+            // select on this column's own nulls.
+            when(expr.clone().is_not_null())
+                .then(polars_as_struct(children))
+                .otherwise(lit(LiteralValue::untyped_null()))
+        }
+        // Elements, keys and values are anonymous; only structs inside them
+        // have names.
+        KernelDataType::Array(array) => {
+            let element = logical_names(Expr::Element, array.element_type())?;
+            expr.list().eval(element)
+        }
+        KernelDataType::Map(map) => {
+            let entry = |name: &'static str, dtype: &KernelDataType| {
+                let field = Expr::Element.struct_().field_by_name(name);
+                logical_names(field.clone(), dtype)
+                    .unwrap_or(field)
+                    .alias(PlSmallStr::from_static(name))
+            };
+            expr.list().eval(polars_as_struct(vec![
+                entry(MAP_KEY_FIELD, map.key_type()),
+                entry(MAP_VALUE_FIELD, map.value_type()),
+            ]))
+        }
+        _ => return None,
+    };
+    Some(renamed)
+}
+
 fn build_select(sources: &[(&StructField, FieldSource)], mut lits: Vec<Expr>) -> Vec<Expr> {
     let mut lit_iter = lits.drain(..);
     sources
@@ -238,8 +290,12 @@ fn build_select(sources: &[(&StructField, FieldSource)], mut lits: Vec<Expr>) ->
             FieldSource::Partition { .. } => lit_iter
                 .next()
                 .expect("one literal per partition field by construction"),
-            FieldSource::Data { physical } => col(PlSmallStr::from_str(physical.as_str()))
-                .alias(PlSmallStr::from_str(field.name.as_str())),
+            FieldSource::Data { physical } => {
+                let read = col(PlSmallStr::from_str(physical.as_str()));
+                logical_names(read.clone(), &field.data_type)
+                    .unwrap_or(read)
+                    .alias(PlSmallStr::from_str(field.name.as_str()))
+            }
         })
         .collect()
 }
