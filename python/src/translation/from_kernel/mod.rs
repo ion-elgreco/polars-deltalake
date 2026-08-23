@@ -229,7 +229,14 @@ fn build_column_ops(
         (KernelDataType::Struct(output_struct), Expression::StructPatch(t)) => {
             build_transform_ops(t, output_struct, input_schema)
         }
-        (KernelDataType::Struct(output_struct), Expression::Struct(children, _)) => {
+        (KernelDataType::Struct(output_struct), Expression::Struct(children, nullability)) => {
+            // A top-level gate would null whole rows — no DataFrame representation.
+            if nullability.is_some() {
+                return Err(Error::Unsupported(
+                    "PolarsExpressionEvaluator: nullability predicate on a top-level output struct"
+                        .into(),
+                ));
+            }
             let n_out = output_struct.num_fields();
             if children.len() != n_out {
                 return Err(Error::Generic(format!(

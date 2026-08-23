@@ -13,7 +13,7 @@ use delta_kernel::transform_output_type;
 use delta_kernel::transforms::SchemaTransform;
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::as_struct as polars_as_struct;
-use polars::prelude::{Column, Expr, Field, Schema, coalesce, col, lit, when};
+use polars::prelude::{Column, Expr, Field, LiteralValue, Schema, coalesce, col, lit, when};
 use polars_utils::pl_str::PlSmallStr;
 use std::borrow::Cow;
 
@@ -38,7 +38,9 @@ pub(crate) fn translate_expr(
         Expression::Literal(scalar) => Ok(scalar_to_lit(scalar)),
         Expression::Column(name) => Ok(column_path_to_expr(name)),
         Expression::Predicate(pred) => translate_predicate(pred, input_schema),
-        Expression::Struct(children, _) => translate_struct(children, output_type, input_schema),
+        Expression::Struct(children, nullability) => {
+            translate_struct(children, nullability.as_deref(), output_type, input_schema)
+        }
         Expression::StructPatch(t) => {
             let target = match output_type {
                 Some(KernelDataType::Struct(s)) => s,
@@ -238,8 +240,17 @@ fn parse_partition_column(
     Ok(Column::from(series))
 }
 
+/// `CASE WHEN gate THEN value END` — NULL where `gate` is false or null
+/// (polars routes null conditions to `otherwise`).
+pub(crate) fn null_gated(gate: Expr, value: Expr) -> Expr {
+    when(gate)
+        .then(value)
+        .otherwise(lit(LiteralValue::untyped_null()))
+}
+
 fn translate_struct(
     children: &[ExpressionRef],
+    nullability: Option<&Expression>,
     output_type: Option<&KernelDataType>,
     input_schema: Option<&StructType>,
 ) -> DeltaResult<Expr> {
@@ -273,7 +284,11 @@ fn translate_struct(
             })
         })
         .collect::<DeltaResult<_>>()?;
-    Ok(polars_as_struct(child_exprs))
+    let built = polars_as_struct(child_exprs);
+    match nullability {
+        Some(pred) => Ok(null_gated(translate_expr(pred, None, input_schema)?, built)),
+        None => Ok(built),
+    }
 }
 
 fn translate_unary_expr(
@@ -319,5 +334,86 @@ fn translate_variadic_expr(
             }
             polars::prelude::concat_list(children.as_slice()).map_err(to_kernel_err)
         }
+    }
+}
+
+#[cfg(test)]
+mod struct_nullability_tests {
+    use super::*;
+    use delta_kernel::expressions::Predicate;
+    use delta_kernel::schema::StructField;
+    use polars::prelude::{AnyValue, DataFrame, IntoLazy, df};
+
+    fn eval(expr: &Expression, output_type: &KernelDataType, df: DataFrame) -> Column {
+        let translated = translate_expr(expr, Some(output_type), None).unwrap();
+        df.lazy()
+            .select([translated.alias("out")])
+            .collect()
+            .unwrap()
+            .column("out")
+            .unwrap()
+            .clone()
+    }
+
+    /// `Expression::Struct(children, Some(pred))` is `CASE WHEN pred THEN
+    /// struct(...) END`. Mirrors the `file_action_key.deletionVector` gate in
+    /// kernel's metadata scan plan.
+    #[test]
+    fn false_gate_nulls_struct_row() {
+        let storage_type = Expression::from(ColumnName::new(["storageType"]));
+        let expr = Expression::struct_with_nullability_from(
+            [
+                storage_type.clone(),
+                Expression::from(ColumnName::new(["pathOrInlineDv"])),
+            ],
+            Expression::from_pred(storage_type.is_not_null()),
+        );
+        let output_type = KernelDataType::Struct(Box::new(
+            StructType::try_new([
+                StructField::nullable("storageType", KernelDataType::STRING),
+                StructField::nullable("pathOrInlineDv", KernelDataType::STRING),
+            ])
+            .unwrap(),
+        ));
+        let df = df! {
+            "storageType" => [Some("u"), None],
+            "pathOrInlineDv" => [Some("p0"), Some("p1")],
+        }
+        .unwrap();
+
+        let out = eval(&expr, &output_type, df);
+        assert!(!matches!(out.get(0).unwrap(), AnyValue::Null));
+        assert!(
+            matches!(out.get(1).unwrap(), AnyValue::Null),
+            "row with a false gate must be an outer-NULL struct, got {:?}",
+            out.get(1).unwrap()
+        );
+    }
+
+    /// A null gate must null the struct exactly like a false one.
+    #[test]
+    fn null_gate_nulls_struct_row() {
+        let expr = Expression::struct_with_nullability_from(
+            [Expression::from(ColumnName::new(["a"]))],
+            Expression::from_pred(Predicate::from_expr(Expression::from(ColumnName::new([
+                "gate",
+            ])))),
+        );
+        let output_type = KernelDataType::Struct(Box::new(
+            StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap(),
+        ));
+        let df = df! {
+            "a" => [1i64, 2, 3],
+            "gate" => [Some(true), Some(false), None],
+        }
+        .unwrap();
+
+        let out = eval(&expr, &output_type, df);
+        assert!(!matches!(out.get(0).unwrap(), AnyValue::Null));
+        assert_eq!(
+            out.null_count(),
+            2,
+            "false and null gates must both produce outer-NULL structs"
+        );
     }
 }

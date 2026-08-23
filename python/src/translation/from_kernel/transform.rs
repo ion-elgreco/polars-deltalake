@@ -13,7 +13,7 @@ use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{Expr, col};
 use polars_utils::pl_str::PlSmallStr;
 
-use super::expr::{column_path_to_expr, translate_expr};
+use super::expr::{column_path_to_expr, null_gated, translate_expr};
 
 /// Per-output-slot intent produced by [`walk_transform_slots`]. Shared by
 /// the lazy [`translate_transform`] walker and the eager `build_transform_ops`
@@ -148,11 +148,7 @@ pub(super) fn translate_transform(
     // make every row valid, and plan filters (`add IS NOT NULL`) select rows
     // by exactly that outer validity.
     Ok(match &root_expr {
-        Some(root) => polars::prelude::when(root.clone().is_not_null())
-            .then(rebuilt)
-            .otherwise(polars::prelude::lit(
-                polars::prelude::LiteralValue::untyped_null(),
-            )),
+        Some(root) => null_gated(root.clone().is_not_null(), rebuilt),
         None => rebuilt,
     })
 }
