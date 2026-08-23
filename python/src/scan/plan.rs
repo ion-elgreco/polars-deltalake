@@ -19,6 +19,7 @@ use delta_kernel::expressions::ColumnName;
 use delta_kernel::plans::Operation;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, StructType};
+use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::{DeltaResult, Engine};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{DataFrame, Expr, LiteralValue, col, lit, when};
@@ -27,7 +28,7 @@ use polars_utils::pl_str::PlSmallStr;
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::engine::{PolarsEngine, PolarsEngineData, path_for_polars_io, resolve_series_path};
-use crate::scan::predicate::{physical_name, renames_nested_fields};
+use crate::scan::predicate::renames_nested_fields;
 use crate::translation::schema::KernelDataTypeExt;
 
 /// Per-file work to apply post-read: physical→logical select + DV keep-mask.
@@ -100,7 +101,13 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
         .map_err(|e| anyhow::anyhow!("metadata plan execution failed: {e:#}"))?;
 
     let table_root = scan.table_root().clone();
-    let sources = field_sources(scan.logical_schema(), scan.physical_schema());
+    // Protocol-aware effective mode: matches how kernel resolved the physical
+    // schema, including stale `physicalName` annotations under mode `none`.
+    let mode = scan
+        .snapshot()
+        .table_configuration()
+        .column_mapping_mode();
+    let sources = field_sources(scan.logical_schema(), scan.physical_schema(), mode);
     // Identity frames need no per-file select at all.
     let needs_select = sources.iter().any(|(f, s)| match s {
         FieldSource::Partition { .. } => true,
@@ -138,7 +145,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
                 })
                 .transpose()?;
 
-            let select = needs_select.then(|| build_select(&sources, lits));
+            let select = needs_select.then(|| build_select(&sources, lits, mode));
 
             let idx = files.len();
             path_index.insert(pl_path.as_str().to_string(), idx);
@@ -159,13 +166,14 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
 fn field_sources<'a>(
     logical: &'a StructType,
     physical: &StructType,
+    mode: ColumnMappingMode,
 ) -> Vec<(&'a StructField, FieldSource)> {
     let physical_names: std::collections::HashSet<&str> =
         physical.fields().map(|f| f.name.as_str()).collect();
     logical
         .fields()
         .map(|f| {
-            let phys = physical_name(f).to_string();
+            let phys = f.physical_name(mode).to_string();
             let source = if physical_names.contains(phys.as_str()) {
                 FieldSource::Data { physical: phys }
             } else {
@@ -238,8 +246,8 @@ fn partition_literals(
 /// Polars names struct fields from the data, so `alias` reaches only the top
 /// level. Kernel's engine has no plan node for this either — its evaluator's
 /// `apply_schema` renames every level as a side effect.
-fn logical_names(expr: Expr, dtype: &KernelDataType) -> Option<Expr> {
-    if !renames_nested_fields(dtype) {
+fn logical_names(expr: Expr, dtype: &KernelDataType, mode: ColumnMappingMode) -> Option<Expr> {
+    if !renames_nested_fields(dtype, mode) {
         return None;
     }
     let renamed = match dtype {
@@ -247,8 +255,8 @@ fn logical_names(expr: Expr, dtype: &KernelDataType) -> Option<Expr> {
             let children: Vec<Expr> = fields
                 .fields()
                 .map(|f| {
-                    let child = expr.clone().struct_().field_by_name(physical_name(f));
-                    logical_names(child.clone(), &f.data_type)
+                    let child = expr.clone().struct_().field_by_name(f.physical_name(mode));
+                    logical_names(child.clone(), &f.data_type, mode)
                         .unwrap_or(child)
                         .alias(PlSmallStr::from_str(f.name.as_str()))
                 })
@@ -262,13 +270,13 @@ fn logical_names(expr: Expr, dtype: &KernelDataType) -> Option<Expr> {
         // Elements, keys and values are anonymous; only structs inside them
         // have names.
         KernelDataType::Array(array) => {
-            let element = logical_names(Expr::Element, array.element_type())?;
+            let element = logical_names(Expr::Element, array.element_type(), mode)?;
             expr.list().eval(element)
         }
         KernelDataType::Map(map) => {
             let entry = |name: &'static str, dtype: &KernelDataType| {
                 let field = Expr::Element.struct_().field_by_name(name);
-                logical_names(field.clone(), dtype)
+                logical_names(field.clone(), dtype, mode)
                     .unwrap_or(field)
                     .alias(PlSmallStr::from_static(name))
             };
@@ -282,7 +290,11 @@ fn logical_names(expr: Expr, dtype: &KernelDataType) -> Option<Expr> {
     Some(renamed)
 }
 
-fn build_select(sources: &[(&StructField, FieldSource)], mut lits: Vec<Expr>) -> Vec<Expr> {
+fn build_select(
+    sources: &[(&StructField, FieldSource)],
+    mut lits: Vec<Expr>,
+    mode: ColumnMappingMode,
+) -> Vec<Expr> {
     let mut lit_iter = lits.drain(..);
     sources
         .iter()
@@ -292,7 +304,7 @@ fn build_select(sources: &[(&StructField, FieldSource)], mut lits: Vec<Expr>) ->
                 .expect("one literal per partition field by construction"),
             FieldSource::Data { physical } => {
                 let read = col(PlSmallStr::from_str(physical.as_str()));
-                logical_names(read.clone(), &field.data_type)
+                logical_names(read.clone(), &field.data_type, mode)
                     .unwrap_or(read)
                     .alias(PlSmallStr::from_str(field.name.as_str()))
             }

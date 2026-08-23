@@ -3,9 +3,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use delta_kernel::schema::{DataType as KernelDataType, MetadataValue, StructField, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::table_properties::TableProperties;
 use polars::prelude::{Column, DataFrame, Expr, IntoLazy};
 use polars_plan::dsl::Operator;
 use polars_utils::pl_str::PlSmallStr;
@@ -44,18 +43,19 @@ pub(crate) struct ConjunctClassification {
 /// Route each conjunct to the layer(s) that will evaluate it.
 pub(crate) fn classify_conjuncts(
     conjuncts: &[Conjunct],
-    column_mapped: bool,
+    mode: ColumnMappingMode,
     logical_schema: &StructType,
     physical_schema: &StructType,
 ) -> ConjunctClassification {
+    let column_mapped = mode != ColumnMappingMode::None;
     let mut out = ConjunctClassification::default();
     for c in conjuncts {
         if c.kernel_translatable {
             out.kernel.push(c.expr.clone());
         }
-        let partition_only = touches_partition_only(&c.expr, logical_schema, physical_schema);
+        let partition_only = touches_partition_only(&c.expr, logical_schema, physical_schema, mode);
         let for_parquet = if column_mapped {
-            rewrite_predicate_to_physical(&c.expr, logical_schema, physical_schema)
+            rewrite_predicate_to_physical(&c.expr, logical_schema, physical_schema, mode)
         } else {
             predicate_only_touches_data_columns(&c.expr, physical_schema).then(|| c.expr.clone())
         };
@@ -116,36 +116,19 @@ pub(crate) fn conjunction(mut conjuncts: Vec<Expr>) -> Option<Expr> {
     Some(conjuncts.into_iter().fold(first, |acc, e| acc.and(e)))
 }
 
-/// Kernel's `StructField::physical_name(mode)` is `pub(crate)`, so read the
-/// underlying metadata key ourselves.
-const PHYSICAL_NAME_KEY: &str = "delta.columnMapping.physicalName";
-
-pub(crate) fn physical_name(field: &StructField) -> &str {
-    match field.metadata.get(PHYSICAL_NAME_KEY) {
-        Some(MetadataValue::String(s)) => s.as_str(),
-        _ => field.name.as_str(),
-    }
-}
-
 /// True when column mapping renames anything below the top level of `dtype`.
-pub(crate) fn renames_nested_fields(dtype: &KernelDataType) -> bool {
+pub(crate) fn renames_nested_fields(dtype: &KernelDataType, mode: ColumnMappingMode) -> bool {
     match dtype {
-        KernelDataType::Struct(fields) => fields
-            .fields()
-            .any(|f| physical_name(f) != f.name.as_str() || renames_nested_fields(&f.data_type)),
-        KernelDataType::Array(array) => renames_nested_fields(array.element_type()),
+        KernelDataType::Struct(fields) => fields.fields().any(|f| {
+            f.physical_name(mode) != f.name.as_str() || renames_nested_fields(&f.data_type, mode)
+        }),
+        KernelDataType::Array(array) => renames_nested_fields(array.element_type(), mode),
         KernelDataType::Map(map) => {
-            renames_nested_fields(map.key_type()) || renames_nested_fields(map.value_type())
+            renames_nested_fields(map.key_type(), mode)
+                || renames_nested_fields(map.value_type(), mode)
         }
         _ => false,
     }
-}
-
-pub(crate) fn has_column_mapping(props: &TableProperties) -> bool {
-    matches!(
-        props.column_mapping_mode,
-        Some(ColumnMappingMode::Id | ColumnMappingMode::Name)
-    )
 }
 
 /// Used to drop predicates touching partition columns — kernel adds those
@@ -220,6 +203,7 @@ pub(crate) fn touches_partition_only(
     expr: &Expr,
     logical_schema: &StructType,
     physical_schema: &StructType,
+    mode: ColumnMappingMode,
 ) -> bool {
     let phys_names: HashSet<&str> = physical_schema.fields().map(|f| f.name.as_str()).collect();
     let referenced = polars_plan::utils::expr_to_leaf_column_names(expr);
@@ -229,26 +213,27 @@ pub(crate) fn touches_partition_only(
         && referenced.iter().all(|n| {
             logical_schema
                 .field(n.as_str())
-                .is_some_and(|f| !phys_names.contains(physical_name(f)))
+                .is_some_and(|f| !phys_names.contains(f.physical_name(mode)))
         })
 }
 
-/// Only meaningful when column mapping is active — see [`has_column_mapping`].
+/// Only meaningful when column mapping is active (`mode` is `Id` or `Name`).
 /// `None` if the predicate references a partition column or an unknown name.
 pub(crate) fn rewrite_predicate_to_physical(
     expr: &Expr,
     logical_schema: &StructType,
     physical_schema: &StructType,
+    mode: ColumnMappingMode,
 ) -> Option<Expr> {
     let phys_names: std::collections::HashSet<&str> =
         physical_schema.fields().map(|f| f.name.as_str()).collect();
     let mut logical_to_phys: HashMap<String, PlSmallStr> = HashMap::new();
     for field in logical_schema.fields() {
-        let phys = physical_name(field);
+        let phys = field.physical_name(mode);
         // A flat name rewrite fixes only the root, so nested-renamed columns
         // stay out: the check below then declines the whole predicate, which
         // runs after `transform_to_logical` on logical names instead.
-        if phys_names.contains(phys) && !renames_nested_fields(&field.data_type) {
+        if phys_names.contains(phys) && !renames_nested_fields(&field.data_type, mode) {
             logical_to_phys.insert(field.name.to_string(), PlSmallStr::from_str(phys));
         }
     }

@@ -34,7 +34,7 @@ use logical::LogicalScanIter;
 use plan::{ResolvedScan, resolve_scan};
 use predicate::{
     Conjunct, classify_conjuncts, conjunction, extract_expr_via_json, file_skip_via_partition_eval,
-    flatten_and_conjuncts, has_column_mapping,
+    flatten_and_conjuncts,
 };
 
 type BatchIter = Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>;
@@ -85,7 +85,7 @@ impl TableState {
         let logical_schema = self.snapshot.schema();
         let routing = classify_conjuncts(
             &conjuncts,
-            has_column_mapping(self.snapshot.table_properties()),
+            self.snapshot.table_configuration().column_mapping_mode(),
             &logical_schema,
             scan.physical_schema(),
         );
@@ -263,12 +263,12 @@ impl TableScan {
         let physical_schema = scan.physical_schema().clone();
         let select_exprs = select_exprs_for_schema(&physical_schema);
 
-        let column_mapped = has_column_mapping(self.snapshot.table_properties());
+        let mode = self.snapshot.table_configuration().column_mapping_mode();
         let table_logical_schema = self.snapshot.schema();
 
         let routing = classify_conjuncts(
             &state.original_predicate,
-            column_mapped,
+            mode,
             &table_logical_schema,
             &physical_schema,
         );
