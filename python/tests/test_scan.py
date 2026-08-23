@@ -600,3 +600,36 @@ class TestEagerRead:
         out = read_delta(str(simple_table), engine=engine).sort("id")
         assert out.shape == (5, 3)
         assert out["id"].to_list() == [1, 2, 3, 4, 5]
+
+
+class TestScanOrderStability:
+    """Kernel leaves row order unspecified, so no particular order is promised.
+    Repeated reads of an unchanged table must still agree, or `head(n)` returns
+    different rows every run."""
+
+    @pytest.fixture
+    def many_files(self, tmp_path):
+        """Twelve commits, one parquet file each."""
+        from deltalake import write_deltalake
+
+        table_path = str(tmp_path / "many")
+        for i in range(12):
+            write_deltalake(
+                table_path,
+                pl.DataFrame({"id": [i * 10, i * 10 + 1]}).to_arrow(),
+                mode="error" if i == 0 else "append",
+            )
+        return table_path
+
+    def test_full_scan_order_is_stable(self, many_files):
+        orders = {
+            tuple(scan_delta(many_files).collect()["id"].to_list()) for _ in range(5)
+        }
+        assert len(orders) == 1
+
+    def test_head_returns_the_same_rows(self, many_files):
+        heads = {
+            tuple(scan_delta(many_files).head(4).collect()["id"].to_list())
+            for _ in range(5)
+        }
+        assert len(heads) == 1

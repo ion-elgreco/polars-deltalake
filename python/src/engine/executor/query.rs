@@ -562,7 +562,7 @@ fn eval_aggregate(agg: Aggregate, input: &NodeState) -> DeltaResult<NodeState> {
     let lf = if key_exprs.is_empty() {
         input.lf.clone().select(agg_exprs)
     } else {
-        input.lf.clone().group_by(key_exprs).agg(agg_exprs)
+        input.lf.clone().group_by_stable(key_exprs).agg(agg_exprs)
     };
     Ok(NodeState { lf, schema })
 }
