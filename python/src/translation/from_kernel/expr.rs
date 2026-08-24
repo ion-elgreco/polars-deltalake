@@ -170,7 +170,12 @@ fn translate_map_to_struct(
                 .alias(PlSmallStr::from_str(f.name.as_str())))
         })
         .collect::<DeltaResult<_>>()?;
-    Ok(polars_as_struct(children))
+    // The arrow reference propagates the map's outer null buffer: a NULL
+    // map row is a NULL struct row, not a valid struct of nulls.
+    Ok(null_gated(
+        map_expr.is_not_null(),
+        polars_as_struct(children),
+    ))
 }
 
 /// Delta serialized-partition-value parse: `raw` is a nullable string expr.
@@ -461,5 +466,30 @@ mod map_to_struct_tests {
             p.get(1).unwrap()
         );
         assert_eq!(p.get(2).unwrap(), AnyValue::String("1"));
+    }
+
+    /// A NULL map row must yield a NULL struct row, not a valid struct of
+    /// null children — the arrow reference propagates the null buffer.
+    #[test]
+    fn null_map_row_yields_null_struct() {
+        let lines = concat!(
+            "{\"m\":[{\"key\":\"p\",\"value\":\"1\"}]}\n",
+            "{\"m\":null}\n",
+        );
+        let df = crate::engine::parse_ndjson_inferred(lines.as_bytes()).unwrap();
+        let (expr, output_type) = map_to_struct_p();
+        let translated = translate_expr(&expr, Some(&output_type), None).unwrap();
+        let out = df
+            .lazy()
+            .select([translated.alias("out")])
+            .collect()
+            .unwrap();
+        let col = out.column("out").unwrap();
+        assert!(!matches!(col.get(0).unwrap(), AnyValue::Null));
+        assert!(
+            matches!(col.get(1).unwrap(), AnyValue::Null),
+            "NULL map row must be an outer-NULL struct, got {:?}",
+            col.get(1).unwrap()
+        );
     }
 }
