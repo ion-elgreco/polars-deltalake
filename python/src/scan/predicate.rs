@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use delta_kernel::schema::{DataType as KernelDataType, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use polars::prelude::{Column, DataFrame, Expr, IntoLazy};
 use polars_plan::dsl::Operator;
@@ -147,12 +147,21 @@ pub(crate) fn predicate_only_touches_data_columns(
 /// Polars-driven partition pruning for predicates kernel can't translate
 /// (e.g. `partition_col.dt.year() == 2024`). Returns the indices of files
 /// whose partition values satisfy `partition_conjuncts`.
+///
+/// `add.partitionValues` is keyed by *physical* name, while the conjuncts
+/// name logical columns, so the frame is built physical-keyed and emitted
+/// under logical names.
 pub(crate) fn file_skip_via_partition_eval(
     partition_conjuncts: &[Expr],
     files: &[ScanFileMeta],
     logical_schema: &StructType,
+    mode: ColumnMappingMode,
 ) -> anyhow::Result<HashSet<usize>> {
     const FILE_IDX_COL: &str = "__pldl_file_idx__";
+    let by_physical: HashMap<&str, &StructField> = logical_schema
+        .fields()
+        .map(|f| (f.physical_name(mode), f))
+        .collect();
     // BTreeSet for one-pass dedup with sorted iteration order.
     let partition_cols: BTreeSet<&str> = files
         .iter()
@@ -161,17 +170,17 @@ pub(crate) fn file_skip_via_partition_eval(
 
     let mut columns: Vec<Column> = partition_cols
         .iter()
-        .map(|name| -> anyhow::Result<Column> {
-            let field = logical_schema
-                .field(name)
-                .ok_or_else(|| anyhow::anyhow!("partition column not in logical schema: {name}"))?;
+        .map(|physical| -> anyhow::Result<Column> {
+            let field = by_physical.get(physical).ok_or_else(|| {
+                anyhow::anyhow!("partition column not in logical schema: {physical}")
+            })?;
             let vals: Vec<Option<&str>> = files
                 .iter()
-                .map(|f| f.partition_values.get(*name).map(String::as_str))
+                .map(|f| f.partition_values.get(*physical).map(String::as_str))
                 .collect();
-            Column::new(PlSmallStr::from_str(name), vals.as_slice())
+            Column::new(PlSmallStr::from_str(field.name.as_str()), vals.as_slice())
                 .cast(&field.data_type.to_polars()?)
-                .map_err(|e| anyhow::anyhow!("cast partition col {name}: {e:#}"))
+                .map_err(|e| anyhow::anyhow!("cast partition col {}: {e:#}", field.name))
         })
         .collect::<anyhow::Result<_>>()?;
     let idx_vals: Vec<u32> = (0..files.len() as u32).collect();
@@ -252,4 +261,49 @@ pub(crate) fn rewrite_predicate_to_physical(
         other => other,
     });
     Some(rewritten)
+}
+
+#[cfg(test)]
+mod partition_prune_tests {
+    use polars::prelude::{col, lit};
+    use polars_utils::pl_path::PlRefPath;
+
+    use super::*;
+    use crate::scan::plan::LogicalRewrite;
+
+    /// Kernel writes `add.partitionValues` keyed by *physical* name.
+    fn file(region: &str) -> ScanFileMeta {
+        ScanFileMeta {
+            path: PlRefPath::new(format!("/t/{region}.parquet")),
+            rewrite: LogicalRewrite {
+                select: None,
+                dv: None,
+            },
+            partition_values: [("col-3".to_string(), region.to_string())]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// The conjunct names logical columns, so the pruning frame has to be
+    /// emitted under logical names even though its keys arrive physical.
+    #[test]
+    fn column_mapped_keys_resolve_to_logical_names() {
+        let logical = StructType::try_new([StructField::nullable(
+            "region",
+            KernelDataType::STRING,
+        )
+        .with_metadata([("delta.columnMapping.physicalName", "col-3")])])
+        .unwrap();
+        let files = [file("EU"), file("US")];
+
+        let surviving = file_skip_via_partition_eval(
+            &[col("region").eq(lit("EU"))],
+            &files,
+            &logical,
+            ColumnMappingMode::Name,
+        )
+        .unwrap();
+        assert_eq!(surviving, HashSet::from([0usize]));
+    }
 }

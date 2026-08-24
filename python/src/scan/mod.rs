@@ -277,6 +277,7 @@ impl TableScan {
                 &routing.partition_prune,
                 &files,
                 &table_logical_schema,
+                mode,
             )?;
             if surviving.is_empty() {
                 state.iter = Some(Box::new(std::iter::empty()));
