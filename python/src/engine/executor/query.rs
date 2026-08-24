@@ -119,14 +119,8 @@ impl PolarsPlanExecutor {
                 eval_semi_join(join, probe, build)
             }
             Operator::UnionAll(_) => {
-                let frames: Vec<LazyFrame> = inputs
-                    .iter()
-                    .map(|&idx| {
-                        states
-                            .get(idx)
-                            .map(|s| s.lf.clone())
-                            .ok_or_else(|| Error::Generic("union input out of range".into()))
-                    })
+                let frames: Vec<LazyFrame> = (0..inputs.len())
+                    .map(|i| Ok(input(i)?.lf.clone()))
                     .collect::<DeltaResult<_>>()?;
                 let schema = input(0)?.schema.clone();
                 Ok(NodeState {
@@ -186,40 +180,41 @@ impl PolarsPlanExecutor {
         row_index: Option<PlSmallStr>,
     ) -> DeltaResult<LazyFrame> {
         let select = crate::scan::select_exprs_for_schema(output_schema);
+        // Broadcast the file's constants, then shape to `schema` order so the
+        // union below sees identical schemas.
+        let shape = |lf: LazyFrame, lits: Vec<Expr>| {
+            let lf = if lits.is_empty() {
+                lf
+            } else {
+                lf.with_columns(lits)
+            };
+            lf.select(select.clone())
+        };
 
-        if entries.is_empty() {
-            // Guard stays: `windows(2).all()` below is vacuously true and
-            // the uniform arm indexes `entries[0]`.
+        let Some(first) = entries.first() else {
             return concat_frames(Vec::new(), output_schema);
-        }
+        };
 
         // Equal per-file lits (checkpoint parts, V2 sidecars) collapse into
         // one multi-file scan, keeping polars-io's cross-file parallelism.
-        let uniform_constants = entries.windows(2).all(|w| w[0].lits == w[1].lits);
+        let uniform_constants = entries[1..].iter().all(|e| e.lits == first.lits);
 
         let frames: Vec<LazyFrame> = match file_type {
             FileType::Parquet if uniform_constants && row_index.is_none() => {
-                let lits = entries[0].lits.clone();
+                let lits = first.lits.clone();
                 let paths: Vec<PlRefPath> = entries
                     .iter()
                     .map(|e| path_for_polars_io(&e.location))
                     .collect::<DeltaResult<_>>()?;
-                let mut lf = self.scan_parquet_lazy(paths, read_schema, None)?;
-                if !lits.is_empty() {
-                    lf = lf.with_columns(lits);
-                }
-                vec![lf.select(select.clone())]
+                let lf = self.scan_parquet_lazy(paths, read_schema, None)?;
+                vec![shape(lf, lits)]
             }
             FileType::Parquet => entries
                 .into_iter()
                 .map(|e| {
                     let path = path_for_polars_io(&e.location)?;
-                    let mut lf =
-                        self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
-                    if !e.lits.is_empty() {
-                        lf = lf.with_columns(e.lits);
-                    }
-                    Ok(lf.select(select.clone()))
+                    let lf = self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
+                    Ok(shape(lf, e.lits))
                 })
                 .collect::<DeltaResult<_>>()?,
             FileType::Json => {
@@ -244,10 +239,7 @@ impl PolarsPlanExecutor {
                         if let Some(name) = &row_index {
                             lf = row_index_as_long(lf.with_row_index(name.clone(), None), name);
                         }
-                        if !e.lits.is_empty() {
-                            lf = lf.with_columns(e.lits);
-                        }
-                        Ok(lf.select(select.clone()))
+                        Ok(shape(lf, e.lits))
                     })
                     .collect::<DeltaResult<_>>()?
             }
