@@ -17,7 +17,8 @@ use polars::io::SerReader;
 use polars::io::json::{JsonFormat, JsonReader};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{
-    DataFrame, DataType as PlDataType, Expr, IntoLazy, LazyFrame, col, concat_list, lit, when,
+    Column, DataFrame, DataType as PlDataType, Expr, Field as PlField, IntoLazy, LazyFrame,
+    PolarsError, Schema as PlSchema, col, concat_list, lit, when,
 };
 use polars_utils::pl_str::PlSmallStr;
 use url::Url;
@@ -136,7 +137,7 @@ pub(crate) fn align_lazy(
         .fields()
         .map(|field| {
             let inferred = polars_schema.get(field.name.as_str());
-            align(col(field.name.as_str()), field, inferred)
+            align(col(field.name.as_str()), field, inferred, None, &field.name)
                 .map(|e| e.alias(PlSmallStr::from_str(field.name.as_str())))
         })
         .collect::<DeltaResult<_>>()?;
@@ -145,29 +146,36 @@ pub(crate) fn align_lazy(
 }
 
 /// Top-level callers pass `col(name)`; nested walks pass the appropriate
-/// `.struct_().field_by_name(...)` subexpression.
-fn align(source: Expr, field: &StructField, inferred: Option<&PlDataType>) -> DeltaResult<Expr> {
+/// `.struct_().field_by_name(...)` subexpression. `gate` is the enclosing
+/// struct's presence (`None` at top level); `path` is the dotted field
+/// path for error messages.
+fn align(
+    source: Expr,
+    field: &StructField,
+    inferred: Option<&PlDataType>,
+    gate: Option<&Expr>,
+    path: &str,
+) -> DeltaResult<Expr> {
     if let KernelDataType::Variant(_) = &field.data_type {
         return Err(Error::Unsupported(format!(
             "json align: Variant column {} is not supported",
             field.name
         )));
     }
-    let Some(inferred) = inferred else {
-        return null_expr_for_kernel(&field.data_type);
-    };
-    match (&field.data_type, inferred) {
+    let aligned = match (&field.data_type, inferred) {
+        (_, None) => null_expr_for_kernel(&field.data_type)?,
         // JSON encodes Map as a JSON object → polars infers `Struct{k1,…}`;
         // reshape into our `List<Struct<{key,value}>>` representation.
-        (KernelDataType::Map(_), PlDataType::Struct(fs)) => map_from_struct_expr(source, fs),
+        (KernelDataType::Map(_), Some(PlDataType::Struct(fs))) => map_from_struct_expr(source, fs)?,
         // A Struct may contain a Map at any depth, so recurse and rebuild.
         // The rebuild must keep the source's outer validity: `as_struct`
         // alone yields a valid struct of null children for a null row, and
         // plan aggregates (`max_non_null_by(protocol, ...)`) select rows by
         // exactly that struct-level nullity.
-        (KernelDataType::Struct(struct_type), PlDataType::Struct(fs)) => {
+        (KernelDataType::Struct(struct_type), Some(PlDataType::Struct(fs))) => {
             let inferred_by_name: std::collections::HashMap<&str, &PlDataType> =
                 fs.iter().map(|f| (f.name.as_str(), &f.dtype)).collect();
+            let presence = source.clone().is_not_null();
             let children: Vec<Expr> = struct_type
                 .fields()
                 .map(|child| {
@@ -175,18 +183,55 @@ fn align(source: Expr, field: &StructField, inferred: Option<&PlDataType>) -> De
                         source.clone().struct_().field_by_name(child.name.as_str()),
                         child,
                         inferred_by_name.get(child.name.as_str()).copied(),
+                        Some(&presence),
+                        &format!("{path}.{}", child.name),
                     )
                     .map(|e| e.alias(PlSmallStr::from_str(child.name.as_str())))
                 })
                 .collect::<DeltaResult<_>>()?;
-            Ok(when(source.clone().is_not_null())
+            when(presence)
                 .then(polars_as_struct(children))
-                .otherwise(lit(polars::prelude::LiteralValue::untyped_null())))
+                .otherwise(lit(polars::prelude::LiteralValue::untyped_null()))
         }
         // Primitives, Arrays, and any shape mismatch — let polars cast the
         // inferred column to the kernel-declared type.
-        _ => Ok(source.cast(field.data_type.to_polars().map_err(to_kernel_err)?)),
+        _ => source.cast(field.data_type.to_polars().map_err(to_kernel_err)?),
+    };
+    if field.nullable {
+        Ok(aligned)
+    } else {
+        Ok(require_present(aligned, gate.cloned(), path.to_string()))
     }
+}
+
+/// ScanJson contract (kernel `plans/ir/nodes.rs`): a missing value for a
+/// non-nullable field is an error, not a null-fill. Row-level — a single
+/// JSON line can omit a field the rest of the file has — and gated to rows
+/// whose enclosing struct is present.
+fn require_present(value: Expr, gate: Option<Expr>, path: String) -> Expr {
+    let gate = gate.unwrap_or_else(|| lit(true));
+    value.map_many(
+        move |cols: &mut [Column]| {
+            let nulls = cols[0].is_null();
+            let present = cols[1].bool()?;
+            // Either input may be a length-1 broadcast literal.
+            let violated = match (nulls.len(), present.len()) {
+                (1, _) => nulls.get(0).unwrap_or(false) && present.any(),
+                (_, 1) => present.get(0).unwrap_or(false) && nulls.any(),
+                _ => (&nulls & present).any(),
+            };
+            if violated {
+                Err(PolarsError::ComputeError(
+                    format!("json align: non-nullable field {path} is null for a present row")
+                        .into(),
+                ))
+            } else {
+                Ok(cols[0].clone())
+            }
+        },
+        &[gate],
+        |_: &PlSchema, fields: &[PlField]| Ok(fields[0].clone()),
+    )
 }
 
 fn map_from_struct_expr(value_expr: Expr, fields: &[polars::prelude::Field]) -> DeltaResult<Expr> {
@@ -256,4 +301,91 @@ fn extract_json_strings(data: &dyn EngineData) -> DeltaResult<Vec<String>> {
     let names = [ColumnName::new(["json"])];
     data.visit_rows(&names, &mut collector)?;
     Ok(collector.out)
+}
+
+#[cfg(test)]
+mod align_nullability_tests {
+    use delta_kernel::schema::StructType;
+
+    use super::*;
+
+    fn aligned(lines: &str, schema: &StructType) -> DeltaResult<DataFrame> {
+        let df = parse_ndjson_inferred(lines.as_bytes())?;
+        align_lazy(df, schema)?.collect().map_err(to_kernel_err)
+    }
+
+    /// The add/remove action shape: nullable outer struct, non-nullable
+    /// `p` leaf, nullable `q` leaf.
+    fn action_schema() -> StructType {
+        StructType::try_new([StructField::nullable(
+            "a",
+            KernelDataType::Struct(Box::new(
+                StructType::try_new([
+                    StructField::not_null("p", KernelDataType::STRING),
+                    StructField::nullable("q", KernelDataType::LONG),
+                ])
+                .unwrap(),
+            )),
+        )])
+        .unwrap()
+    }
+
+    /// ScanJson contract: a missing value for a non-nullable field under a
+    /// present parent is an error, not a null-fill.
+    #[test]
+    fn missing_non_nullable_leaf_under_present_parent_errors() {
+        let out = aligned(
+            "{\"a\":{\"p\":\"x\",\"q\":1}}\n{\"a\":{\"q\":2}}",
+            &action_schema(),
+        );
+        let err = out.expect_err("row with present parent and missing p must error");
+        assert!(err.to_string().contains("a.p"), "got: {err}");
+    }
+
+    #[test]
+    fn absent_parent_rows_pass() {
+        let out = aligned("{\"a\":{\"p\":\"x\"}}\n{\"z\":5}", &action_schema()).unwrap();
+        assert_eq!(out.height(), 2);
+        assert_eq!(out.column("a").unwrap().null_count(), 1);
+    }
+
+    #[test]
+    fn missing_nullable_leaf_null_fills() {
+        let out = aligned("{\"a\":{\"p\":\"x\"}}", &action_schema()).unwrap();
+        assert_eq!(out.height(), 1);
+    }
+
+    #[test]
+    fn missing_top_level_non_nullable_column_errors() {
+        let schema =
+            StructType::try_new([StructField::not_null("p", KernelDataType::STRING)]).unwrap();
+        let err = aligned("{\"z\":1}", &schema).expect_err("whole column missing must error");
+        assert!(err.to_string().contains('p'), "got: {err}");
+    }
+
+    /// A null mid-level struct gates out its non-nullable leaves; a present
+    /// but empty one does not.
+    #[test]
+    fn gate_is_transitive_through_nesting() {
+        let schema = StructType::try_new([StructField::nullable(
+            "o",
+            KernelDataType::Struct(Box::new(
+                StructType::try_new([StructField::nullable(
+                    "m",
+                    KernelDataType::Struct(Box::new(
+                        StructType::try_new([StructField::not_null("p", KernelDataType::STRING)])
+                            .unwrap(),
+                    )),
+                )])
+                .unwrap(),
+            )),
+        )])
+        .unwrap();
+
+        aligned("{\"o\":{\"m\":{\"p\":\"x\"}}}\n{\"o\":{}}", &schema)
+            .expect("null mid struct must not trip the leaf check");
+        let err = aligned("{\"o\":{\"m\":{}}}", &schema)
+            .expect_err("present empty mid struct must error on p");
+        assert!(err.to_string().contains("o.m.p"), "got: {err}");
+    }
 }
