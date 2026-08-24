@@ -6,9 +6,11 @@ profile := env_var_or_default("PROFILE", "dev")
 default:
     @just --list
 
-# Sync venv with all deps (without building rivers native extension)
+# Sync venv with all deps (without building rivers native extension).
+# `--inexact`: an exact sync treats the maturin-installed editable wheel as
+# extraneous and removes it, breaking `import polars_deltalake`.
 venv:
-    cd python && uv sync --no-install-project --all-groups
+    cd python && uv sync --no-install-project --all-groups --inexact
 
 # Use `PROFILE=release just develop` for an optimized build.
 develop: venv
@@ -54,9 +56,13 @@ check:
 
 # cargo unit tests on the cdylib crate. `--no-default-features` drops
 # pyo3/extension-module so the test binary links libpython — pointed at the
-# venv interpreter, since the system python3 can predate abi3-py310.
-test-rust: venv
-    cd python && PYO3_PYTHON='{{ justfile_directory() }}/python/.venv/bin/python3' cargo test --lib --no-default-features
+# venv `just develop` built, since the system python3 can predate abi3-py310.
+# `uv run` resolves the interpreter so the recipe works on Windows too, where
+# the venv puts it in `Scripts/python.exe`. Deliberately not `: venv`:
+# re-syncing between `just develop` and `just test-local` only risks the
+# installed wheel and re-locks uv.lock.
+test-rust:
+    cd python && PYO3_PYTHON="$(uv run --no-sync python -c 'import sys; print(sys.executable)')" cargo test --lib --no-default-features
 
 # Wipe build artifacts.
 clean:
