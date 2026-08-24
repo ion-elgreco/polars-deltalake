@@ -23,14 +23,14 @@ use polars::prelude::{
     DataFrame, DataType, Expr, IntoLazy, JoinArgs, JoinType, LazyFrame, SortMultipleOptions,
     UnionArgs, col, concat, lit,
 };
-use polars_plan::dsl::{DslBuilder, Engine as PolarsEngineMode, ScanSources};
+use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
 use url::Url;
 
 use crate::engine::data::resolve_path;
 use crate::engine::handlers::{
-    align_lazy, ensure_no_field_id_matching, parquet_options, parse_ndjson_inferred,
+    align_lazy, dsl_parquet_scan, ensure_no_field_id_matching, parse_ndjson_inferred,
     path_for_polars_io, unified_scan_args,
 };
 use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData};
@@ -259,7 +259,6 @@ impl PolarsPlanExecutor {
         // Plan contract: a field carrying `parquet.field.id` matches by ID,
         // which polars cannot express — refuse rather than null-fill.
         ensure_no_field_id_matching(read_schema)?;
-        let options = parquet_options(read_schema)?;
         let mut args = unified_scan_args(self.cloud_opts.as_ref(), None);
         if let Some(name) = &row_index {
             args.row_index = Some(polars::prelude::RowIndex {
@@ -267,11 +266,7 @@ impl PolarsPlanExecutor {
                 offset: 0,
             });
         }
-        let lf: LazyFrame =
-            DslBuilder::scan_parquet(ScanSources::Paths(paths.into()), options, args)
-                .map_err(to_kernel_err)?
-                .build()
-                .into();
+        let lf = dsl_parquet_scan(paths, read_schema, args)?;
         Ok(match &row_index {
             Some(name) => row_index_as_long(lf, name),
             None => lf,

@@ -12,7 +12,7 @@ pub(super) use json::PolarsJsonHandler;
 pub(crate) use json::{align_lazy, parse_ndjson_inferred};
 pub(super) use parquet::PolarsParquetHandler;
 pub(crate) use parquet::{
-    ensure_no_field_id_matching, kernel_parquet_footer, parquet_options, path_for_polars_io,
+    dsl_parquet_scan, ensure_no_field_id_matching, kernel_parquet_footer, path_for_polars_io,
     unified_scan_args,
 };
 pub(crate) use storage::ObjectStoreStorageHandler;

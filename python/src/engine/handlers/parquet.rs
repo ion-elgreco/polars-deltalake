@@ -210,6 +210,22 @@ pub(crate) fn parquet_options(physical_schema: &StructType) -> DeltaResult<Parqu
     })
 }
 
+/// The one shared `DslBuilder::scan_parquet` construction: schema-typed
+/// options over `paths`. Callers customize `args` first (row index,
+/// file-id column).
+pub(crate) fn dsl_parquet_scan(
+    paths: Vec<PlRefPath>,
+    physical_schema: &StructType,
+    args: UnifiedScanArgs,
+) -> DeltaResult<LazyFrame> {
+    let options = parquet_options(physical_schema)?;
+    let lazy: LazyFrame = DslBuilder::scan_parquet(ScanSources::Paths(paths.into()), options, args)
+        .map_err(to_kernel_err)?
+        .build()
+        .into();
+    Ok(lazy)
+}
+
 /// The ScanParquet plan contract resolves a field carrying
 /// `parquet.field.id` metadata by field ID. polars' unified scan matches by
 /// name only, which would silently null-fill renamed columns — the plan
@@ -276,14 +292,7 @@ fn read_batch(
     predicate: Option<&Expr>,
     physical_schema: &StructType,
 ) -> DeltaResult<FileDataReadResultIterator> {
-    let parquet_options = parquet_options(physical_schema)?;
-    let unified_scan_args = unified_scan_args(cloud_opts, None);
-
-    let sources = ScanSources::Paths(paths.into());
-    let lazy: LazyFrame = DslBuilder::scan_parquet(sources, parquet_options, unified_scan_args)
-        .map_err(to_kernel_err)?
-        .build()
-        .into();
+    let lazy = dsl_parquet_scan(paths, physical_schema, unified_scan_args(cloud_opts, None))?;
 
     let mut plan = lazy.select(select_exprs);
     if let Some(pred) = predicate {

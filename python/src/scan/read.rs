@@ -5,7 +5,6 @@ use delta_kernel::schema::StructType;
 use polars::io::cloud::CloudOptions;
 use polars::lazy::frame::LazyFrame;
 use polars::prelude::Expr;
-use polars_plan::dsl::{DslBuilder, ScanSources};
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
 
@@ -24,18 +23,12 @@ pub(crate) fn build_lazy_scan(
     physical_schema: &StructType,
     include_file_id: bool,
 ) -> anyhow::Result<LazyFrame> {
-    let parquet_options = crate::engine::parquet_options(physical_schema)
-        .map_err(|e| anyhow::anyhow!("kernel→polars schema conversion failed: {e:#}"))?;
     let unified_scan_args = crate::engine::unified_scan_args(
         cloud_opts,
         include_file_id.then(|| PlSmallStr::from_static(FILE_ID_COL)),
     );
-
-    let sources = ScanSources::Paths(paths.into());
-    let lazy: LazyFrame = DslBuilder::scan_parquet(sources, parquet_options, unified_scan_args)
-        .map_err(|e| anyhow::anyhow!("scan_parquet plan failed: {e:#}"))?
-        .build()
-        .into();
+    let lazy = crate::engine::dsl_parquet_scan(paths, physical_schema, unified_scan_args)
+        .map_err(|e| anyhow::anyhow!("scan_parquet plan failed: {e:#}"))?;
 
     let mut final_select: Vec<Expr> = Vec::with_capacity(select_exprs.len() + 1);
     final_select.extend(select_exprs.iter().cloned());
