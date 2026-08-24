@@ -455,6 +455,20 @@ fn eval_values(values: Values) -> DeltaResult<NodeState> {
             fields.len()
         )));
     }
+    // Foreign plans arrive via the proto round-trip, so scalar/schema
+    // agreement is not guaranteed here — and `build_series` panics on it.
+    for row in &rows {
+        for (scalar, field) in row.iter().zip(&fields) {
+            if !matches!(scalar, Scalar::Null(_)) && scalar.data_type() != field.data_type {
+                return Err(Error::Generic(format!(
+                    "Values scalar for {} is {}, schema declares {}",
+                    field.name,
+                    scalar.data_type(),
+                    field.data_type
+                )));
+            }
+        }
+    }
     let df = if rows.is_empty() {
         DataFrame::empty_with_schema(schema.to_polars().map_err(to_kernel_err)?.as_ref())
     } else {
@@ -655,6 +669,22 @@ mod scan_entries_tests {
     fn differing_lits_scan_per_file() {
         let lits = |n| vec![lit(n).alias("v")];
         assert_eq!(plan_scan_count([lits(1i64), lits(2i64)]), 2);
+    }
+
+    /// Foreign plans reach `eval_values` through the proto round-trip, so a
+    /// mismatched scalar must surface as an Error, not a `build_series`
+    /// panic unwinding into PyO3.
+    #[test]
+    fn values_scalar_type_mismatch_errors() {
+        use delta_kernel::plans::ir::nodes::Values;
+
+        let values = Values {
+            schema: Arc::new(
+                StructType::try_new([StructField::nullable("x", DataType::LONG)]).unwrap(),
+            ),
+            rows: vec![vec![Scalar::String("oops".into())]],
+        };
+        assert!(eval_values(values).is_err());
     }
 
     /// ScanParquet contract: `parquet.field.id` fields match by ID, which
