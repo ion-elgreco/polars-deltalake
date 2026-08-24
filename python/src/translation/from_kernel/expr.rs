@@ -155,21 +155,17 @@ fn translate_map_to_struct(
                 .struct_()
                 .field_by_name(MAP_KEY_FIELD)
                 .eq(lit(f.name.as_str()));
-            let value_when_match = when(key_match)
-                .then(
-                    polars::prelude::Expr::Element
-                        .struct_()
-                        .field_by_name(MAP_VALUE_FIELD),
-                )
-                .otherwise(lit(polars::prelude::LiteralValue::untyped_null()));
+            let value = polars::prelude::Expr::Element
+                .struct_()
+                .field_by_name(MAP_VALUE_FIELD);
+            // Rightmost matching entry with null values kept — kernel's
+            // duplicate-key contract (the arrow reference takes the last).
             let raw = map_expr
                 .clone()
                 .list()
-                .eval(value_when_match)
+                .eval(value.filter(key_match))
                 .list()
-                .drop_nulls()
-                .list()
-                .first();
+                .last();
             Ok(parse_partition_string(raw, &f.data_type)?
                 .alias(PlSmallStr::from_str(f.name.as_str())))
         })
@@ -419,5 +415,51 @@ mod struct_nullability_tests {
             2,
             "false and null gates must both produce outer-NULL structs"
         );
+    }
+}
+
+#[cfg(test)]
+mod map_to_struct_tests {
+    use delta_kernel::expressions::{ColumnName, MapToStructExpression};
+    use delta_kernel::schema::StructField;
+    use polars::prelude::{AnyValue, IntoLazy};
+
+    use super::*;
+
+    fn map_to_struct_p() -> (Expression, KernelDataType) {
+        let expr = Expression::MapToStruct(MapToStructExpression {
+            map_expr: Box::new(Expression::from(ColumnName::new(["m"]))),
+        });
+        let output_type = KernelDataType::Struct(Box::new(
+            StructType::try_new([StructField::nullable("p", KernelDataType::STRING)]).unwrap(),
+        ));
+        (expr, output_type)
+    }
+
+    /// Kernel resolves duplicate map keys to the rightmost entry including
+    /// null values; leftmost-non-null diverges on both counts.
+    #[test]
+    fn duplicate_keys_resolve_to_rightmost_entry() {
+        let lines = concat!(
+            "{\"m\":[{\"key\":\"p\",\"value\":\"1\"},{\"key\":\"p\",\"value\":\"2\"}]}\n",
+            "{\"m\":[{\"key\":\"p\",\"value\":\"1\"},{\"key\":\"p\",\"value\":null}]}\n",
+            "{\"m\":[{\"key\":\"p\",\"value\":\"1\"}]}\n",
+        );
+        let df = crate::engine::parse_ndjson_inferred(lines.as_bytes()).unwrap();
+        let (expr, output_type) = map_to_struct_p();
+        let translated = translate_expr(&expr, Some(&output_type), None).unwrap();
+        let out = df
+            .lazy()
+            .select([translated.struct_().field_by_name("p").alias("p")])
+            .collect()
+            .unwrap();
+        let p = out.column("p").unwrap();
+        assert_eq!(p.get(0).unwrap(), AnyValue::String("2"), "rightmost wins");
+        assert!(
+            matches!(p.get(1).unwrap(), AnyValue::Null),
+            "a rightmost null value stays null, got {:?}",
+            p.get(1).unwrap()
+        );
+        assert_eq!(p.get(2).unwrap(), AnyValue::String("1"));
     }
 }

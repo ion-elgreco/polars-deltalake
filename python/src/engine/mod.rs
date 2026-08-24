@@ -21,7 +21,9 @@ pub(crate) use data::resolve_path as resolve_series_path;
 pub(crate) use executor::PolarsPlanExecutor;
 
 use handlers::{ObjectStoreStorageHandler, PolarsJsonHandler, PolarsParquetHandler};
-pub(crate) use handlers::{parquet_options, path_for_polars_io, unified_scan_args};
+pub(crate) use handlers::{
+    parquet_options, parse_ndjson_inferred, path_for_polars_io, unified_scan_args,
+};
 
 use crate::translation::PolarsEvaluationHandler;
 
