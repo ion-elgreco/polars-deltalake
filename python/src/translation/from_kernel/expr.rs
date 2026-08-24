@@ -77,7 +77,10 @@ pub(crate) fn translate_expr(
             // match the target; delta-rs writes Date/Timestamp stats as ISO
             // strings, so decode them as String first and let the struct-wide
             // cast lift each temporal field.
-            let inner = translate_expr(&p.json_expr, None, input_schema)?;
+            let raw = translate_expr(&p.json_expr, None, input_schema)?;
+            // The contract names the empty string as unparseable input that
+            // must decode to NULL; polars would fail the whole batch on it.
+            let inner = null_gated(raw.clone().str().len_bytes().gt(lit(0u32)), raw);
             let decoded = match StringifyTemporal.transform_struct(&p.output_schema) {
                 Cow::Borrowed(_) => {
                     let dt = KernelDataType::Struct(Box::new((*p.output_schema).clone()))
@@ -567,5 +570,44 @@ mod array_variadic_tests {
             .unwrap();
         let first = out.column("out").unwrap().list().unwrap().get_as_series(0);
         assert_eq!(first.unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod parse_json_tests {
+    use std::sync::Arc;
+
+    use delta_kernel::schema::StructField;
+    use polars::prelude::{AnyValue, IntoLazy, df};
+
+    use super::*;
+
+    /// Kernel contract: unparseable input, which includes the empty string,
+    /// must yield NULL rather than failing the whole batch.
+    #[test]
+    fn empty_json_string_decodes_to_null() {
+        let schema = Arc::new(
+            StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap(),
+        );
+        let expr = Expression::parse_json(ColumnName::new(["stats"]), schema.clone());
+        let output_type = KernelDataType::Struct(Box::new((*schema).clone()));
+        let frame = df!("stats" => [Some("{\"a\":1}"), Some(""), None]).unwrap();
+
+        let translated = translate_expr(&expr, Some(&output_type), None).unwrap();
+        let out = frame
+            .lazy()
+            .select([translated.alias("out")])
+            .collect()
+            .unwrap();
+        let col = out.column("out").unwrap();
+
+        assert_eq!(col.len(), 3);
+        assert!(!matches!(col.get(0).unwrap(), AnyValue::Null));
+        assert!(
+            matches!(col.get(1).unwrap(), AnyValue::Null),
+            "empty string must decode to NULL, got {:?}",
+            col.get(1).unwrap()
+        );
+        assert!(matches!(col.get(2).unwrap(), AnyValue::Null));
     }
 }
