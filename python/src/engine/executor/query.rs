@@ -534,12 +534,14 @@ fn eval_semi_join(join: SemiJoin, probe: &NodeState, build: &NodeState) -> Delta
     } else {
         JoinType::Semi
     };
-    // Default `nulls_equal: false` matches the SQL semantics the node
-    // specifies: a NULL key never matches the build side.
+    // Kernel's reference executor row-encodes keys, so NULL keys compare
+    // equal — `nulls_equal` matches that, not SQL join semantics.
+    let mut args = JoinArgs::new(how);
+    args.nulls_equal = true;
     let lf = probe
         .lf
         .clone()
-        .join(build.lf.clone(), left_on, right_on, JoinArgs::new(how));
+        .join(build.lf.clone(), left_on, right_on, args);
     Ok(NodeState {
         lf,
         schema: probe.schema.clone(),
@@ -669,6 +671,44 @@ mod scan_entries_tests {
     fn differing_lits_scan_per_file() {
         let lits = |n| vec![lit(n).alias("v")];
         assert_eq!(plan_scan_count([lits(1i64), lits(2i64)]), 2);
+    }
+
+    /// Kernel's reference executor row-encodes join keys, so NULL keys
+    /// compare equal; the polars join must set `nulls_equal` to match.
+    #[test]
+    fn semi_join_matches_null_keys() {
+        use delta_kernel::expressions::ColumnName;
+        use delta_kernel::plans::ir::nodes::SemiJoin;
+        use polars::prelude::IntoLazy;
+
+        let schema = Arc::new(StructType::try_new([long_field("k")]).unwrap());
+        let state = |vals: &[Option<i64>]| NodeState {
+            lf: polars::df!("k" => vals).unwrap().lazy(),
+            schema: schema.clone(),
+        };
+        let node = |inverted| SemiJoin {
+            inverted,
+            probe_keys: vec![ColumnName::new(["k"])],
+            build_keys: vec![ColumnName::new(["k"])],
+        };
+        let probe = state(&[Some(1), None]);
+        let build = state(&[None]);
+
+        let semi = eval_semi_join(node(false), &probe, &build)
+            .unwrap()
+            .lf
+            .collect()
+            .unwrap();
+        assert_eq!(semi.height(), 1, "NULL probe key must match NULL build key");
+        assert_eq!(semi.column("k").unwrap().null_count(), 1);
+
+        let anti = eval_semi_join(node(true), &probe, &build)
+            .unwrap()
+            .lf
+            .collect()
+            .unwrap();
+        assert_eq!(anti.height(), 1, "anti join must drop the matched NULL row");
+        assert_eq!(anti.column("k").unwrap().null_count(), 0);
     }
 
     /// Foreign plans reach `eval_values` through the proto round-trip, so a
