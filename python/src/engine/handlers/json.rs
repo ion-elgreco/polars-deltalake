@@ -140,7 +140,7 @@ pub(crate) fn align_lazy(
     kernel_schema: &delta_kernel::schema::StructType,
 ) -> DeltaResult<LazyFrame> {
     let polars_schema = df.schema().clone();
-    let select_exprs: Vec<Expr> = kernel_schema
+    let mut select_exprs: Vec<Expr> = kernel_schema
         .fields()
         .map(|field| {
             let inferred = polars_schema.get(field.name.as_str());
@@ -148,6 +148,23 @@ pub(crate) fn align_lazy(
                 .map(|e| e.alias(PlSmallStr::from_str(field.name.as_str())))
         })
         .collect::<DeltaResult<_>>()?;
+
+    // Every column is a literal when the file names none of the requested
+    // fields, and polars collapses an all-literal select to one row. A row
+    // index keeps the select anchored to the input height.
+    let no_field_present = !kernel_schema
+        .fields()
+        .any(|f| polars_schema.contains(f.name.as_str()));
+    if no_field_present {
+        const ANCHOR: &str = "__pldl_rows__";
+        let anchor = PlSmallStr::from_static(ANCHOR);
+        select_exprs.push(col(anchor.clone()));
+        return Ok(df
+            .lazy()
+            .with_row_index(anchor.clone(), None)
+            .select(select_exprs)
+            .drop(polars::prelude::cols([anchor])));
+    }
 
     Ok(df.lazy().select(select_exprs))
 }
@@ -365,6 +382,17 @@ mod align_nullability_tests {
     fn missing_nullable_leaf_null_fills() {
         let out = aligned("{\"a\":{\"p\":\"x\"}}", &action_schema()).unwrap();
         assert_eq!(out.height(), 1);
+    }
+
+    /// An all-literal select collapses to one row in polars; one output row
+    /// per input line is the ScanJson contract.
+    #[test]
+    fn rows_survive_when_no_requested_field_is_present() {
+        let schema =
+            StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap();
+        let out = aligned("{\"z\":1}\n{\"z\":2}\n{\"z\":3}", &schema).unwrap();
+        assert_eq!(out.height(), 3);
+        assert_eq!(out.column("a").unwrap().null_count(), 3);
     }
 
     #[test]
