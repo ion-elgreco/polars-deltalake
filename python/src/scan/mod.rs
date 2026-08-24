@@ -346,10 +346,14 @@ impl TableScan {
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
             )
         } else {
-            debug_assert!(
-                routing.post_transform.is_empty(),
-                "post_transform requires the select list to materialize partition cols",
-            );
+            // Release builds compile `debug_assert!` out, and dropping these
+            // conjuncts silently returns unfiltered rows.
+            if !routing.post_transform.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "internal: {} predicate conjunct(s) need the logical rewrite, but no file requested one",
+                    routing.post_transform.len()
+                ));
+            }
             source
         };
         state.iter = Some(new_iter);
