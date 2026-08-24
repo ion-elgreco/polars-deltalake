@@ -183,10 +183,9 @@ impl PolarsPlanExecutor {
         let select = crate::scan::select_exprs_for_schema(output_schema);
 
         if entries.is_empty() {
-            let empty = DataFrame::empty_with_schema(
-                output_schema.to_polars().map_err(to_kernel_err)?.as_ref(),
-            );
-            return Ok(empty.lazy());
+            // Guard stays: `windows(2).all()` below is vacuously true and
+            // the uniform arm indexes `entries[0]`.
+            return concat_frames(Vec::new(), output_schema);
         }
 
         // Equal per-file lits (checkpoint parts, V2 sidecars) collapse into
@@ -461,9 +460,13 @@ fn eval_values(values: Values) -> DeltaResult<NodeState> {
             }
         }
     }
-    let df = if rows.is_empty() {
-        DataFrame::empty_with_schema(schema.to_polars().map_err(to_kernel_err)?.as_ref())
-    } else {
+    if rows.is_empty() {
+        return Ok(NodeState {
+            lf: concat_frames(Vec::new(), &schema)?,
+            schema,
+        });
+    }
+    let df = {
         let height = rows.len();
         let columns = fields
             .iter()
