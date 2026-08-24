@@ -145,7 +145,7 @@ impl CdfTableScan {
                 if touches_cdf_metadata(c) {
                     continue;
                 }
-                if let Some(kp) = polars_expr_to_kernel_predicate(c, &schema) {
+                if let Some(kp) = polars_expr_to_kernel_predicate(c, schema) {
                     translated.push(kp);
                 }
             }
