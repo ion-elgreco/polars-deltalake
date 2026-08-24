@@ -367,16 +367,20 @@ fn resolve_column_dtype<'a>(
     name: &ColumnName,
     schema: Option<&'a StructType>,
 ) -> Option<&'a KernelDataType> {
-    let mut fields: &StructType = schema?;
-    let mut dt: Option<&'a KernelDataType> = None;
-    for segment in name.iter() {
-        let field = fields.field(segment)?;
-        dt = Some(&field.data_type);
-        if let KernelDataType::Struct(s) = &field.data_type {
-            fields = s;
+    let mut level: &'a StructType = schema?;
+    let mut segments = name.iter().peekable();
+    while let Some(segment) = segments.next() {
+        let dt = &level.field(segment)?.data_type;
+        if segments.peek().is_none() {
+            return Some(dt);
+        }
+        // Only a struct has children the next segment could name.
+        match dt {
+            KernelDataType::Struct(inner) => level = inner,
+            _ => return None,
         }
     }
-    dt
+    None
 }
 
 #[cfg(test)]
@@ -609,5 +613,28 @@ mod parse_json_tests {
             col.get(1).unwrap()
         );
         assert!(matches!(col.get(2).unwrap(), AnyValue::Null));
+    }
+}
+
+#[cfg(test)]
+mod column_dtype_tests {
+    use delta_kernel::schema::StructField;
+
+    use super::*;
+
+    /// `a.b` where `a` is not a struct has no children to resolve. The walk
+    /// must not stay at the parent level and hand back the sibling `b`.
+    #[test]
+    fn non_struct_midpath_resolves_to_none() {
+        let schema = StructType::try_new([
+            StructField::nullable("a", KernelDataType::LONG),
+            StructField::nullable("b", KernelDataType::STRING),
+        ])
+        .unwrap();
+        assert_eq!(
+            resolve_column_dtype(&ColumnName::new(["a"]), Some(&schema)),
+            Some(&KernelDataType::LONG)
+        );
+        assert!(resolve_column_dtype(&ColumnName::new(["a", "b"]), Some(&schema)).is_none());
     }
 }
