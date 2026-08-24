@@ -121,6 +121,11 @@ impl JsonHandler for PolarsJsonHandler {
 }
 
 pub(crate) fn parse_ndjson_inferred(bytes: &[u8]) -> DeltaResult<DataFrame> {
+    // polars raises a type-inference error on a reader with no JSON value;
+    // a zero-byte or blank commit file is an empty batch, not a failure.
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(DataFrame::empty());
+    }
     let mut df = JsonReader::new(Cursor::new(bytes))
         .with_json_format(JsonFormat::JsonLines)
         .infer_schema_len(NonZeroUsize::new(usize::MAX))
@@ -442,5 +447,14 @@ mod json_string_tests {
         let data = PolarsEngineData::new(df);
         let out = extract_json_strings(&data).unwrap();
         assert_eq!(out, vec!["{\"a\":1}", "{}", "{}", "{}"]);
+    }
+
+    /// A reader holding no JSON value is an empty batch, not a type-inference
+    /// failure — a crashed writer can leave a zero-byte commit.
+    #[test]
+    fn blank_input_parses_to_an_empty_frame() {
+        for bytes in [&b""[..], b"\n", b"   \n  "] {
+            assert_eq!(parse_ndjson_inferred(bytes).unwrap().height(), 0);
+        }
     }
 }
