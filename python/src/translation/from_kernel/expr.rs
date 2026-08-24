@@ -3,11 +3,11 @@
 //! struct/array/scalar leaves stay here, `Transform` defers to
 //! [`super::transform`], and `Predicate` defers to [`super::predicate`].
 
+use delta_kernel::expressions::Scalar;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, ColumnName, Expression, ExpressionRef, UnaryExpression,
     UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
-use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, StructType};
 use delta_kernel::transform_output_type;
 use delta_kernel::transforms::SchemaTransform;
@@ -235,8 +235,12 @@ fn parse_partition_column(
                 .map_err(|e| polars::prelude::PolarsError::ComputeError(e.to_string().into())),
         })
         .collect::<polars::prelude::PolarsResult<Vec<Scalar>>>()?;
-    let series = build_series(column.name().as_str(), target, &scalars.iter().collect::<Vec<_>>())
-        .map_err(|e| polars::prelude::PolarsError::ComputeError(e.to_string().into()))?;
+    let series = build_series(
+        column.name().as_str(),
+        target,
+        &scalars.iter().collect::<Vec<_>>(),
+    )
+    .map_err(|e| polars::prelude::PolarsError::ComputeError(e.to_string().into()))?;
     Ok(Column::from(series))
 }
 

@@ -11,9 +11,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-use delta_kernel::actions::deletion_vector::{
-    DeletionVectorDescriptor, DeletionVectorStorageType,
-};
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::engine_data::{GetData, RowVisitor};
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::plans::Operation;
@@ -103,10 +101,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
     let table_root = scan.table_root().clone();
     // Protocol-aware effective mode: matches how kernel resolved the physical
     // schema, including stale `physicalName` annotations under mode `none`.
-    let mode = scan
-        .snapshot()
-        .table_configuration()
-        .column_mapping_mode();
+    let mode = scan.snapshot().table_configuration().column_mapping_mode();
     let sources = field_sources(scan.logical_schema(), scan.physical_schema(), mode);
     // Identity frames need no per-file select at all.
     let needs_select = sources.iter().any(|(f, s)| match s {
