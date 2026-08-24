@@ -9,7 +9,7 @@ mod parquet;
 mod storage;
 
 pub(super) use json::PolarsJsonHandler;
-pub(crate) use json::{align_dataframe, parse_ndjson_inferred};
+pub(crate) use json::{align_lazy, parse_ndjson_inferred};
 pub(super) use parquet::PolarsParquetHandler;
 pub(crate) use parquet::{
     kernel_parquet_footer, parquet_options, path_for_polars_io, unified_scan_args,

@@ -29,7 +29,7 @@ use polars_utils::pl_str::PlSmallStr;
 use url::Url;
 
 use crate::engine::data::resolve_path;
-use crate::engine::handlers::{align_dataframe, parse_ndjson_inferred, parquet_options,
+use crate::engine::handlers::{align_lazy, parse_ndjson_inferred, parquet_options,
     path_for_polars_io, unified_scan_args};
 use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData};
 use crate::errors::to_kernel_err;
@@ -230,7 +230,8 @@ impl PolarsPlanExecutor {
                 .collect::<DeltaResult<_>>()?,
             FileType::Json => {
                 // Whole-file fetches in one parallel `read_files` batch;
-                // NDJSON parse + kernel-schema align per file.
+                // NDJSON parse per file. The align select stays lazy so only
+                // the raw parses are pinned until the terminal collect.
                 let slices = entries.iter().map(|e| (e.location.clone(), None)).collect();
                 let payloads: Vec<bytes::Bytes> = self
                     .storage
@@ -241,8 +242,7 @@ impl PolarsPlanExecutor {
                     .zip(entries)
                     .map(|(bytes, e)| {
                         let df = parse_ndjson_inferred(&bytes)?;
-                        let aligned = align_dataframe(df, read_schema)?;
-                        let mut lf = aligned.lazy();
+                        let mut lf = align_lazy(df, read_schema)?;
                         if let Some(name) = &row_index {
                             lf = lf.with_row_index(name.clone(), None);
                         }

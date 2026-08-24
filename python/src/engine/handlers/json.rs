@@ -17,7 +17,7 @@ use polars::io::SerReader;
 use polars::io::json::{JsonFormat, JsonReader};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{
-    DataFrame, DataType as PlDataType, Expr, IntoLazy, col, concat_list, lit, when,
+    DataFrame, DataType as PlDataType, Expr, IntoLazy, LazyFrame, col, concat_list, lit, when,
 };
 use polars_utils::pl_str::PlSmallStr;
 use url::Url;
@@ -60,7 +60,9 @@ impl JsonHandler for PolarsJsonHandler {
             blob.push('\n');
         }
         let df = parse_ndjson_inferred(blob.as_bytes())?;
-        let aligned = align_dataframe(df, output_schema.as_ref())?;
+        let aligned = align_lazy(df, output_schema.as_ref())?
+            .collect()
+            .map_err(to_kernel_err)?;
         Ok(Box::new(PolarsEngineData::new(aligned)))
     }
 
@@ -86,7 +88,9 @@ impl JsonHandler for PolarsJsonHandler {
             .into_iter()
             .map(move |bytes| -> DeltaResult<Box<dyn EngineData>> {
                 let df = parse_ndjson_inferred(&bytes)?;
-                let aligned = align_dataframe(df, schema.as_ref())?;
+                let aligned = align_lazy(df, schema.as_ref())?
+                    .collect()
+                    .map_err(to_kernel_err)?;
                 Ok(Box::new(PolarsEngineData::new(aligned)))
             });
         Ok(Box::new(iter))
@@ -120,11 +124,13 @@ pub(crate) fn parse_ndjson_inferred(bytes: &[u8]) -> DeltaResult<DataFrame> {
 
 /// Reshape an inferred polars DataFrame to the kernel-declared layout:
 /// missing fields → null columns, inferred `Struct{...}` map fields →
-/// `List<Struct<{key, value}>>`, struct children recurse.
-pub(crate) fn align_dataframe(
+/// `List<Struct<{key, value}>>`, struct children recurse. Returned lazy so
+/// the executor's concatenated commit frames pin only the raw parses; the
+/// align runs inside the terminal streaming collect.
+pub(crate) fn align_lazy(
     df: DataFrame,
     kernel_schema: &delta_kernel::schema::StructType,
-) -> DeltaResult<DataFrame> {
+) -> DeltaResult<LazyFrame> {
     let polars_schema = df.schema().clone();
     let select_exprs: Vec<Expr> = kernel_schema
         .fields()
@@ -135,10 +141,7 @@ pub(crate) fn align_dataframe(
         })
         .collect::<DeltaResult<_>>()?;
 
-    df.lazy()
-        .select(select_exprs)
-        .collect()
-        .map_err(to_kernel_err)
+    Ok(df.lazy().select(select_exprs))
 }
 
 /// Top-level callers pass `col(name)`; nested walks pass the appropriate
