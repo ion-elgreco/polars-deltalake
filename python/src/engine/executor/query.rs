@@ -373,6 +373,13 @@ fn split_scan_schema(
         match f.get_metadata_column_spec() {
             None => {}
             Some(MetadataColumnSpec::RowIndex) => {
+                // Only one is representable: the second would silently be
+                // read as a data column that no file has.
+                if row_index.is_some() {
+                    return Err(Error::Unsupported(
+                        "plan scan: more than one row-index metadata column".into(),
+                    ));
+                }
                 row_index = Some(PlSmallStr::from_str(f.name.as_str()));
             }
             Some(other) => {
