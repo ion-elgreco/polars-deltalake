@@ -569,6 +569,29 @@ class TestDeletionVectors:
         out = scan_delta(table_path).select("value").collect().sort("value")
         assert out["value"].to_list() == [40, 50, 60]
 
+    def test_dv_with_predicate(self):
+        """A DV indexes the file's *physical* rows, so a pushed-down predicate
+        must not run before the keep-mask. Uses the DAT fixture because
+        `deltalake` cannot write a deletion vector."""
+        from _dat_helper import reader_cases
+
+        case = next(c for c in reader_cases() if c.name == "deletion_vectors")
+        table = str(case / "delta")
+        # The DELETE behind this DV removed every `letter == 'a'` row.
+        survivor = [{"letter": "b", "int": 228}]
+
+        def read(pred=None):
+            lf = scan_delta(table)
+            if pred is not None:
+                lf = lf.filter(pred)
+            return lf.select("letter", "int").collect().to_dicts()
+
+        assert read() == survivor
+        # Filtering before the mask resurrected the deleted `a, 692` row.
+        assert read(pl.col("int") > 100) == survivor
+        # ...and dropped the one live row entirely.
+        assert read(pl.col("letter") == "b") == survivor
+
 
 class TestEagerRead:
     def test_read_delta_eager(self, simple_table):

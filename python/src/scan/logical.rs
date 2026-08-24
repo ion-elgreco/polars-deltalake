@@ -106,11 +106,15 @@ pub(crate) struct LogicalScanIter {
     /// `FILE_ID_COL` value → index in `rewrites`.
     path_index: HashMap<String, usize>,
     rewrites: Vec<LogicalRewrite>,
+    /// Physical-name data conjuncts held back from the parquet scan because
+    /// a DV is in play: the keep-mask addresses file row positions, so the
+    /// predicate has to run after it.
+    physical_predicate: Option<Expr>,
     /// Mixed atomic conjuncts (touching both partition and data cols) —
     /// applied after the select list materializes partition values.
     orphan_predicate: Option<Expr>,
     /// Index-aligned with `rewrites`: the pre-parsed fast path for each
-    /// select list, when it qualifies and no orphan predicate exists.
+    /// select list, when it qualifies and no predicate needs the lazy path.
     simple: Vec<Option<SimpleSelect>>,
     /// One inner frame may span multiple files; we slice into per-file
     /// frames here and drain before pulling the next inner frame.
@@ -122,12 +126,14 @@ impl LogicalScanIter {
         source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>,
         path_index: HashMap<String, usize>,
         rewrites: Vec<LogicalRewrite>,
+        physical_predicate: Option<Expr>,
         orphan_predicate: Option<Expr>,
     ) -> Self {
+        let any_predicate = physical_predicate.is_some() || orphan_predicate.is_some();
         let simple = rewrites
             .iter()
-            .map(|r| match (&r.select, &orphan_predicate) {
-                (Some(select), None) => SimpleSelect::parse(select),
+            .map(|r| match (&r.select, any_predicate) {
+                (Some(select), false) => SimpleSelect::parse(select),
                 _ => None,
             })
             .collect();
@@ -135,6 +141,7 @@ impl LogicalScanIter {
             source,
             path_index,
             rewrites,
+            physical_predicate,
             orphan_predicate,
             simple,
             pending: VecDeque::new(),
@@ -208,8 +215,15 @@ impl LogicalScanIter {
             df = fast
                 .apply(&df)
                 .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))?;
-        } else if rewrite.select.is_some() || self.orphan_predicate.is_some() {
+        } else if rewrite.select.is_some()
+            || self.physical_predicate.is_some()
+            || self.orphan_predicate.is_some()
+        {
             let mut lazy = df.lazy();
+            // Physical names are still in place here, before the select.
+            if let Some(pred) = &self.physical_predicate {
+                lazy = lazy.filter(pred.clone());
+            }
             if let Some(select) = &rewrite.select {
                 lazy = lazy.select(select.clone());
             }

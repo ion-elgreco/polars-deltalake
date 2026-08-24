@@ -308,11 +308,21 @@ impl TableScan {
             .iter()
             .any(|r| r.select.is_some() || r.dv.is_some());
 
+        // A DV's row indices address the file's physical rows, so a filter
+        // inside the scan would shift them. Hold it back to `LogicalScanIter`
+        // (below the keep-mask) at the cost of row-group pushdown.
+        let has_dv = rewrites.iter().any(|r| r.dv.is_some());
+        let (scan_predicate, post_dv_predicate) = if has_dv {
+            (None, polars_predicate)
+        } else {
+            (polars_predicate, None)
+        };
+
         let lazy = build_lazy_scan(
             paths,
             self.engine.cloud_options(),
             &select_exprs,
-            polars_predicate.as_ref(),
+            scan_predicate.as_ref(),
             &physical_schema,
             needs_rewrite,
         )?;
@@ -330,6 +340,7 @@ impl TableScan {
                     source,
                     path_index,
                     rewrites,
+                    post_dv_predicate,
                     conjunction(routing.post_transform),
                 )
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
