@@ -181,6 +181,15 @@ fn fetch_parquet_metadata(
     };
 
     let trailer = read_range((file.size - FOOTER_SIZE)..file.size)?;
+    // A short body (proxy error page, truncated presigned response) would
+    // otherwise index out of bounds below.
+    if trailer.len() != FOOTER_SIZE as usize {
+        return Err(Error::Generic(format!(
+            "{}: trailer read returned {} of {FOOTER_SIZE} bytes",
+            file.location,
+            trailer.len(),
+        )));
+    }
     if trailer[4..] != PARQUET_MAGIC {
         return Err(Error::Generic(format!(
             "{}: missing PAR1 magic in trailer",
@@ -197,6 +206,13 @@ fn fetch_parquet_metadata(
 
     let footer_thrift =
         read_range((file.size - FOOTER_SIZE - footer_len)..(file.size - FOOTER_SIZE))?;
+    if footer_thrift.len() as u64 != footer_len {
+        return Err(Error::Generic(format!(
+            "{}: footer read returned {} of {footer_len} bytes",
+            file.location,
+            footer_thrift.len(),
+        )));
+    }
     deserialize_metadata(Buffer::from(footer_thrift.to_vec())).map_err(to_kernel_err)
 }
 
