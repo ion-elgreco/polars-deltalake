@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::PredicateRef;
-use delta_kernel::schema::{SchemaRef, StructType};
+use delta_kernel::schema::{ColumnMetadataKey, DataType as KernelDataType, SchemaRef, StructType};
 use delta_kernel::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
     StorageHandler,
@@ -215,6 +215,39 @@ pub(crate) fn parquet_options(physical_schema: &StructType) -> DeltaResult<Parqu
     })
 }
 
+/// The ScanParquet plan contract resolves a field carrying
+/// `parquet.field.id` metadata by field ID. polars' unified scan matches by
+/// name only, which would silently null-fill renamed columns — the plan
+/// executor refuses instead. The classic data path keeps name matching:
+/// delta writers put physical names in the files, and Id-mode tables read
+/// correctly by name there today.
+pub(crate) fn ensure_no_field_id_matching(schema: &StructType) -> DeltaResult<()> {
+    fn walk_dtype(dt: &KernelDataType) -> DeltaResult<()> {
+        match dt {
+            KernelDataType::Struct(s) => ensure_no_field_id_matching(s),
+            KernelDataType::Array(a) => walk_dtype(a.element_type()),
+            KernelDataType::Map(m) => {
+                walk_dtype(m.key_type())?;
+                walk_dtype(m.value_type())
+            }
+            _ => Ok(()),
+        }
+    }
+    for field in schema.fields() {
+        if field
+            .get_config_value(&ColumnMetadataKey::ParquetFieldId)
+            .is_some()
+        {
+            return Err(Error::Unsupported(format!(
+                "parquet read: field {} carries parquet.field.id — field-ID matching is not implemented",
+                field.name
+            )));
+        }
+        walk_dtype(&field.data_type)?;
+    }
+    Ok(())
+}
+
 /// `Insert` / `Ignore` policies are load-bearing for the kernel contract:
 /// null-fill missing fields, drop file columns kernel didn't ask for (e.g.
 /// `txn` in checkpoints written with stats-as-struct disabled).
@@ -299,4 +332,39 @@ pub(crate) fn path_for_polars_io(url: &Url) -> DeltaResult<PlRefPath> {
         }
     };
     Ok(PlRefPath::new(s))
+}
+
+#[cfg(test)]
+mod field_id_tests {
+    use delta_kernel::schema::{DataType, MetadataValue, StructField};
+
+    use super::*;
+
+    #[test]
+    fn field_id_metadata_is_unsupported() {
+        let schema = StructType::try_new([StructField::nullable("c1", DataType::LONG)
+            .with_metadata([("parquet.field.id", MetadataValue::Number(5))])])
+        .unwrap();
+        let err =
+            ensure_no_field_id_matching(&schema).expect_err("field-id matching is unimplemented");
+        assert!(err.to_string().contains("parquet.field.id"), "got: {err}");
+    }
+
+    #[test]
+    fn nested_field_id_metadata_is_unsupported() {
+        let inner = StructField::nullable("x", DataType::LONG)
+            .with_metadata([("parquet.field.id", MetadataValue::Number(7))]);
+        let schema = StructType::try_new([StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(StructType::try_new([inner]).unwrap())),
+        )])
+        .unwrap();
+        assert!(ensure_no_field_id_matching(&schema).is_err());
+    }
+
+    #[test]
+    fn plain_schema_passes() {
+        let schema = StructType::try_new([StructField::nullable("c", DataType::LONG)]).unwrap();
+        assert!(ensure_no_field_id_matching(&schema).is_ok());
+    }
 }

@@ -30,7 +30,8 @@ use url::Url;
 
 use crate::engine::data::resolve_path;
 use crate::engine::handlers::{
-    align_lazy, parquet_options, parse_ndjson_inferred, path_for_polars_io, unified_scan_args,
+    align_lazy, ensure_no_field_id_matching, parquet_options, parse_ndjson_inferred,
+    path_for_polars_io, unified_scan_args,
 };
 use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData};
 use crate::errors::to_kernel_err;
@@ -257,6 +258,9 @@ impl PolarsPlanExecutor {
         read_schema: &StructType,
         row_index: Option<PlSmallStr>,
     ) -> DeltaResult<LazyFrame> {
+        // Plan contract: a field carrying `parquet.field.id` matches by ID,
+        // which polars cannot express — refuse rather than null-fill.
+        ensure_no_field_id_matching(read_schema)?;
         let options = parquet_options(read_schema)?;
         let mut args = unified_scan_args(self.cloud_opts.as_ref(), None);
         if let Some(name) = &row_index {
@@ -651,6 +655,33 @@ mod scan_entries_tests {
     fn differing_lits_scan_per_file() {
         let lits = |n| vec![lit(n).alias("v")];
         assert_eq!(plan_scan_count([lits(1i64), lits(2i64)]), 2);
+    }
+
+    /// ScanParquet contract: `parquet.field.id` fields match by ID, which
+    /// polars cannot express — the plan build must refuse.
+    #[test]
+    fn field_id_read_schema_is_rejected() {
+        use delta_kernel::schema::MetadataValue;
+
+        let read_schema = StructType::try_new([StructField::nullable("id", DataType::LONG)
+            .with_metadata([("parquet.field.id", MetadataValue::Number(3))])])
+        .unwrap();
+        let output_schema = Arc::new(StructType::try_new([long_field("id")]).unwrap());
+        let entries = vec![FileEntry {
+            location: Url::parse("file:///t/0.parquet").unwrap(),
+            lits: vec![],
+        }];
+        let err = match executor().scan_entries(
+            FileType::Parquet,
+            entries,
+            &read_schema,
+            &output_schema,
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("field-id read schema must be refused"),
+        };
+        assert!(err.to_string().contains("parquet.field.id"), "got: {err}");
     }
 
     /// Kernel's plan contract types metadata columns LONG; polars' native
