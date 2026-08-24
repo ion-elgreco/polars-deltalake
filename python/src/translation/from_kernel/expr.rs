@@ -337,9 +337,43 @@ fn translate_variadic_expr(
                     "translate_expr: Array expression with no elements".into(),
                 ));
             }
+            // `concat_list` splices list-typed inputs entry-wise; kernel
+            // ARRAY makes each input a single element. Refuse the statically
+            // detectable list inputs instead of building the wrong shape.
+            if v.exprs.iter().any(|e| is_statically_list(e, input_schema)) {
+                return Err(Error::Unsupported(
+                    "translate_expr: ARRAY over a list-typed input is not implemented".into(),
+                ));
+            }
             polars::prelude::concat_list(children.as_slice()).map_err(to_kernel_err)
         }
     }
+}
+
+fn is_statically_list(e: &Expression, schema: Option<&StructType>) -> bool {
+    match e {
+        Expression::Literal(Scalar::Array(_)) => true,
+        Expression::Column(name) => resolve_column_dtype(name, schema)
+            .is_some_and(|dt| matches!(dt, KernelDataType::Array(_))),
+        Expression::Cast(c) => matches!(c.target, KernelDataType::Array(_)),
+        _ => false,
+    }
+}
+
+fn resolve_column_dtype<'a>(
+    name: &ColumnName,
+    schema: Option<&'a StructType>,
+) -> Option<&'a KernelDataType> {
+    let mut fields: &StructType = schema?;
+    let mut dt: Option<&'a KernelDataType> = None;
+    for segment in name.iter() {
+        let field = fields.field(segment)?;
+        dt = Some(&field.data_type);
+        if let KernelDataType::Struct(s) = &field.data_type {
+            fields = s;
+        }
+    }
+    dt
 }
 
 #[cfg(test)]
@@ -491,5 +525,47 @@ mod map_to_struct_tests {
             "NULL map row must be an outer-NULL struct, got {:?}",
             col.get(1).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod array_variadic_tests {
+    use delta_kernel::expressions::{ColumnName, VariadicExpression, VariadicExpressionOp};
+    use delta_kernel::schema::{ArrayType, StructField};
+    use polars::prelude::IntoLazy;
+
+    use super::*;
+
+    /// `concat_list` splices list-typed inputs entry-wise; kernel ARRAY makes
+    /// each input one element — statically list-typed inputs must be refused.
+    #[test]
+    fn list_typed_input_is_refused() {
+        let schema = StructType::try_new([StructField::nullable(
+            "l",
+            KernelDataType::Array(Box::new(ArrayType::new(KernelDataType::LONG, true))),
+        )])
+        .unwrap();
+        let expr = Expression::Variadic(VariadicExpression {
+            op: VariadicExpressionOp::Array,
+            exprs: vec![Expression::from(ColumnName::new(["l"]))],
+        });
+        assert!(translate_expr(&expr, None, Some(&schema)).is_err());
+    }
+
+    #[test]
+    fn scalar_inputs_build_one_element_each() {
+        let expr = Expression::Variadic(VariadicExpression {
+            op: VariadicExpressionOp::Array,
+            exprs: vec![Expression::literal(1i64), Expression::literal(2i64)],
+        });
+        let translated = translate_expr(&expr, None, None).unwrap();
+        let df = polars::df!("x" => [0i64]).unwrap();
+        let out = df
+            .lazy()
+            .select([translated.alias("out")])
+            .collect()
+            .unwrap();
+        let first = out.column("out").unwrap().list().unwrap().get_as_series(0);
+        assert_eq!(first.unwrap().len(), 2);
     }
 }
