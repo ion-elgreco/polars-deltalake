@@ -37,7 +37,8 @@ impl PredicateEvaluator for PolarsPredicateEvaluator {
                     .alias(PlSmallStr::from_static(KERNEL_OUTPUT_COL)),
             ])
             .collect_with_engine(PolarsEngineMode::Streaming)
-            .map_err(to_kernel_err)?;
+            .map_err(to_kernel_err)?
+            .unwrap_single();
         Ok(Box::new(PolarsEngineData::new(result)))
     }
 }

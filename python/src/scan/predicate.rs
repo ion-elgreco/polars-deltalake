@@ -193,7 +193,7 @@ pub(crate) fn file_skip_via_partition_eval(
         .column(FILE_IDX_COL)
         .and_then(|c| c.u32())
         .map_err(|e| anyhow::anyhow!("read file-idx col: {e:#}"))?;
-    Ok(chunked.into_iter().flatten().map(|x| x as usize).collect())
+    Ok(chunked.iter().flatten().map(|x| x as usize).collect())
 }
 
 /// Returns true iff `expr` references any column that is in `logical_schema`

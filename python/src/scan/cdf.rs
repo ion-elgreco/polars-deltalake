@@ -203,7 +203,8 @@ impl CdfTableScan {
                     .lazy()
                     .filter(pred.clone())
                     .collect_with_engine(PolarsEngineMode::Streaming)
-                    .map_err(|e| anyhow::anyhow!("CDF post-filter failed: {e:#}"))?;
+                    .map_err(|e| anyhow::anyhow!("CDF post-filter failed: {e:#}"))?
+                    .unwrap_single();
             }
             Ok(df)
         }));

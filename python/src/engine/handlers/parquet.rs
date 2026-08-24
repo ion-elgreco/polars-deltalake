@@ -20,6 +20,7 @@ use polars::io::cloud::CloudOptions;
 use polars::io::parquet::read::{ParquetOptions, infer_schema};
 use polars::lazy::frame::LazyFrame;
 use polars::prelude::{DataFrame, Expr};
+use polars_buffer::Buffer;
 use polars_parquet::parquet::metadata::FileMetadata;
 use polars_parquet::parquet::{FOOTER_SIZE, PARQUET_MAGIC, read::deserialize_metadata};
 use polars_plan::dsl::{
@@ -201,8 +202,7 @@ pub(crate) fn fetch_parquet_metadata(
 
     let footer_thrift =
         read_range((file.size - FOOTER_SIZE - footer_len)..(file.size - FOOTER_SIZE))?;
-    let max_size = footer_thrift.len() * 2 + 1024;
-    deserialize_metadata(footer_thrift.as_ref(), max_size).map_err(to_kernel_err)
+    deserialize_metadata(Buffer::from(footer_thrift.to_vec())).map_err(to_kernel_err)
 }
 
 /// `ParquetOptions` shaped by the kernel-declared physical schema. Shared

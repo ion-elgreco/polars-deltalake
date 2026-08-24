@@ -117,7 +117,8 @@ impl LogicalScanIter {
                 .collect_with_engine(PolarsEngineMode::Streaming)
                 .map_err(|e| {
                     delta_kernel::Error::Generic(format!("logical rewrite eval: {e}"))
-                })?;
+                })?
+                .unwrap_single();
         }
         Ok(df)
     }

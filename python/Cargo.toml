@@ -27,12 +27,12 @@ delta_kernel = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "64f
 # Polars — parquet + ndjson readers, plus the lazy DSL for the expression
 # translator. `polars-arrow` exposes the ArrowSchema/Field/StructArray types
 # the parquet reader projects against.
-polars = { version = "0.53", default-features = false, features = [
+polars = { version = "0.55", default-features = false, features = [
     "parquet",
     "json",
     "lazy",
     "async",
-    "new_streaming",
+    "streaming",
     "fmt",
     "diagonal_concat",
     "partition_by",
@@ -120,19 +120,21 @@ polars = { version = "0.53", default-features = false, features = [
     "string_reverse",
     "string_to_integer",
 ] }
-polars-arrow = { version = "0.53", default-features = false }
-polars-utils = { version = "0.53", default-features = false }
+polars-arrow = { version = "0.55", default-features = false }
+polars-utils = { version = "0.55", default-features = false }
 # polars-parquet — for `deserialize_metadata` + `PARQUET_MAGIC` /
 # `FOOTER_SIZE` constants, used by the suffix-range footer reader to avoid
 # downloading the whole file for kernel's `read_parquet_footer`.
-polars-parquet = { version = "0.53", default-features = false }
-polars-ffi = { version = "0.53" }
+polars-parquet = { version = "0.55", default-features = false }
+# polars-buffer — `deserialize_metadata` takes its `Buffer<u8>` since 0.55.
+polars-buffer = { version = "0.55", default-features = false }
+polars-ffi = { version = "0.55" }
 # polars-plan exposes Expr / Operator / FunctionExpr / BooleanFunction /
 # DynLiteralValue for the polars→kernel predicate pushdown translator.
 # Feature set must broadly match what the Python polars wheel exposes so the
 # serialized-Expr bytes we receive from pl.Expr.deserialize have all variant
 # discriminants in range.
-polars-plan = { version = "0.53", default-features = false, features = [
+polars-plan = { version = "0.55", default-features = false, features = [
     "is_in",
     "is_between",
     "strings",
@@ -163,12 +165,12 @@ futures-util = { version = "0.3", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # PyO3 boundary — polars-native types crossing into Python.
-# pyo3 pinned to 0.27 to match pyo3-polars 0.26 (the latest release).
+# pyo3 pinned to 0.29 to match pyo3-polars 0.28 (the latest release).
 # `extension-module` lives behind a default cargo feature: wheel builds keep
 # it, while `cargo test --no-default-features` links libpython so test
 # binaries resolve the pyo3 symbols that polars-utils' numpy glue pulls in.
-pyo3 = { version = "0.27", features = ["abi3-py310"] }
-pyo3-polars = { version = "0.26", features = [
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+pyo3-polars = { version = "0.28", features = [
     "lazy",
     "dtype-decimal",   # Delta `decimal(p, s)` → polars Decimal across FFI
     "dtype-struct",    # Delta `struct<…>` + our Map = List<Struct<key,value>>
