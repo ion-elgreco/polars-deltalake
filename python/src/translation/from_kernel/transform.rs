@@ -44,12 +44,20 @@ pub(super) fn walk_transform_slots<'a>(
 ) -> DeltaResult<Vec<TransformSlot<'a>>> {
     // A non-optional patch naming a field the input doesn't have is an error
     // per the kernel contract; optional ones are silently skipped.
-    for (name, patch) in &t.field_patches {
-        if !patch.optional && !input_fields.iter().any(|f| f.name.as_str() == name) {
-            return Err(Error::Generic(format!(
-                "StructPatch: patched field '{name}' not found in input schema"
-            )));
-        }
+    let mut missing: Vec<&str> = t
+        .field_patches
+        .iter()
+        .filter(|(name, patch)| {
+            !patch.optional && !input_fields.iter().any(|f| f.name.as_str() == *name)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !missing.is_empty() {
+        // `field_patches` is a HashMap, so sort for a reproducible message.
+        missing.sort_unstable();
+        return Err(Error::Generic(format!(
+            "StructPatch: patched field(s) {missing:?} not found in input schema"
+        )));
     }
 
     let mut slots: Vec<TransformSlot<'a>> = Vec::with_capacity(output_struct.num_fields());
@@ -187,4 +195,45 @@ fn descend_struct_path<'a>(root: &'a StructType, path: &ColumnName) -> DeltaResu
         }
     }
     Ok(current)
+}
+
+#[cfg(test)]
+mod missing_patch_tests {
+    use delta_kernel::expressions::{ExpressionFieldPatch, ExpressionStructPatch};
+
+    use super::*;
+
+    /// `field_patches` is a HashMap, so naming only the first field found
+    /// makes the error depend on iteration order.
+    #[test]
+    fn missing_fields_are_all_named_in_sorted_order() {
+        let drop = || ExpressionFieldPatch {
+            keep_input: false,
+            insertions: vec![],
+            optional: false,
+        };
+        let patch = ExpressionStructPatch {
+            input_path: None,
+            field_patches: [("zz".to_string(), drop()), ("aa".to_string(), drop())]
+                .into_iter()
+                .collect(),
+            prepended_fields: vec![],
+            appended_fields: vec![],
+        };
+        let output = StructType::try_new([StructField::nullable("keep", KernelDataType::LONG)])
+            .unwrap();
+        let kept = StructField::nullable("keep", KernelDataType::LONG);
+
+        let err = match walk_transform_slots(&patch, &output, &[&kept]) {
+            Err(e) => e,
+            Ok(_) => panic!("non-optional patches naming absent fields must error"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("\"aa\""), "got: {msg}");
+        assert!(msg.contains("\"zz\""), "got: {msg}");
+        assert!(
+            msg.find("aa") < msg.find("zz"),
+            "names must be sorted, got: {msg}"
+        );
+    }
 }
