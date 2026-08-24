@@ -158,6 +158,12 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
 /// Pair each projected logical field with its physical source. Partition
 /// columns are exactly the logical fields whose physical name is absent
 /// from the physical (file) schema.
+///
+/// This name-diff re-derives the partition/rename subset of kernel's
+/// five-variant `FieldTransformSpec`, which (with `Scan::state_info`) is
+/// private at the pinned rev. A future logical-only field that is not a
+/// partition column — row tracking, CDF metadata — would be misclassified
+/// as one here and fail downstream with a partition-shaped error.
 fn field_sources<'a>(
     logical: &'a StructType,
     physical: &StructType,
