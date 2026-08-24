@@ -163,7 +163,7 @@ pub(crate) fn kernel_parquet_footer(
 }
 
 /// Fetch a parquet file's thrift footer via two range reads
-pub(crate) fn fetch_parquet_metadata(
+fn fetch_parquet_metadata(
     storage: &ObjectStoreStorageHandler,
     file: &FileMeta,
 ) -> DeltaResult<FileMetadata> {
