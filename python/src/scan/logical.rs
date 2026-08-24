@@ -4,8 +4,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use polars::prelude::{
-    BooleanChunked, Column, DataFrame, Expr, IntoLazy, NamedFrom, PolarsResult, Scalar,
-    StringChunked,
+    BooleanChunked, Column, DataFrame, Expr, IntoLazy, LiteralValue, NamedFrom, PolarsResult,
+    Scalar, StringChunked,
 };
 use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_str::PlSmallStr;
@@ -33,6 +33,8 @@ impl SimpleSelect {
     pub(crate) fn parse(exprs: &[Expr]) -> Option<Self> {
         let mut ops = Vec::with_capacity(exprs.len());
         let mut literal_exprs: Vec<Expr> = Vec::new();
+        // Positions in `ops` waiting on the one-shot eval below.
+        let mut deferred: Vec<usize> = Vec::new();
         for expr in exprs {
             match expr {
                 Expr::Column(name) => ops.push(SimpleOp::Rename {
@@ -44,7 +46,15 @@ impl SimpleSelect {
                         from: from.clone(),
                         to: to.clone(),
                     }),
+                    // Partition literals already carry their output dtype, so
+                    // read the scalar straight off instead of planning a query
+                    // per file.
+                    Expr::Literal(LiteralValue::Scalar(value)) => ops.push(SimpleOp::Broadcast {
+                        name: to.clone(),
+                        value: value.clone(),
+                    }),
                     _ if polars_plan::utils::expr_to_leaf_column_names(inner).is_empty() => {
+                        deferred.push(ops.len());
                         literal_exprs.push(expr.clone());
                         ops.push(SimpleOp::Broadcast {
                             name: to.clone(),
@@ -58,18 +68,21 @@ impl SimpleSelect {
             }
         }
         if !literal_exprs.is_empty() {
-            // One evaluation for all literal exprs (partition parsing may
-            // run a UDF); per-batch application is then a pure broadcast.
+            // Column-free but not already a scalar (a cast, a Series
+            // literal): one evaluation for all of them, then pure broadcast.
             let evaluated = DataFrame::empty()
                 .lazy()
                 .select(literal_exprs)
                 .collect()
                 .ok()?;
-            let mut cols = evaluated.columns().iter();
-            for op in &mut ops {
-                if let SimpleOp::Broadcast { value, .. } = op {
-                    let col = cols.next()?;
-                    let av = col.get(0).ok()?.into_static();
+            for (idx, col) in deferred.into_iter().zip(evaluated.columns()) {
+                // A multi-value literal has no broadcast form; let the lazy
+                // path evaluate it rather than silently keeping element 0.
+                if col.len() != 1 {
+                    return None;
+                }
+                let av = col.get(0).ok()?.into_static();
+                if let SimpleOp::Broadcast { value, .. } = &mut ops[idx] {
                     *value = Scalar::new(col.dtype().clone(), av);
                 }
             }
@@ -324,5 +337,15 @@ mod simple_select_tests {
             .unwrap();
         let lazy = frame.lazy().select(exprs()).collect().unwrap();
         assert!(fast.equals_missing(&lazy), "{fast:?} vs {lazy:?}");
+    }
+
+    /// A Series literal has no single broadcast value, so the fast path must
+    /// decline instead of replicating element 0 over every row.
+    #[test]
+    fn multi_value_literal_declines_fast_path() {
+        use polars::prelude::{NamedFrom, Series};
+
+        let multi = lit(Series::new("s".into(), [1i64, 2])).alias("part");
+        assert!(SimpleSelect::parse(&[multi]).is_none());
     }
 }
