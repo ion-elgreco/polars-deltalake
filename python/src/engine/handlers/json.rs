@@ -64,6 +64,13 @@ impl JsonHandler for PolarsJsonHandler {
         let aligned = align_lazy(df, output_schema.as_ref())?
             .collect()
             .map_err(to_kernel_err)?;
+        // Contract: N input rows produce N output rows.
+        if aligned.height() != row_count {
+            return Err(Error::Generic(format!(
+                "parse_json: {row_count} input rows produced {} output rows",
+                aligned.height()
+            )));
+        }
         Ok(Box::new(PolarsEngineData::new(aligned)))
     }
 
@@ -289,7 +296,12 @@ fn extract_json_strings(data: &dyn EngineData) -> DeltaResult<Vec<String>> {
             let getter = getters[0];
             for i in 0..row_count {
                 let s: Option<&str> = getter.get_str(i, "json")?;
-                self.out.push(s.unwrap_or_default().to_string());
+                // polars drops blank NDJSON lines; `{}` keeps the row and
+                // null-fills it, matching kernel's reference decoder.
+                self.out.push(match s {
+                    Some(v) if !v.trim().is_empty() => v.to_string(),
+                    _ => "{}".to_string(),
+                });
             }
             Ok(())
         }
@@ -387,5 +399,20 @@ mod align_nullability_tests {
         let err = aligned("{\"o\":{\"m\":{}}}", &schema)
             .expect_err("present empty mid struct must error on p");
         assert!(err.to_string().contains("o.m.p"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod json_string_tests {
+    use super::*;
+
+    /// polars silently drops a blank NDJSON line, so a NULL or empty input
+    /// has to become `{}` to keep one output row per input row.
+    #[test]
+    fn null_and_blank_become_empty_objects() {
+        let df = polars::df!("json" => [Some("{\"a\":1}"), None, Some(""), Some("  ")]).unwrap();
+        let data = PolarsEngineData::new(df);
+        let out = extract_json_strings(&data).unwrap();
+        assert_eq!(out, vec!["{\"a\":1}", "{}", "{}", "{}"]);
     }
 }
