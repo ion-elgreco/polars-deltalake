@@ -27,6 +27,7 @@ use polars_utils::pl_str::PlSmallStr;
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::engine::{PolarsEngine, PolarsEngineData, path_for_polars_io, resolve_series_path};
 use crate::scan::predicate::renames_nested_fields;
+use crate::translation::from_kernel::series_value_lit;
 use crate::translation::schema::KernelDataTypeExt;
 
 /// Per-file work to apply post-read: physical→logical select + DV keep-mask.
@@ -209,12 +210,13 @@ fn partition_literals(
         .iter()
         .map(|(f, phys)| {
             let path = ColumnName::new(["add", "partitionValues_parsed", phys]);
-            resolve_series_path(df, &path).map_err(|e| {
+            let series = resolve_series_path(df, &path).map_err(|e| {
                 anyhow::anyhow!(
                     "partition column '{}' missing from parsed partition values: {e:#}",
                     f.name
                 )
-            })
+            })?;
+            Ok((series, f.data_type.to_polars()?))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -223,16 +225,9 @@ fn partition_literals(
             partition_fields
                 .iter()
                 .zip(series_per_field.iter())
-                .map(|((field, _), series)| -> anyhow::Result<Expr> {
-                    let value = series
-                        .get(row)
-                        .map_err(|e| anyhow::anyhow!("partition value read: {e:#}"))?
-                        .into_static();
-                    let scalar = polars::prelude::Scalar::new(series.dtype().clone(), value);
-                    let target = field.data_type.to_polars()?;
-                    Ok(lit(scalar)
-                        .cast(target)
-                        .alias(PlSmallStr::from_str(field.name.as_str())))
+                .map(|((field, _), (series, target))| -> anyhow::Result<Expr> {
+                    series_value_lit(series, row, target.clone(), field.name.as_str())
+                        .map_err(|e| anyhow::anyhow!("partition value read: {e:#}"))
                 })
                 .collect()
         })

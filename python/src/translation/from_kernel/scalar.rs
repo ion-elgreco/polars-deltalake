@@ -18,6 +18,20 @@ use crate::errors::to_kernel_err;
 use crate::translation::schema::KernelDataTypeExt;
 
 /// Compound scalars (Array/Map/Struct/Decimal) round-trip through
+/// `series[row]` as a literal cast to `target` and aliased to `name` — the
+/// shared row-literal builder. `target` is pre-converted so `to_polars()`
+/// stays out of row loops.
+pub(crate) fn series_value_lit(
+    series: &polars::prelude::Series,
+    row: usize,
+    target: PlDataType,
+    name: &str,
+) -> polars::prelude::PolarsResult<Expr> {
+    let value = series.get(row)?.into_static();
+    let scalar = PolarsScalar::new(series.dtype().clone(), value);
+    Ok(lit(scalar).cast(target).alias(PlSmallStr::from_str(name)))
+}
+
 /// `build_series` so an empty list stays `[]` instead of collapsing to null
 /// — non-null typed empties are load-bearing for Delta log replay.
 pub(crate) fn scalar_to_lit(scalar: &Scalar) -> Expr {

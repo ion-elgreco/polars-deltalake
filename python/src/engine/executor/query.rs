@@ -21,7 +21,7 @@ use delta_kernel::schema::{
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
     DataFrame, DataType, Expr, IntoLazy, JoinArgs, JoinType, LazyFrame, SortMultipleOptions,
-    UnionArgs, col, concat, lit,
+    UnionArgs, col, concat,
 };
 use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_path::PlRefPath;
@@ -36,7 +36,8 @@ use crate::engine::handlers::{
 use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{
-    column_path_to_expr, projection_exprs, scalar_to_lit, translate_expr, translate_predicate,
+    column_path_to_expr, projection_exprs, scalar_to_lit, series_value_lit, translate_expr,
+    translate_predicate,
 };
 use crate::translation::schema::{KernelDataTypeExt, KernelSchemaExt};
 
@@ -149,6 +150,10 @@ impl PolarsPlanExecutor {
     ) -> DeltaResult<NodeState> {
         let (read_schema, row_index) = split_scan_schema(&schema, constant_cols)?;
         let const_fields = constant_fields(&schema, constant_cols)?;
+        let const_dts: Vec<DataType> = const_fields
+            .iter()
+            .map(|f| f.data_type.to_polars().map_err(to_kernel_err))
+            .collect::<DeltaResult<_>>()?;
 
         let entries = files
             .into_iter()
@@ -160,7 +165,7 @@ impl PolarsPlanExecutor {
                         constant_cols.len()
                     )));
                 }
-                let lits = kernel_constant_lits(&f.file_constants, &const_fields)?;
+                let lits = kernel_constant_lits(&f.file_constants, &const_fields, &const_dts)?;
                 Ok(FileEntry {
                     location: f.meta.location,
                     lits,
@@ -311,6 +316,10 @@ impl PolarsPlanExecutor {
             })
             .collect::<DeltaResult<_>>()?;
         let const_fields = constant_fields(&ds.schema, &ds.file_constant_columns)?;
+        let const_dts: Vec<DataType> = const_fields
+            .iter()
+            .map(|f| f.data_type.to_polars().map_err(to_kernel_err))
+            .collect::<DeltaResult<_>>()?;
 
         let mut entries = Vec::with_capacity(df.height());
         for row in 0..df.height() {
@@ -331,14 +340,10 @@ impl PolarsPlanExecutor {
             }
             let lits = const_series
                 .iter()
-                .zip(const_fields.iter())
-                .map(|(series, field)| -> DeltaResult<Expr> {
-                    let value = series.get(row).map_err(to_kernel_err)?.into_static();
-                    let scalar = polars::prelude::Scalar::new(series.dtype().clone(), value);
-                    let dt = field.data_type.to_polars().map_err(to_kernel_err)?;
-                    Ok(lit(scalar)
-                        .cast(dt)
-                        .alias(PlSmallStr::from_str(field.name.as_str())))
+                .zip(const_fields.iter().zip(const_dts.iter()))
+                .map(|(series, (field, dt))| {
+                    series_value_lit(series, row, dt.clone(), field.name.as_str())
+                        .map_err(to_kernel_err)
                 })
                 .collect::<DeltaResult<Vec<_>>>()?;
             entries.push(FileEntry { location, lits });
@@ -406,14 +411,18 @@ fn constant_fields<'a>(
         .collect()
 }
 
-fn kernel_constant_lits(constants: &[Scalar], fields: &[&StructField]) -> DeltaResult<Vec<Expr>> {
+/// `dts` is index-aligned with `fields`, pre-converted once per scan node.
+fn kernel_constant_lits(
+    constants: &[Scalar],
+    fields: &[&StructField],
+    dts: &[DataType],
+) -> DeltaResult<Vec<Expr>> {
     constants
         .iter()
-        .zip(fields.iter())
-        .map(|(scalar, field)| -> DeltaResult<Expr> {
-            let dt = field.data_type.to_polars().map_err(to_kernel_err)?;
+        .zip(fields.iter().zip(dts.iter()))
+        .map(|(scalar, (field, dt))| -> DeltaResult<Expr> {
             Ok(scalar_to_lit(scalar)
-                .cast(dt)
+                .cast(dt.clone())
                 .alias(PlSmallStr::from_str(field.name.as_str())))
         })
         .collect()
@@ -608,7 +617,7 @@ mod scan_entries_tests {
     use std::sync::Arc;
 
     use delta_kernel::schema::DataType;
-    use polars::prelude::{DataType as PlDataType, ParquetWriter};
+    use polars::prelude::{DataType as PlDataType, ParquetWriter, lit};
 
     use super::*;
     use crate::engine::handlers::ObjectStoreStorageHandler;

@@ -32,7 +32,7 @@ mod transform;
 
 pub(crate) use expr::{column_path_to_expr, translate_expr};
 pub(crate) use predicate::translate_predicate;
-pub(crate) use scalar::{build_series, empty_typed_list_expr, scalar_to_lit};
+pub(crate) use scalar::{build_series, empty_typed_list_expr, scalar_to_lit, series_value_lit};
 
 use predicate::PolarsPredicateEvaluator;
 use scalar::try_to_polars_scalar;
