@@ -20,8 +20,8 @@ use delta_kernel::schema::{
 };
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
-    DataFrame, Expr, IntoLazy, JoinArgs, JoinType, LazyFrame, SortMultipleOptions, UnionArgs, col,
-    concat, lit,
+    DataFrame, DataType, Expr, IntoLazy, JoinArgs, JoinType, LazyFrame, SortMultipleOptions,
+    UnionArgs, col, concat, lit,
 };
 use polars_plan::dsl::{DslBuilder, Engine as PolarsEngineMode, ScanSources};
 use polars_utils::pl_path::PlRefPath;
@@ -238,7 +238,7 @@ impl PolarsPlanExecutor {
                         let df = parse_ndjson_inferred(&bytes)?;
                         let mut lf = align_lazy(df, read_schema)?;
                         if let Some(name) = &row_index {
-                            lf = lf.with_row_index(name.clone(), None);
+                            lf = row_index_as_long(lf.with_row_index(name.clone(), None), name);
                         }
                         if !e.lits.is_empty() {
                             lf = lf.with_columns(e.lits);
@@ -259,15 +259,21 @@ impl PolarsPlanExecutor {
     ) -> DeltaResult<LazyFrame> {
         let options = parquet_options(read_schema)?;
         let mut args = unified_scan_args(self.cloud_opts.as_ref(), None);
-        if let Some(name) = row_index {
-            args.row_index = Some(polars::prelude::RowIndex { name, offset: 0 });
+        if let Some(name) = &row_index {
+            args.row_index = Some(polars::prelude::RowIndex {
+                name: name.clone(),
+                offset: 0,
+            });
         }
         let lf: LazyFrame =
             DslBuilder::scan_parquet(ScanSources::Paths(paths.into()), options, args)
                 .map_err(to_kernel_err)?
                 .build()
                 .into();
-        Ok(lf)
+        Ok(match &row_index {
+            Some(name) => row_index_as_long(lf, name),
+            None => lf,
+        })
     }
 
     /// Reads files named by `input` rows. Deletion vectors are not applied
@@ -346,6 +352,12 @@ impl PolarsPlanExecutor {
         let lf = self.scan_entries(ds.file_type, entries, &read_schema, &schema, row_index)?;
         Ok(NodeState { lf, schema })
     }
+}
+
+/// Kernel's plan contract types metadata columns LONG; polars' row index
+/// is IDX_DTYPE (u32), so both scan arms cast it.
+fn row_index_as_long(lf: LazyFrame, name: &PlSmallStr) -> LazyFrame {
+    lf.with_columns([col(name.clone()).cast(DataType::Int64)])
 }
 
 /// Splits a scan output schema into the fields read from files (everything
@@ -582,31 +594,32 @@ fn non_null_by(
 }
 
 #[cfg(test)]
-mod scan_shape_tests {
+mod scan_entries_tests {
     use std::sync::Arc;
 
     use delta_kernel::schema::DataType;
+    use polars::prelude::{DataType as PlDataType, ParquetWriter};
 
     use super::*;
     use crate::engine::handlers::ObjectStoreStorageHandler;
 
-    /// Builds the parquet scan plan for two files and counts its scan nodes.
-    fn plan_scan_count(lits_per_file: [Vec<Expr>; 2]) -> usize {
+    fn executor() -> PolarsPlanExecutor {
         let url = Url::parse("file:///").unwrap();
         let rt = crate::engine::rt();
         let storage =
             Arc::new(ObjectStoreStorageHandler::new(&url, std::iter::empty(), rt).unwrap());
-        let executor = PolarsPlanExecutor::new(storage, None, rt);
+        PolarsPlanExecutor::new(storage, None, rt)
+    }
 
-        let read_schema =
-            StructType::try_new([StructField::nullable("id", DataType::LONG)]).unwrap();
-        let output_schema = Arc::new(
-            StructType::try_new([
-                StructField::nullable("id", DataType::LONG),
-                StructField::nullable("v", DataType::LONG),
-            ])
-            .unwrap(),
-        );
+    fn long_field(name: &str) -> StructField {
+        StructField::nullable(name, DataType::LONG)
+    }
+
+    /// Builds the parquet scan plan for two files and counts its scan nodes.
+    fn plan_scan_count(lits_per_file: [Vec<Expr>; 2]) -> usize {
+        let read_schema = StructType::try_new([long_field("id")]).unwrap();
+        let output_schema =
+            Arc::new(StructType::try_new([long_field("id"), long_field("v")]).unwrap());
         let entries = lits_per_file
             .into_iter()
             .enumerate()
@@ -615,7 +628,7 @@ mod scan_shape_tests {
                 lits,
             })
             .collect();
-        let lf = executor
+        let lf = executor()
             .scan_entries(
                 FileType::Parquet,
                 entries,
@@ -638,5 +651,63 @@ mod scan_shape_tests {
     fn differing_lits_scan_per_file() {
         let lits = |n| vec![lit(n).alias("v")];
         assert_eq!(plan_scan_count([lits(1i64), lits(2i64)]), 2);
+    }
+
+    /// Kernel's plan contract types metadata columns LONG; polars' native
+    /// row index is IDX_DTYPE (u32). Both scan arms and the empty branch
+    /// must agree on Int64.
+    #[test]
+    fn row_index_is_long() {
+        let dir = std::env::temp_dir().join(format!("pldl-rowidx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pq = dir.join("f.parquet");
+        let mut df = polars::df!("id" => [1i64, 2, 3]).unwrap();
+        ParquetWriter::new(std::fs::File::create(&pq).unwrap())
+            .finish(&mut df)
+            .unwrap();
+        let json = dir.join("f.json");
+        std::fs::write(&json, "{\"id\": 1}\n{\"id\": 2}\n{\"id\": 3}\n").unwrap();
+
+        let read_schema = StructType::try_new([long_field("id")]).unwrap();
+        let output_schema =
+            Arc::new(StructType::try_new([long_field("id"), long_field("ridx")]).unwrap());
+        let executor = executor();
+
+        for (file_type, path) in [(FileType::Parquet, &pq), (FileType::Json, &json)] {
+            let entries = vec![FileEntry {
+                location: Url::from_file_path(path).unwrap(),
+                lits: vec![],
+            }];
+            let df = executor
+                .scan_entries(
+                    file_type,
+                    entries,
+                    &read_schema,
+                    &output_schema,
+                    Some("ridx".into()),
+                )
+                .unwrap()
+                .collect()
+                .unwrap();
+            let ridx = df.column("ridx").unwrap();
+            assert_eq!(ridx.dtype(), &PlDataType::Int64);
+            assert_eq!(
+                ridx.i64().unwrap().iter().flatten().collect::<Vec<_>>(),
+                [0, 1, 2]
+            );
+        }
+
+        let empty = executor
+            .scan_entries(
+                FileType::Parquet,
+                vec![],
+                &read_schema,
+                &output_schema,
+                Some("ridx".into()),
+            )
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(empty.column("ridx").unwrap().dtype(), &PlDataType::Int64);
     }
 }
