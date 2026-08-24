@@ -519,6 +519,11 @@ class TestMixedAtomicConjunct:
 
 
 class TestDeletionVectors:
+    """`deltalake` never writes deletion vectors — it rewrites the file even
+    with `delta.enableDeletionVectors` set — so the three DELETE tests below
+    exercise the rewrite path, not the keep-mask, whatever their names
+    suggest. `test_dv_with_predicate` reaches it via the DAT fixture."""
+
     def test_delete_via_rewrite(self, tmp_path):
         """Plain DELETE (no DV protocol) — deltalake rewrites the file."""
         from deltalake import DeltaTable, write_deltalake
