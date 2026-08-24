@@ -57,8 +57,9 @@ python/
 ├── polars_deltalake/        # Python entry points: scan_delta / read_delta
 ├── src/
 │   ├── lib.rs               # pyo3 module wiring
-│   ├── scan.rs              # DeltaSource pyclass, the io-plugin source
+│   ├── scan/                # DeltaSource pyclass, the io-plugin source
 │   ├── engine/              # custom delta_kernel::Engine (no default-engine)
+│   │   ├── executor/        # PlanExecutor: kernel query plans → LazyFrame
 │   │   └── handlers/        # ParquetHandler / JsonHandler / StorageHandler
 │   │                        # built on polars-io + object_store
 │   └── translation/         # polars-Expr ↔ kernel-Predicate + schema bridge

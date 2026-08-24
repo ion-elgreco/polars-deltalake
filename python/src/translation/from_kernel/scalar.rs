@@ -46,8 +46,8 @@ pub(crate) fn scalar_to_lit(scalar: &Scalar) -> Expr {
         Scalar::Double(v) => lit(*v),
         Scalar::Boolean(v) => lit(*v),
         Scalar::Date(v) => lit(polars::prelude::Scalar::new_date(*v)),
-        // Typed literal sidesteps a polars-0.53 cast-folding path that drops
-        // the timezone when this scalar is embedded in `as_struct`.
+        // Typed literal sidesteps a polars cast-folding path that drops the
+        // timezone when this scalar is embedded in `as_struct`.
         Scalar::Timestamp(v) => lit(polars::prelude::Scalar::new_datetime(
             *v,
             polars::prelude::TimeUnit::Microseconds,

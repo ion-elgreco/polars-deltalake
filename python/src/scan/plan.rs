@@ -239,8 +239,6 @@ fn partition_literals(
         .collect()
 }
 
-/// Logical-order select list: partition literals in place, physical→logical
-/// renames for data columns.
 /// Rename nested struct fields to their logical names; `None` if nothing
 /// below `dtype` is renamed.
 ///
@@ -291,6 +289,8 @@ fn logical_names(expr: Expr, dtype: &KernelDataType, mode: ColumnMappingMode) ->
     Some(renamed)
 }
 
+/// Logical-order select list: partition literals in place, physical→logical
+/// renames for data columns.
 fn build_select(
     sources: &[(&StructField, FieldSource)],
     lits: Vec<Expr>,

@@ -1,6 +1,6 @@
 //! `delta_kernel::StorageHandler` over `object_store`. Kernel is sync and
 //! `object_store` is async, so every method `block_on`s the engine's
-//! shared tokio runtime. Mirrors kernel 0.23's `default-engine`
+//! shared tokio runtime. Mirrors kernel's `default-engine`
 //! `ObjectStoreStorageHandler` so behaviour stays aligned.
 
 use std::sync::Arc;

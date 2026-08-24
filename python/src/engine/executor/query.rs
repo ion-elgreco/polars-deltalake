@@ -132,9 +132,9 @@ impl PolarsPlanExecutor {
         }
     }
 
-    /// Reads `files` as `file_type`. Constant columns are broadcast as
-    /// typed literals; every frame is shaped to `schema` order before the
-    /// union so vertical concat sees identical schemas.
+    /// Constant columns are broadcast as typed literals; every frame is
+    /// shaped to `schema` order before the union so vertical concat sees
+    /// identical schemas.
     fn eval_scan(
         &self,
         file_type: FileType,
@@ -635,7 +635,6 @@ mod scan_entries_tests {
         StructField::nullable(name, DataType::LONG)
     }
 
-    /// Builds the parquet scan plan for two files and counts its scan nodes.
     fn plan_scan_count(lits_per_file: [Vec<Expr>; 2]) -> usize {
         let read_schema = StructType::try_new([long_field("id")]).unwrap();
         let output_schema =
