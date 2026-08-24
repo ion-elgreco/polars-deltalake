@@ -29,8 +29,9 @@ use polars_utils::pl_str::PlSmallStr;
 use url::Url;
 
 use crate::engine::data::resolve_path;
-use crate::engine::handlers::{align_lazy, parse_ndjson_inferred, parquet_options,
-    path_for_polars_io, unified_scan_args};
+use crate::engine::handlers::{
+    align_lazy, parquet_options, parse_ndjson_inferred, path_for_polars_io, unified_scan_args,
+};
 use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{
@@ -149,14 +150,6 @@ impl PolarsPlanExecutor {
         let (read_schema, row_index) = split_scan_schema(&schema, constant_cols)?;
         let const_fields = constant_fields(&schema, constant_cols)?;
 
-        // All-constants-equal (incl. the no-constants case) lets parquet use
-        // one multi-file scan, keeping polars-io's cross-file parallelism —
-        // the multi-part-checkpoint shape. Commit JSONs differ per file
-        // (`version`), so they take the per-file path.
-        let uniform = files
-            .windows(2)
-            .all(|w| w[0].file_constants == w[1].file_constants);
-
         let entries = files
             .into_iter()
             .map(|f| {
@@ -175,14 +168,7 @@ impl PolarsPlanExecutor {
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
-        let lf = self.scan_entries(
-            file_type,
-            entries,
-            uniform,
-            &read_schema,
-            &schema,
-            row_index,
-        )?;
+        let lf = self.scan_entries(file_type, entries, &read_schema, &schema, row_index)?;
         Ok(NodeState { lf, schema })
     }
 
@@ -190,7 +176,6 @@ impl PolarsPlanExecutor {
         &self,
         file_type: FileType,
         entries: Vec<FileEntry>,
-        uniform_constants: bool,
         read_schema: &StructType,
         output_schema: &SchemaRef,
         row_index: Option<PlSmallStr>,
@@ -203,6 +188,10 @@ impl PolarsPlanExecutor {
             );
             return Ok(empty.lazy());
         }
+
+        // Equal per-file lits (checkpoint parts, V2 sidecars) collapse into
+        // one multi-file scan, keeping polars-io's cross-file parallelism.
+        let uniform_constants = entries.windows(2).all(|w| w[0].lits == w[1].lits);
 
         let frames: Vec<LazyFrame> = match file_type {
             FileType::Parquet if uniform_constants && row_index.is_none() => {
@@ -221,7 +210,8 @@ impl PolarsPlanExecutor {
                 .into_iter()
                 .map(|e| {
                     let path = path_for_polars_io(&e.location)?;
-                    let mut lf = self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
+                    let mut lf =
+                        self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
                     if !e.lits.is_empty() {
                         lf = lf.with_columns(e.lits);
                     }
@@ -272,10 +262,11 @@ impl PolarsPlanExecutor {
         if let Some(name) = row_index {
             args.row_index = Some(polars::prelude::RowIndex { name, offset: 0 });
         }
-        let lf: LazyFrame = DslBuilder::scan_parquet(ScanSources::Paths(paths.into()), options, args)
-            .map_err(to_kernel_err)?
-            .build()
-            .into();
+        let lf: LazyFrame =
+            DslBuilder::scan_parquet(ScanSources::Paths(paths.into()), options, args)
+                .map_err(to_kernel_err)?
+                .build()
+                .into();
         Ok(lf)
     }
 
@@ -320,9 +311,9 @@ impl PolarsPlanExecutor {
 
         let mut entries = Vec::with_capacity(df.height());
         for row in 0..df.height() {
-            let rel = path.get(row).ok_or_else(|| {
-                Error::Generic("DynamicScan path must not be null".into())
-            })?;
+            let rel = path
+                .get(row)
+                .ok_or_else(|| Error::Generic("DynamicScan path must not be null".into()))?;
             let location = ds
                 .base_url
                 .join(rel)
@@ -352,7 +343,7 @@ impl PolarsPlanExecutor {
 
         let (read_schema, row_index) = split_scan_schema(&ds.schema, &ds.file_constant_columns)?;
         let schema = ds.schema.clone();
-        let lf = self.scan_entries(ds.file_type, entries, false, &read_schema, &schema, row_index)?;
+        let lf = self.scan_entries(ds.file_type, entries, &read_schema, &schema, row_index)?;
         Ok(NodeState { lf, schema })
     }
 }
@@ -406,10 +397,7 @@ fn constant_fields<'a>(
         .collect()
 }
 
-fn kernel_constant_lits(
-    constants: &[Scalar],
-    fields: &[&StructField],
-) -> DeltaResult<Vec<Expr>> {
+fn kernel_constant_lits(constants: &[Scalar], fields: &[&StructField]) -> DeltaResult<Vec<Expr>> {
     constants
         .iter()
         .zip(fields.iter())
@@ -586,5 +574,69 @@ fn non_null_by(
     let sorted = v
         .filter(keep.clone())
         .sort_by([k.filter(keep)], SortMultipleOptions::default());
-    if ascending { sorted.first() } else { sorted.last() }
+    if ascending {
+        sorted.first()
+    } else {
+        sorted.last()
+    }
+}
+
+#[cfg(test)]
+mod scan_shape_tests {
+    use std::sync::Arc;
+
+    use delta_kernel::schema::DataType;
+
+    use super::*;
+    use crate::engine::handlers::ObjectStoreStorageHandler;
+
+    /// Builds the parquet scan plan for two files and counts its scan nodes.
+    fn plan_scan_count(lits_per_file: [Vec<Expr>; 2]) -> usize {
+        let url = Url::parse("file:///").unwrap();
+        let rt = crate::engine::rt();
+        let storage =
+            Arc::new(ObjectStoreStorageHandler::new(&url, std::iter::empty(), rt).unwrap());
+        let executor = PolarsPlanExecutor::new(storage, None, rt);
+
+        let read_schema =
+            StructType::try_new([StructField::nullable("id", DataType::LONG)]).unwrap();
+        let output_schema = Arc::new(
+            StructType::try_new([
+                StructField::nullable("id", DataType::LONG),
+                StructField::nullable("v", DataType::LONG),
+            ])
+            .unwrap(),
+        );
+        let entries = lits_per_file
+            .into_iter()
+            .enumerate()
+            .map(|(i, lits)| FileEntry {
+                location: Url::parse(&format!("file:///t/{i}.parquet")).unwrap(),
+                lits,
+            })
+            .collect();
+        let lf = executor
+            .scan_entries(
+                FileType::Parquet,
+                entries,
+                &read_schema,
+                &output_schema,
+                None,
+            )
+            .unwrap();
+        format!("{:?}", lf.logical_plan).matches("Scan {").count()
+    }
+
+    /// The DynamicScan sidecar shape: identical constants across files.
+    #[test]
+    fn equal_lits_collapse_to_one_multifile_scan() {
+        let lits = || vec![lit(7i64).alias("v")];
+        assert_eq!(plan_scan_count([lits(), lits()]), 1);
+    }
+
+    #[test]
+    fn differing_lits_scan_per_file() {
+        let lits = |n| vec![lit(n).alias("v")];
+        assert_eq!(plan_scan_count([lits(1i64), lits(2i64)]), 2);
+    }
 }
