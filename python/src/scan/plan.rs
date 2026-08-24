@@ -209,6 +209,8 @@ fn partition_literals(
         return Ok(vec![Vec::new(); row_count]);
     }
 
+    // Cast per field, not per row: the per-row literals then carry the
+    // output dtype already and stay plain literals.
     let series_per_field = partition_fields
         .iter()
         .map(|(f, phys)| {
@@ -219,7 +221,7 @@ fn partition_literals(
                     f.name
                 )
             })?;
-            Ok((series, f.data_type.to_polars()?))
+            Ok(series.cast(&f.data_type.to_polars()?)?)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -228,8 +230,8 @@ fn partition_literals(
             partition_fields
                 .iter()
                 .zip(series_per_field.iter())
-                .map(|((field, _), (series, target))| -> anyhow::Result<Expr> {
-                    series_value_lit(series, row, target.clone(), field.name.as_str())
+                .map(|((field, _), series)| -> anyhow::Result<Expr> {
+                    series_value_lit(series, row, field.name.as_str())
                         .map_err(|e| anyhow::anyhow!("partition value read: {e:#}"))
                 })
                 .collect()

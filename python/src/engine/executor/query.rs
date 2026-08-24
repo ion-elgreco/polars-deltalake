@@ -307,18 +307,18 @@ impl PolarsPlanExecutor {
         let size = resolve_path(&df, &ds.file_size_column).map_err(to_kernel_err)?;
         let size = size.i64().map_err(to_kernel_err)?;
 
+        let const_fields = constant_fields(&ds.schema, &ds.file_constant_columns)?;
+        // Cast per column, not per row, so the row loop only reads values.
         let const_series: Vec<polars::prelude::Series> = ds
             .file_constant_columns
             .iter()
-            .map(|name| {
-                resolve_path(&df, &delta_kernel::expressions::ColumnName::new([name]))
-                    .map_err(to_kernel_err)
+            .zip(const_fields.iter())
+            .map(|(name, field)| {
+                let series = resolve_path(&df, &delta_kernel::expressions::ColumnName::new([name]))
+                    .map_err(to_kernel_err)?;
+                let dt = field.data_type.to_polars().map_err(to_kernel_err)?;
+                series.cast(&dt).map_err(to_kernel_err)
             })
-            .collect::<DeltaResult<_>>()?;
-        let const_fields = constant_fields(&ds.schema, &ds.file_constant_columns)?;
-        let const_dts: Vec<DataType> = const_fields
-            .iter()
-            .map(|f| f.data_type.to_polars().map_err(to_kernel_err))
             .collect::<DeltaResult<_>>()?;
 
         let mut entries = Vec::with_capacity(df.height());
@@ -340,10 +340,9 @@ impl PolarsPlanExecutor {
             }
             let lits = const_series
                 .iter()
-                .zip(const_fields.iter().zip(const_dts.iter()))
-                .map(|(series, (field, dt))| {
-                    series_value_lit(series, row, dt.clone(), field.name.as_str())
-                        .map_err(to_kernel_err)
+                .zip(const_fields.iter())
+                .map(|(series, field)| {
+                    series_value_lit(series, row, field.name.as_str()).map_err(to_kernel_err)
                 })
                 .collect::<DeltaResult<Vec<_>>>()?;
             entries.push(FileEntry { location, lits });

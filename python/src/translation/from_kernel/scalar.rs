@@ -17,21 +17,22 @@ use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::errors::to_kernel_err;
 use crate::translation::schema::KernelDataTypeExt;
 
-/// Compound scalars (Array/Map/Struct/Decimal) round-trip through
-/// `series[row]` as a literal cast to `target` and aliased to `name` — the
-/// shared row-literal builder. `target` is pre-converted so `to_polars()`
-/// stays out of row loops.
+/// `series[row]` as a typed literal aliased to `name` — the shared
+/// row-literal builder. `series` must already carry the output dtype: the
+/// cast belongs on the series once, not on every row's literal, and a bare
+/// literal is what the scan's fast path reads back without a polars round
+/// trip.
 pub(crate) fn series_value_lit(
     series: &polars::prelude::Series,
     row: usize,
-    target: PlDataType,
     name: &str,
 ) -> polars::prelude::PolarsResult<Expr> {
     let value = series.get(row)?.into_static();
     let scalar = PolarsScalar::new(series.dtype().clone(), value);
-    Ok(lit(scalar).cast(target).alias(PlSmallStr::from_str(name)))
+    Ok(lit(scalar).alias(PlSmallStr::from_str(name)))
 }
 
+/// Compound scalars (Array/Map/Struct/Decimal) round-trip through
 /// `build_series` so an empty list stays `[]` instead of collapsing to null
 /// — non-null typed empties are load-bearing for Delta log replay.
 pub(crate) fn scalar_to_lit(scalar: &Scalar) -> Expr {
