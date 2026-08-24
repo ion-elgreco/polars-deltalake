@@ -104,10 +104,13 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
     // schema, including stale `physicalName` annotations under mode `none`.
     let mode = scan.snapshot().table_configuration().column_mapping_mode();
     let sources = field_sources(scan.logical_schema(), scan.physical_schema(), mode);
-    // Identity frames need no per-file select at all.
+    // Identity frames need no per-file select at all. Nested renames count:
+    // a top-level name can survive column mapping while a child does not.
     let needs_select = sources.iter().any(|(f, s)| match s {
         FieldSource::Partition { .. } => true,
-        FieldSource::Data { physical } => physical != f.name.as_str(),
+        FieldSource::Data { physical } => {
+            physical != f.name.as_str() || renames_nested_fields(&f.data_type, mode)
+        }
     });
 
     let storage = engine.storage_handler();
