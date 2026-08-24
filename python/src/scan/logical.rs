@@ -3,11 +3,99 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use polars::prelude::{BooleanChunked, DataFrame, Expr, IntoLazy, NamedFrom, StringChunked};
+use polars::prelude::{
+    BooleanChunked, Column, DataFrame, Expr, IntoLazy, NamedFrom, PolarsResult, Scalar,
+    StringChunked,
+};
 use polars_plan::dsl::Engine as PolarsEngineMode;
+use polars_utils::pl_str::PlSmallStr;
 
 use crate::scan::plan::{DvState, LogicalRewrite};
 use crate::scan::read::FILE_ID_COL;
+
+/// One column of a pre-parsed simple select: a rename of a read column or a
+/// broadcast literal (partition value).
+enum SimpleOp {
+    Rename { from: PlSmallStr, to: PlSmallStr },
+    Broadcast { name: PlSmallStr, value: Scalar },
+}
+
+/// Real-world `LogicalRewrite` selects are renames + partition literals, so
+/// they apply as direct column ops — no per-batch plan build / streaming
+/// collect. Anything else (nested column-mapping rebuilds) falls back to
+/// the lazy path.
+pub(crate) struct SimpleSelect {
+    ops: Vec<SimpleOp>,
+}
+
+impl SimpleSelect {
+    /// `None` when any expr is not a plain rename or a column-free literal.
+    pub(crate) fn parse(exprs: &[Expr]) -> Option<Self> {
+        let mut ops = Vec::with_capacity(exprs.len());
+        let mut literal_exprs: Vec<Expr> = Vec::new();
+        for expr in exprs {
+            match expr {
+                Expr::Column(name) => ops.push(SimpleOp::Rename {
+                    from: name.clone(),
+                    to: name.clone(),
+                }),
+                Expr::Alias(inner, to) => match inner.as_ref() {
+                    Expr::Column(from) => ops.push(SimpleOp::Rename {
+                        from: from.clone(),
+                        to: to.clone(),
+                    }),
+                    _ if polars_plan::utils::expr_to_leaf_column_names(inner).is_empty() => {
+                        literal_exprs.push(expr.clone());
+                        ops.push(SimpleOp::Broadcast {
+                            name: to.clone(),
+                            // Placeholder; filled from the one-shot eval below.
+                            value: Scalar::null(polars::prelude::DataType::Null),
+                        });
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        if !literal_exprs.is_empty() {
+            // One evaluation for all literal exprs (partition parsing may
+            // run a UDF); per-batch application is then a pure broadcast.
+            let evaluated = DataFrame::empty()
+                .lazy()
+                .select(literal_exprs)
+                .collect()
+                .ok()?;
+            let mut cols = evaluated.columns().iter();
+            for op in &mut ops {
+                if let SimpleOp::Broadcast { value, .. } = op {
+                    let col = cols.next()?;
+                    let av = col.get(0).ok()?.into_static();
+                    *value = Scalar::new(col.dtype().clone(), av);
+                }
+            }
+        }
+        Some(Self { ops })
+    }
+
+    pub(crate) fn apply(&self, df: &DataFrame) -> PolarsResult<DataFrame> {
+        let height = df.height();
+        let cols: Vec<Column> = self
+            .ops
+            .iter()
+            .map(|op| match op {
+                SimpleOp::Rename { from, to } => df.column(from).map(|c| {
+                    let mut c = c.clone();
+                    c.rename(to.clone());
+                    c
+                }),
+                SimpleOp::Broadcast { name, value } => {
+                    Ok(Column::new_scalar(name.clone(), value.clone(), height))
+                }
+            })
+            .collect::<PolarsResult<_>>()?;
+        DataFrame::new(height, cols)
+    }
+}
 
 /// Splits each bulk-read frame on `FILE_ID_COL` runs and applies the
 /// per-file `LogicalRewrite`, yielding logical-schema frames in scan order.
@@ -21,6 +109,9 @@ pub(crate) struct LogicalScanIter {
     /// Mixed atomic conjuncts (touching both partition and data cols) —
     /// applied after the select list materializes partition values.
     orphan_predicate: Option<Expr>,
+    /// Index-aligned with `rewrites`: the pre-parsed fast path for each
+    /// select list, when it qualifies and no orphan predicate exists.
+    simple: Vec<Option<SimpleSelect>>,
     /// One inner frame may span multiple files; we slice into per-file
     /// frames here and drain before pulling the next inner frame.
     pending: VecDeque<Result<DataFrame, delta_kernel::Error>>,
@@ -33,11 +124,19 @@ impl LogicalScanIter {
         rewrites: Vec<LogicalRewrite>,
         orphan_predicate: Option<Expr>,
     ) -> Self {
+        let simple = rewrites
+            .iter()
+            .map(|r| match (&r.select, &orphan_predicate) {
+                (Some(select), None) => SimpleSelect::parse(select),
+                _ => None,
+            })
+            .collect();
         Self {
             source,
             path_index,
             rewrites,
             orphan_predicate,
+            simple,
             pending: VecDeque::new(),
         }
     }
@@ -105,7 +204,11 @@ impl LogicalScanIter {
                 .map_err(|e| delta_kernel::Error::Generic(format!("DV filter: {e}")))?;
         }
 
-        if rewrite.select.is_some() || self.orphan_predicate.is_some() {
+        if let Some(fast) = &self.simple[idx] {
+            df = fast
+                .apply(&df)
+                .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))?;
+        } else if rewrite.select.is_some() || self.orphan_predicate.is_some() {
             let mut lazy = df.lazy();
             if let Some(select) = &rewrite.select {
                 lazy = lazy.select(select.clone());
@@ -177,5 +280,35 @@ impl Iterator for LogicalScanIter {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod simple_select_tests {
+    use polars::prelude::{IntoLazy, col, df, lit};
+
+    use super::*;
+
+    fn exprs() -> Vec<Expr> {
+        vec![col("phys").alias("logical"), lit(7i64).alias("part")]
+    }
+
+    #[test]
+    fn parses_renames_and_literals() {
+        assert!(SimpleSelect::parse(&exprs()).is_some());
+        let rebuild = col("a").struct_().field_by_name("x").alias("y");
+        assert!(SimpleSelect::parse(&[rebuild]).is_none());
+    }
+
+    /// The fast path must be indistinguishable from the lazy select.
+    #[test]
+    fn fast_apply_matches_lazy_select() {
+        let frame = df!("phys" => [1i64, 2], "extra" => ["a", "b"]).unwrap();
+        let fast = SimpleSelect::parse(&exprs())
+            .unwrap()
+            .apply(&frame)
+            .unwrap();
+        let lazy = frame.lazy().select(exprs()).collect().unwrap();
+        assert!(fast.equals_missing(&lazy), "{fast:?} vs {lazy:?}");
     }
 }
