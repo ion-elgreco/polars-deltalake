@@ -319,7 +319,6 @@ fn build_select(
 fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<AddRow>> {
     struct Visitor {
         rows: Vec<AddRow>,
-        err: Option<anyhow::Error>,
     }
 
     fn names_and_types() -> &'static (Vec<ColumnName>, Vec<KernelDataType>) {
@@ -364,8 +363,9 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
             for i in 0..row_count {
                 let path: Option<&str> = getters[0].get_str(i, "add.path")?;
                 let Some(path) = path else {
-                    self.err = Some(anyhow::anyhow!("metadata plan emitted a null add.path"));
-                    return Ok(());
+                    return Err(delta_kernel::Error::Generic(
+                        "metadata plan emitted a null add.path".into(),
+                    ));
                 };
                 let partition_values = getters[1]
                     .get_map(i, "add.partitionValues")?
@@ -417,14 +417,9 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
 
     let mut visitor = Visitor {
         rows: Vec::with_capacity(batch.len()),
-        err: None,
     };
-    let (names, _) = names_and_types();
-    batch
-        .visit_rows(names.as_slice(), &mut visitor)
+    visitor
+        .visit_rows_of(batch)
         .map_err(|e| anyhow::anyhow!("add-row visit failed: {e:#}"))?;
-    if let Some(e) = visitor.err {
-        return Err(e);
-    }
     Ok(visitor.rows)
 }
