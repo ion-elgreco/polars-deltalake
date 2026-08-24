@@ -20,8 +20,8 @@ use delta_kernel::schema::{
 };
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
-    DataFrame, DataType, Expr, IntoLazy, JoinArgs, JoinType, LazyFrame, SortMultipleOptions,
-    UnionArgs, col, concat,
+    DataFrame, DataType, Expr, IntoLazy, JoinArgs, JoinType, LazyFrame, MaintainOrderJoin,
+    SortMultipleOptions, UnionArgs, col, concat,
 };
 use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_path::PlRefPath;
@@ -536,6 +536,9 @@ fn eval_semi_join(join: SemiJoin, probe: &NodeState, build: &NodeState) -> Delta
     // equal — `nulls_equal` matches that, not SQL join semantics.
     let mut args = JoinArgs::new(how);
     args.nulls_equal = true;
+    // The plan's checkpoint anti-join feeds scan file order; the default
+    // `None` would randomize it per run.
+    args.maintain_order = MaintainOrderJoin::Left;
     let lf = probe
         .lf
         .clone()
