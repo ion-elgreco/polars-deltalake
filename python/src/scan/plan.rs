@@ -293,10 +293,10 @@ fn logical_names(expr: Expr, dtype: &KernelDataType, mode: ColumnMappingMode) ->
 
 fn build_select(
     sources: &[(&StructField, FieldSource)],
-    mut lits: Vec<Expr>,
+    lits: Vec<Expr>,
     mode: ColumnMappingMode,
 ) -> Vec<Expr> {
-    let mut lit_iter = lits.drain(..);
+    let mut lit_iter = lits.into_iter();
     sources
         .iter()
         .map(|(field, source)| match source {
