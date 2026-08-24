@@ -87,7 +87,8 @@ fn translate_binary_predicate(
         BinaryPredicateOp::Equal => lhs.eq(rhs),
         // Direct null-aware inequality — matches kernel's Distinct semantics 1:1.
         BinaryPredicateOp::Distinct => lhs.neq_missing(rhs),
-        BinaryPredicateOp::In => lhs.is_in(rhs, false),
+        // Kernel defines IN as false for a NULL probe, not SQL's NULL.
+        BinaryPredicateOp::In => lhs.is_in(rhs, false).fill_null(lit(false)),
     })
 }
 
@@ -110,4 +111,43 @@ fn translate_junction_predicate(
             JunctionPredicateOp::Or => acc.or(n),
         })
     })
+}
+
+#[cfg(test)]
+mod in_null_tests {
+    use delta_kernel::expressions::ColumnName;
+    use polars::prelude::{AnyValue, IntoLazy};
+
+    use super::*;
+
+    /// Kernel defines IN as false for a NULL probe; SQL-style NULL would
+    /// flip `NOT(x IN ...)` from keep to drop.
+    #[test]
+    fn null_probe_evaluates_false() {
+        let lines = concat!(
+            "{\"x\":1,\"r\":[1,2]}\n",
+            "{\"x\":null,\"r\":[1,2]}\n",
+            "{\"x\":5,\"r\":[1,2]}\n",
+        );
+        let df = crate::engine::parse_ndjson_inferred(lines.as_bytes()).unwrap();
+        let pred = Predicate::Binary(BinaryPredicate {
+            op: BinaryPredicateOp::In,
+            left: Box::new(delta_kernel::expressions::Expression::from(
+                ColumnName::new(["x"]),
+            )),
+            right: Box::new(delta_kernel::expressions::Expression::from(
+                ColumnName::new(["r"]),
+            )),
+        });
+        let expr = translate_predicate(&pred, None).unwrap();
+        let out = df.lazy().select([expr.alias("out")]).collect().unwrap();
+        let col = out.column("out").unwrap();
+        assert_eq!(col.get(0).unwrap(), AnyValue::Boolean(true));
+        assert_eq!(
+            col.get(1).unwrap(),
+            AnyValue::Boolean(false),
+            "NULL probe must be false, not NULL"
+        );
+        assert_eq!(col.get(2).unwrap(), AnyValue::Boolean(false));
+    }
 }
