@@ -4,9 +4,7 @@
 //! fields. Output ordering must match the declared output struct
 //! position-by-position — see [`translate_transform`].
 
-use delta_kernel::expressions::{
-    ColumnName, Expression, ExpressionFieldPatch, ExpressionRef, ExpressionStructPatch,
-};
+use delta_kernel::expressions::{ColumnName, Expression, ExpressionRef, ExpressionStructPatch};
 use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::as_struct as polars_as_struct;
@@ -71,13 +69,14 @@ pub(super) fn walk_transform_slots<'a>(
     }
 
     for (input_idx, input_field) in input_fields.iter().enumerate() {
-        let op = classify_input_op(t.field_patches.get(input_field.name.as_str()));
-        let (passes_through, inserts) = match op {
-            InputFieldOp::Keep => (true, &[][..]),
-            InputFieldOp::KeepThenInsert(exprs) => (true, exprs),
-            InputFieldOp::Drop => (false, &[][..]),
-            InputFieldOp::ReplaceWith(exprs) => (false, exprs),
-        };
+        // No entry keeps the field; an entry keeps it only when `keep_input`,
+        // and its insertions land after the field's output position. Keeping
+        // nothing and inserting nothing drops the field.
+        let (passes_through, inserts): (bool, &[ExpressionRef]) =
+            match t.field_patches.get(input_field.name.as_str()) {
+                None => (true, &[]),
+                Some(p) => (p.keep_input, &p.insertions),
+            };
         if passes_through {
             slots.push(TransformSlot::Passthrough {
                 input_idx,
@@ -159,22 +158,6 @@ pub(super) fn translate_transform(
         Some(root) => null_gated(root.clone().is_not_null(), rebuilt),
         None => rebuilt,
     })
-}
-
-enum InputFieldOp<'a> {
-    Keep,
-    KeepThenInsert(&'a [ExpressionRef]),
-    Drop,
-    ReplaceWith(&'a [ExpressionRef]),
-}
-
-fn classify_input_op(patch: Option<&ExpressionFieldPatch>) -> InputFieldOp<'_> {
-    match patch {
-        None => InputFieldOp::Keep,
-        Some(p) if p.keep_input => InputFieldOp::KeepThenInsert(&p.insertions),
-        Some(p) if p.insertions.is_empty() => InputFieldOp::Drop,
-        Some(p) => InputFieldOp::ReplaceWith(&p.insertions),
-    }
 }
 
 fn descend_struct_path<'a>(root: &'a StructType, path: &ColumnName) -> DeltaResult<&'a StructType> {
