@@ -205,10 +205,13 @@ impl StorageHandler for ObjectStoreStorageHandler {
         let p = self.url_to_path(path)?;
         let store = self.store.clone();
         self.rt.block_on(async move {
-            store.delete(&p).await.map_err(|e| match e {
-                object_store::Error::NotFound { .. } => Error::FileNotFound(p.to_string()),
-                other => Error::Generic(format!("object_store delete failed: {other}")),
-            })
+            match store.delete(&p).await {
+                // The trait documents delete as idempotent.
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(other) => Err(Error::Generic(format!(
+                    "object_store delete failed: {other}"
+                ))),
+            }
         })
     }
 
@@ -304,4 +307,23 @@ fn supports_ordered_listing(url: &Url) -> bool {
     !((url.scheme() == "file")
         || url.domain().map(|d| d.contains("--x-s3")).unwrap_or(false)
         || url.domain().map(|d| d.contains("-xa-s3")).unwrap_or(false))
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+
+    /// The trait documents delete as idempotent: a missing path is `Ok`.
+    #[test]
+    fn delete_missing_path_is_ok() {
+        use delta_kernel::StorageHandler;
+
+        let dir = std::env::temp_dir().join(format!("pldl-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = Url::from_directory_path(&dir).unwrap();
+        let storage =
+            ObjectStoreStorageHandler::new(&base, std::iter::empty(), crate::engine::rt()).unwrap();
+        let missing = base.join("nope.json").unwrap();
+        storage.delete(&missing).expect("idempotent delete");
+    }
 }
