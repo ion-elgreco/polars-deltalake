@@ -232,6 +232,10 @@ impl PolarsPlanExecutor {
                 // Whole-file fetches in one parallel `read_files` batch;
                 // NDJSON parse per file. The align select stays lazy so only
                 // the raw parses are pinned until the terminal collect.
+                // TODO: fetch+parse are still eager per file. Deferring them
+                // into the pipeline (restoring kernel's P&M early-out) needs
+                // AnonymousScan under the streaming engine; polars-stream
+                // `todo!()`s on `FileScanIR::Anonymous` through 0.55.2.
                 let slices = entries.iter().map(|e| (e.location.clone(), None)).collect();
                 let payloads: Vec<bytes::Bytes> = self
                     .storage
