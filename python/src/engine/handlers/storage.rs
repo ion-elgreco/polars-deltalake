@@ -301,10 +301,12 @@ async fn fetch_presigned(url: Url, range: Option<std::ops::Range<u64>>) -> Delta
 
 /// Kernel-aligned: `true` iff `object_store::list` is guaranteed to return
 /// lexicographically-ordered results for this URL. False for local fs
-/// (`LocalFileSystem` lists in filesystem order) and S3 directory buckets
-/// (`*--x-s3`, `*-xa-s3`); true for general-purpose S3 / GCS / Azure.
+/// (`LocalFileSystem` lists in filesystem order), for HTTP/WebDAV
+/// (`HttpStore` streams PROPFIND entries in server order), and for S3
+/// directory buckets (`*--x-s3`, `*-xa-s3`); true for general-purpose
+/// S3 / GCS / Azure.
 fn supports_ordered_listing(url: &Url) -> bool {
-    !((url.scheme() == "file")
+    !(matches!(url.scheme(), "file" | "http" | "https")
         || url.domain().map(|d| d.contains("--x-s3")).unwrap_or(false)
         || url.domain().map(|d| d.contains("-xa-s3")).unwrap_or(false))
 }
@@ -325,5 +327,25 @@ mod delete_tests {
             ObjectStoreStorageHandler::new(&base, std::iter::empty(), crate::engine::rt()).unwrap();
         let missing = base.join("nope.json").unwrap();
         storage.delete(&missing).expect("idempotent delete");
+    }
+}
+
+#[cfg(test)]
+mod listing_order_tests {
+    use super::*;
+
+    /// Kernel relies on the ordering claim for log-segment discovery, so a
+    /// store that lists in server order must report `false` and get sorted.
+    #[test]
+    fn unordered_schemes_report_false() {
+        let claims = |u: &str| supports_ordered_listing(&Url::parse(u).unwrap());
+        // HttpStore streams PROPFIND entries in server order.
+        assert!(!claims("http://host/tbl"));
+        assert!(!claims("https://host/tbl"));
+        assert!(!claims("file:///tmp/tbl"));
+        assert!(!claims("s3://bucket--x-s3/tbl"));
+        // General-purpose object stores do list lexicographically.
+        assert!(claims("s3://bucket/tbl"));
+        assert!(claims("gs://bucket/tbl"));
     }
 }
