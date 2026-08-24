@@ -180,7 +180,7 @@ impl PolarsPlanExecutor {
         output_schema: &SchemaRef,
         row_index: Option<PlSmallStr>,
     ) -> DeltaResult<LazyFrame> {
-        let select = schema_order_select(output_schema);
+        let select = crate::scan::select_exprs_for_schema(output_schema);
 
         if entries.is_empty() {
             let empty = DataFrame::empty_with_schema(
@@ -422,13 +422,6 @@ fn kernel_constant_lits(constants: &[Scalar], fields: &[&StructField]) -> DeltaR
                 .cast(dt)
                 .alias(PlSmallStr::from_str(field.name.as_str())))
         })
-        .collect()
-}
-
-fn schema_order_select(schema: &SchemaRef) -> Vec<Expr> {
-    schema
-        .fields()
-        .map(|f| col(PlSmallStr::from_str(f.name.as_str())))
         .collect()
 }
 
