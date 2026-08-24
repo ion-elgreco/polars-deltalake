@@ -11,7 +11,6 @@ use polars::prelude::{DataFrame, Expr, Schema as PlSchema};
 use polars_plan::dsl::Engine as PolarsEngineMode;
 use pyo3::prelude::*;
 use pyo3_polars::PySchema;
-use tokio::runtime::Runtime;
 use url::Url;
 
 use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngine};
@@ -318,8 +317,6 @@ impl TableScan {
             needs_rewrite,
         )?;
 
-        let rt: &'static Runtime = crate::engine::rt();
-        let _enter = rt.enter();
         let chunk_size = std::num::NonZeroUsize::new(COLLECT_CHUNK_ROWS);
         let batches = lazy
             .collect_batches(PolarsEngineMode::Streaming, true, chunk_size, false)

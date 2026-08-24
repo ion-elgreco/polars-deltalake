@@ -20,10 +20,10 @@ pub(crate) use data::PolarsEngineData;
 pub(crate) use data::resolve_path as resolve_series_path;
 pub(crate) use executor::PolarsPlanExecutor;
 
+#[cfg(test)]
+pub(crate) use handlers::parse_ndjson_inferred;
 use handlers::{ObjectStoreStorageHandler, PolarsJsonHandler, PolarsParquetHandler};
-pub(crate) use handlers::{
-    parquet_options, parse_ndjson_inferred, path_for_polars_io, unified_scan_args,
-};
+pub(crate) use handlers::{parquet_options, path_for_polars_io, unified_scan_args};
 
 use crate::translation::PolarsEvaluationHandler;
 
@@ -78,12 +78,11 @@ impl PolarsEngine {
         let storage = Arc::new(ObjectStoreStorageHandler::new(table_url, opts.clone(), rt)?);
 
         let json = Arc::new(PolarsJsonHandler::new(storage.clone()));
-        let parquet = Arc::new(PolarsParquetHandler::new(storage.clone(), opts, rt)?);
+        let parquet = Arc::new(PolarsParquetHandler::new(storage.clone(), opts)?);
         let evaluation = Arc::new(PolarsEvaluationHandler::new());
         let executor = Arc::new(PolarsPlanExecutor::new(
             storage.clone(),
             parquet.cloud_options().cloned(),
-            rt,
         ));
 
         Ok(Self {

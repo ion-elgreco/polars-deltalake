@@ -10,7 +10,6 @@ use std::sync::Arc;
 use delta_kernel::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use delta_kernel::{DeltaResult, FileMeta, StorageHandler};
 use polars::io::cloud::CloudOptions;
-use tokio::runtime::Runtime;
 
 use super::handlers::{ObjectStoreStorageHandler, kernel_parquet_footer};
 
@@ -20,19 +19,16 @@ pub(crate) struct PolarsPlanExecutor {
     storage: Arc<ObjectStoreStorageHandler>,
     /// Shared with the parquet handler; `None` for `file://`.
     cloud_opts: Option<CloudOptions>,
-    rt: &'static Runtime,
 }
 
 impl PolarsPlanExecutor {
     pub(crate) fn new(
         storage: Arc<ObjectStoreStorageHandler>,
         cloud_opts: Option<CloudOptions>,
-        rt: &'static Runtime,
     ) -> Self {
         Self {
             storage,
             cloud_opts,
-            rt,
         }
     }
 

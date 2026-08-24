@@ -29,7 +29,6 @@ use polars_plan::dsl::{
 };
 use polars_utils::pl_path::{CloudScheme, PlRefPath};
 use polars_utils::pl_str::PlSmallStr;
-use tokio::runtime::Runtime;
 use url::Url;
 
 use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData};
@@ -43,20 +42,17 @@ pub(crate) struct PolarsParquetHandler {
     /// Pre-built once per table; `None` for `file://`. Cloned once per
     /// `read_parquet_files` call into `UnifiedScanArgs`.
     cloud_opts: Option<CloudOptions>,
-    rt: &'static Runtime,
 }
 
 impl PolarsParquetHandler {
     pub(crate) fn new(
         storage: Arc<ObjectStoreStorageHandler>,
         storage_options: HashMap<String, String>,
-        rt: &'static Runtime,
     ) -> DeltaResult<Self> {
         let cloud_opts = cloud_options_for(storage.base_url(), storage_options)?;
         Ok(Self {
             storage,
             cloud_opts,
-            rt,
         })
     }
 
@@ -134,7 +130,6 @@ impl ParquetHandler for PolarsParquetHandler {
             &select_exprs,
             polars_predicate.as_ref(),
             physical_schema.as_ref(),
-            self.rt,
         )
     }
 
@@ -280,7 +275,6 @@ fn read_batch(
     select_exprs: &[Expr],
     predicate: Option<&Expr>,
     physical_schema: &StructType,
-    rt: &'static Runtime,
 ) -> DeltaResult<FileDataReadResultIterator> {
     let parquet_options = parquet_options(physical_schema)?;
     let unified_scan_args = unified_scan_args(cloud_opts, None);
@@ -291,9 +285,6 @@ fn read_batch(
         .build()
         .into();
 
-    // Bind our runtime so polars' async tasks reuse it instead of spinning
-    // up a fresh per-call executor.
-    let _enter = rt.enter();
     let mut plan = lazy.select(select_exprs);
     if let Some(pred) = predicate {
         plan = plan.filter(pred.clone());

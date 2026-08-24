@@ -69,7 +69,6 @@ impl PolarsPlanExecutor {
             .pop()
             .ok_or_else(|| Error::Generic("execute_query: plan has no nodes".into()))?;
 
-        let _enter = self.rt.enter();
         let chunk_size = NonZeroUsize::new(COLLECT_CHUNK_ROWS);
         let batches = terminal
             .lf
@@ -628,7 +627,7 @@ mod scan_entries_tests {
         let rt = crate::engine::rt();
         let storage =
             Arc::new(ObjectStoreStorageHandler::new(&url, std::iter::empty(), rt).unwrap());
-        PolarsPlanExecutor::new(storage, None, rt)
+        PolarsPlanExecutor::new(storage, None)
     }
 
     fn long_field(name: &str) -> StructField {
