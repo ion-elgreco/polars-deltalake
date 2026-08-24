@@ -213,7 +213,7 @@ fn fetch_parquet_metadata(
             footer_thrift.len(),
         )));
     }
-    deserialize_metadata(Buffer::from(footer_thrift.to_vec())).map_err(to_kernel_err)
+    deserialize_metadata(Buffer::from_owner(footer_thrift)).map_err(to_kernel_err)
 }
 
 /// `ParquetOptions` shaped by the kernel-declared physical schema. Shared
