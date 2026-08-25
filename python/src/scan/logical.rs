@@ -99,15 +99,21 @@ impl SimpleSelect {
     }
 }
 
+/// One file's rewrite state plus its pre-parsed select fast path.
+struct FileRewrite {
+    rewrite: LogicalRewrite,
+    simple: Option<SimpleSelect>,
+}
+
 /// Splits each bulk-read frame on `FILE_ID_COL` runs and applies the
 /// per-file `LogicalRewrite`, yielding logical-schema frames in scan order.
 pub(crate) struct LogicalScanIter {
     /// Raw bulk-read frames carrying `FILE_ID_COL`. One frame on the eager
     /// path; many on a streaming follow-up.
     source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>,
-    /// `FILE_ID_COL` value → index in `rewrites`.
+    /// `FILE_ID_COL` value → index in `files`.
     path_index: HashMap<String, usize>,
-    rewrites: Vec<LogicalRewrite>,
+    files: Vec<FileRewrite>,
     /// Physical-name data conjuncts held back from the parquet scan because
     /// a DV is in play: the keep-mask addresses file row positions, so the
     /// predicate has to run after it.
@@ -115,9 +121,6 @@ pub(crate) struct LogicalScanIter {
     /// Mixed atomic conjuncts (touching both partition and data cols) —
     /// applied after the select list materializes partition values.
     orphan_predicate: Option<Expr>,
-    /// Index-aligned with `rewrites`: the pre-parsed fast path for each
-    /// select list, when it qualifies.
-    simple: Vec<Option<SimpleSelect>>,
     /// One inner frame may span multiple files; we slice into per-file
     /// frames here and drain before pulling the next inner frame.
     pending: VecDeque<Result<DataFrame, delta_kernel::Error>>,
@@ -131,17 +134,19 @@ impl LogicalScanIter {
         physical_predicate: Option<Expr>,
         orphan_predicate: Option<Expr>,
     ) -> Self {
-        let simple = rewrites
-            .iter()
-            .map(|r| r.select.as_deref().and_then(SimpleSelect::parse))
+        let files = rewrites
+            .into_iter()
+            .map(|rewrite| {
+                let simple = rewrite.select.as_deref().and_then(SimpleSelect::parse);
+                FileRewrite { rewrite, simple }
+            })
             .collect();
         Self {
             source,
             path_index,
-            rewrites,
+            files,
             physical_predicate,
             orphan_predicate,
-            simple,
             pending: VecDeque::new(),
         }
     }
@@ -199,9 +204,9 @@ impl LogicalScanIter {
         let idx = *self.path_index.get(file_id).ok_or_else(|| {
             delta_kernel::Error::Generic(format!("unknown file_id from polars-io scan: {file_id}"))
         })?;
-        let rewrite = &mut self.rewrites[idx];
+        let entry = &mut self.files[idx];
 
-        if let Some(state) = rewrite.dv.as_mut() {
+        if let Some(state) = entry.rewrite.dv.as_mut() {
             let mask = build_keep_mask(state, df.height());
             let mask = BooleanChunked::new("__pldl_dv__".into(), mask.as_slice());
             df = df
@@ -213,7 +218,7 @@ impl LogicalScanIter {
         if let Some(pred) = &self.physical_predicate {
             df = collect_lazy(df.lazy().filter(pred.clone()))?;
         }
-        match (&self.simple[idx], &rewrite.select) {
+        match (&entry.simple, &entry.rewrite.select) {
             (Some(fast), _) => {
                 df = fast.apply(&df).map_err(|e| {
                     delta_kernel::Error::Generic(format!("logical rewrite eval: {e}"))
