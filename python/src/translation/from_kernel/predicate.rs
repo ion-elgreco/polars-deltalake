@@ -14,7 +14,7 @@ use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_str::PlSmallStr;
 
 use crate::consts::KERNEL_OUTPUT_COL;
-use crate::engine::PolarsEngineData;
+use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 
 use super::downcast_engine_data;
@@ -28,14 +28,12 @@ impl PredicateEvaluator for PolarsPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let df = downcast_engine_data(batch)?.dataframe().clone();
         // Per kernel contract the result is a single nullable boolean column
-        // named "output".
-        let result = df
-            .lazy()
-            .select(vec![
-                self.predicate_expr
-                    .clone()
-                    .alias(PlSmallStr::from_static(KERNEL_OUTPUT_COL)),
-            ])
+        // named "output", one value per input row.
+        let select = [self
+            .predicate_expr
+            .clone()
+            .alias(PlSmallStr::from_static(KERNEL_OUTPUT_COL))];
+        let result = select_anchored(df.lazy(), &select)
             .collect_with_engine(PolarsEngineMode::Streaming)
             .map_err(to_kernel_err)?
             .unwrap_single();
@@ -111,6 +109,24 @@ fn translate_junction_predicate(
             JunctionPredicateOp::Or => acc.or(n),
         })
     })
+}
+
+#[cfg(test)]
+mod evaluate_height_tests {
+    use super::*;
+
+    /// Kernel contract: one boolean per input row. A column-free predicate —
+    /// an empty AND junction translates to `lit(true)` — must not let the
+    /// select collapse the mask to a single row.
+    #[test]
+    fn column_free_predicate_keeps_batch_height() {
+        let df = polars::df!("x" => [1i64, 2, 3]).unwrap();
+        let evaluator = PolarsPredicateEvaluator {
+            predicate_expr: lit(true),
+        };
+        let out = evaluator.evaluate(&PolarsEngineData::new(df)).unwrap();
+        assert_eq!(out.len(), 3, "selection vector must cover every row");
+    }
 }
 
 #[cfg(test)]
