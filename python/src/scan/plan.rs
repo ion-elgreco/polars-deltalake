@@ -124,9 +124,10 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
             .any_ref()
             .downcast_ref::<PolarsEngineData>()
             .ok_or_else(|| anyhow::anyhow!("metadata plan returned non-PolarsEngineData"))?;
-        let partition_lits = partition_literals(polars_batch.dataframe(), &sources, rows.len())?;
+        let partition_literals_per_row =
+            partition_literals(polars_batch.dataframe(), &sources, rows.len())?;
 
-        for (row, lits) in rows.into_iter().zip(partition_lits) {
+        for (row, literals) in rows.into_iter().zip(partition_literals_per_row) {
             let abs = table_root
                 .join(&row.path)
                 .map_err(|e| anyhow::anyhow!("failed to resolve add path {}: {e}", row.path))?;
@@ -144,7 +145,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
                 })
                 .transpose()?;
 
-            let select = needs_select.then(|| build_select(&sources, lits, mode));
+            let select = needs_select.then(|| build_select(&sources, literals, mode));
 
             let idx = files.len();
             path_index.insert(pl_path.as_str().to_string(), idx);
@@ -293,14 +294,14 @@ fn logical_names(expr: Expr, dtype: &KernelDataType, mode: ColumnMappingMode) ->
 /// renames for data columns.
 fn build_select(
     sources: &[(&StructField, FieldSource)],
-    lits: Vec<Expr>,
+    literals: Vec<Expr>,
     mode: ColumnMappingMode,
 ) -> Vec<Expr> {
-    let mut lit_iter = lits.into_iter();
+    let mut literal_iter = literals.into_iter();
     sources
         .iter()
         .map(|(field, source)| match source {
-            FieldSource::Partition { .. } => lit_iter
+            FieldSource::Partition { .. } => literal_iter
                 .next()
                 .expect("one literal per partition field by construction"),
             FieldSource::Data { physical } => {

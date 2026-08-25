@@ -188,7 +188,7 @@ fn translate_map_to_struct(
 /// and every `ParseError` it raises match exactly. Reimplementing that grammar
 /// out of polars cast and strptime rules cannot: kernel accepts spellings
 /// polars rejects (unpadded dates, `%+` offsets) and its lenient counterparts
-/// null unparseable values instead of failing the scan.
+/// null unparsable values instead of failing the scan.
 ///
 /// The empty string is the contract's one exception and never reaches
 /// `parse_scalar`: it stays itself for string, becomes empty bytes for binary
@@ -586,7 +586,7 @@ mod parse_json_tests {
 
     use super::*;
 
-    /// Kernel contract: unparseable input, which includes the empty string,
+    /// Kernel contract: unparsable input, which includes the empty string,
     /// must yield NULL rather than failing the whole batch.
     #[test]
     fn empty_json_string_decodes_to_null() {

@@ -133,8 +133,8 @@ class TestNullProducingValues:
         assert _read_p(table) == [""]
 
 
-class TestUnparseableValueFails:
-    """An unparseable value is a broken table: fail loudly, never silently."""
+class TestUnparsableValueFails:
+    """An unparsable value is a broken table: fail loudly, never silently."""
 
     @pytest.mark.parametrize(
         ("dtype", "value", "garbage"),

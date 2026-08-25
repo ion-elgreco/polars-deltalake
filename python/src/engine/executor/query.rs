@@ -56,7 +56,7 @@ struct NodeState {
 /// file-constant columns (typed + aliased).
 struct FileEntry {
     location: Url,
-    lits: Vec<Expr>,
+    literals: Vec<Expr>,
 }
 
 impl PolarsPlanExecutor {
@@ -159,10 +159,11 @@ impl PolarsPlanExecutor {
                         constant_cols.len()
                     )));
                 }
-                let lits = kernel_constant_lits(&f.file_constants, &const_fields, &const_dts)?;
+                let literals =
+                    kernel_constant_literals(&f.file_constants, &const_fields, &const_dts)?;
                 Ok(FileEntry {
                     location: f.meta.location,
-                    lits,
+                    literals,
                 })
             })
             .collect::<DeltaResult<Vec<_>>>()?;
@@ -182,11 +183,11 @@ impl PolarsPlanExecutor {
         let select = crate::scan::select_exprs_for_schema(output_schema);
         // Broadcast the file's constants, then shape to `schema` order so the
         // union below sees identical schemas.
-        let shape = |lf: LazyFrame, lits: Vec<Expr>| {
-            let lf = if lits.is_empty() {
+        let shape = |lf: LazyFrame, literals: Vec<Expr>| {
+            let lf = if literals.is_empty() {
                 lf
             } else {
-                lf.with_columns(lits)
+                lf.with_columns(literals)
             };
             lf.select(select.clone())
         };
@@ -195,26 +196,26 @@ impl PolarsPlanExecutor {
             return concat_frames(Vec::new(), output_schema);
         };
 
-        // Equal per-file lits (checkpoint parts, V2 sidecars) collapse into
+        // Equal per-file literals (checkpoint parts, V2 sidecars) collapse into
         // one multi-file scan, keeping polars-io's cross-file parallelism.
-        let uniform_constants = entries[1..].iter().all(|e| e.lits == first.lits);
+        let uniform_constants = entries[1..].iter().all(|e| e.literals == first.literals);
 
         let frames: Vec<LazyFrame> = match file_type {
             FileType::Parquet if uniform_constants && row_index.is_none() => {
-                let lits = first.lits.clone();
+                let literals = first.literals.clone();
                 let paths: Vec<PlRefPath> = entries
                     .iter()
                     .map(|e| path_for_polars_io(&e.location))
                     .collect::<DeltaResult<_>>()?;
                 let lf = self.scan_parquet_lazy(paths, read_schema, None)?;
-                vec![shape(lf, lits)]
+                vec![shape(lf, literals)]
             }
             FileType::Parquet => entries
                 .into_iter()
                 .map(|e| {
                     let path = path_for_polars_io(&e.location)?;
                     let lf = self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
-                    Ok(shape(lf, e.lits))
+                    Ok(shape(lf, e.literals))
                 })
                 .collect::<DeltaResult<_>>()?,
             FileType::Json => {
@@ -239,7 +240,7 @@ impl PolarsPlanExecutor {
                         if let Some(name) = &row_index {
                             lf = row_index_as_long(lf.with_row_index(name.clone(), None), name);
                         }
-                        Ok(shape(lf, e.lits))
+                        Ok(shape(lf, e.literals))
                     })
                     .collect::<DeltaResult<_>>()?
             }
@@ -330,14 +331,14 @@ impl PolarsPlanExecutor {
                     ));
                 }
             }
-            let lits = const_series
+            let literals = const_series
                 .iter()
                 .zip(const_fields.iter())
                 .map(|(series, field)| {
                     series_value_lit(series, row, field.name.as_str()).map_err(to_kernel_err)
                 })
                 .collect::<DeltaResult<Vec<_>>>()?;
-            entries.push(FileEntry { location, lits });
+            entries.push(FileEntry { location, literals });
         }
 
         let (read_schema, row_index) = split_scan_schema(&ds.schema, &ds.file_constant_columns)?;
@@ -410,7 +411,7 @@ fn constant_fields<'a>(
 }
 
 /// `dts` is index-aligned with `fields`, pre-converted once per scan node.
-fn kernel_constant_lits(
+fn kernel_constant_literals(
     constants: &[Scalar],
     fields: &[&StructField],
     dts: &[DataType],
@@ -635,16 +636,16 @@ mod scan_entries_tests {
         StructField::nullable(name, DataType::LONG)
     }
 
-    fn plan_scan_count(lits_per_file: [Vec<Expr>; 2]) -> usize {
+    fn plan_scan_count(literals_per_file: [Vec<Expr>; 2]) -> usize {
         let read_schema = StructType::try_new([long_field("id")]).unwrap();
         let output_schema =
             Arc::new(StructType::try_new([long_field("id"), long_field("v")]).unwrap());
-        let entries = lits_per_file
+        let entries = literals_per_file
             .into_iter()
             .enumerate()
-            .map(|(i, lits)| FileEntry {
+            .map(|(i, literals)| FileEntry {
                 location: Url::parse(&format!("file:///t/{i}.parquet")).unwrap(),
-                lits,
+                literals,
             })
             .collect();
         let lf = executor()
@@ -661,15 +662,15 @@ mod scan_entries_tests {
 
     /// The DynamicScan sidecar shape: identical constants across files.
     #[test]
-    fn equal_lits_collapse_to_one_multifile_scan() {
-        let lits = || vec![lit(7i64).alias("v")];
-        assert_eq!(plan_scan_count([lits(), lits()]), 1);
+    fn equal_literals_collapse_to_one_multifile_scan() {
+        let literals = || vec![lit(7i64).alias("v")];
+        assert_eq!(plan_scan_count([literals(), literals()]), 1);
     }
 
     #[test]
-    fn differing_lits_scan_per_file() {
-        let lits = |n| vec![lit(n).alias("v")];
-        assert_eq!(plan_scan_count([lits(1i64), lits(2i64)]), 2);
+    fn differing_literals_scan_per_file() {
+        let literals = |n| vec![lit(n).alias("v")];
+        assert_eq!(plan_scan_count([literals(1i64), literals(2i64)]), 2);
     }
 
     /// Kernel's reference executor row-encodes join keys, so NULL keys
@@ -738,7 +739,7 @@ mod scan_entries_tests {
         let output_schema = Arc::new(StructType::try_new([long_field("id")]).unwrap());
         let entries = vec![FileEntry {
             location: Url::parse("file:///t/0.parquet").unwrap(),
-            lits: vec![],
+            literals: vec![],
         }];
         let err = match executor().scan_entries(
             FileType::Parquet,
@@ -776,7 +777,7 @@ mod scan_entries_tests {
         for (file_type, path) in [(FileType::Parquet, &pq), (FileType::Json, &json)] {
             let entries = vec![FileEntry {
                 location: Url::from_file_path(path).unwrap(),
-                lits: vec![],
+                literals: vec![],
             }];
             let df = executor
                 .scan_entries(
