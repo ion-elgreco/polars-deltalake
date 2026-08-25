@@ -214,23 +214,34 @@ impl LogicalScanIter {
                 .map_err(|e| delta_kernel::Error::Generic(format!("DV filter: {e}")))?;
         }
 
-        // Physical names are still in place here, before the select.
-        if let Some(pred) = &self.physical_predicate {
-            df = collect_lazy(df.lazy().filter(pred.clone()))?;
-        }
-        match (&entry.simple, &entry.rewrite.select) {
-            (Some(fast), _) => {
+        // With no predicate in play the fast path stays collect-free; once a
+        // predicate forces a streaming collect anyway, every active stage
+        // chains into that one plan: the physical filter must precede the
+        // select (physical names), the orphan filter must follow it
+        // (logical/partition names).
+        let has_lazy_stage = self.physical_predicate.is_some()
+            || self.orphan_predicate.is_some()
+            || (entry.simple.is_none() && entry.rewrite.select.is_some());
+        if !has_lazy_stage {
+            if let Some(fast) = &entry.simple {
                 df = fast.apply(&df).map_err(|e| {
                     delta_kernel::Error::Generic(format!("logical rewrite eval: {e}"))
                 })?;
             }
-            (None, Some(select)) => df = collect_lazy(select_anchored(df.lazy(), select))?,
-            (None, None) => {}
+            return Ok(df);
+        }
+
+        let mut lazy = df.lazy();
+        if let Some(pred) = &self.physical_predicate {
+            lazy = lazy.filter(pred.clone());
+        }
+        if let Some(select) = &entry.rewrite.select {
+            lazy = select_anchored(lazy, select);
         }
         if let Some(pred) = &self.orphan_predicate {
-            df = collect_lazy(df.lazy().filter(pred.clone()))?;
+            lazy = lazy.filter(pred.clone());
         }
-        Ok(df)
+        collect_lazy(lazy)
     }
 }
 
