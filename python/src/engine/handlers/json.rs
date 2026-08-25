@@ -198,6 +198,13 @@ fn align(
             let inferred_by_name: std::collections::HashMap<&str, &PlDataType> =
                 fs.iter().map(|f| (f.name.as_str(), &f.dtype)).collect();
             let presence = source.clone().is_not_null();
+            // Composed with the enclosing gate, not replacing it: a child
+            // array under a NULL ancestor may still hold values, so its own
+            // validity alone would re-admit a row the ancestor gated out.
+            let child_gate = match gate {
+                Some(outer) => outer.clone().and(presence.clone()),
+                None => presence.clone(),
+            };
             let children: Vec<Expr> = struct_type
                 .fields()
                 .map(|child| {
@@ -205,7 +212,7 @@ fn align(
                         source.clone().struct_().field_by_name(child.name.as_str()),
                         child,
                         inferred_by_name.get(child.name.as_str()).copied(),
-                        Some(&presence),
+                        Some(&child_gate),
                         &format!("{path}.{}", child.name),
                     )
                     .map(|e| e.alias(PlSmallStr::from_str(child.name.as_str())))
@@ -341,6 +348,43 @@ mod align_nullability_tests {
         .unwrap()
     }
 
+    /// The presence gates in `align` (and in the parquet arm's
+    /// `non_nullable_guards`) compose every ancestor's validity rather than
+    /// trusting the immediate parent's alone. That is redundant only while
+    /// polars keeps a null struct row's children null — `set_outer_validity`
+    /// calls `propagate_nulls_mut` today. Pin it: if it ever stops holding,
+    /// the composed gate is what keeps a gated-out row from being checked.
+    #[test]
+    fn polars_propagates_outer_struct_nulls_to_children() {
+        use polars::prelude::{IntoColumn, IntoSeries, NamedFrom, Series, StructChunked, col};
+
+        let leaf = Series::new("p".into(), [Some("x"), None::<&str>]);
+        let mid = StructChunked::from_series("m".into(), 2, [leaf].iter())
+            .unwrap()
+            .into_series();
+        let outer = StructChunked::from_series("o".into(), 2, [mid].iter())
+            .unwrap()
+            .with_outer_validity(Some(polars_arrow::bitmap::Bitmap::from([true, false])));
+        let df = DataFrame::new(2, vec![outer.into_series().into_column()]).unwrap();
+
+        let child = df.column("o").unwrap().struct_().unwrap();
+        assert_eq!(
+            child.field_by_name("m").unwrap().null_count(),
+            1,
+            "an outer-null struct row must carry a null child"
+        );
+        let gate = df
+            .lazy()
+            .select([col("o").struct_().field_by_name("m").is_not_null().alias("g")])
+            .collect()
+            .unwrap();
+        assert_eq!(
+            gate.column("g").unwrap().bool().unwrap().get(1),
+            Some(false),
+            "the parent gate must already read false under a null ancestor"
+        );
+    }
+
     /// ScanJson contract: a missing value for a non-nullable field under a
     /// present parent is an error, not a null-fill.
     #[test]
@@ -406,6 +450,10 @@ mod align_nullability_tests {
 
         aligned("{\"o\":{\"m\":{\"p\":\"x\"}}}\n{\"o\":{}}", &schema)
             .expect("null mid struct must not trip the leaf check");
+        // A null grandparent gates the leaf too, so the leaf's check must
+        // carry every ancestor's presence, not just its parent's.
+        aligned("{\"o\":{\"m\":{\"p\":\"x\"}}}\n{\"z\":1}", &schema)
+            .expect("null outer struct must not trip the leaf check");
         let err = aligned("{\"o\":{\"m\":{}}}", &schema)
             .expect_err("present empty mid struct must error on p");
         assert!(err.to_string().contains("o.m.p"), "got: {err}");

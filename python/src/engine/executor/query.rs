@@ -380,7 +380,13 @@ fn non_nullable_guards(read_schema: &StructType) -> Vec<Expr> {
             }
         }
         if let KernelDataType::Struct(inner) = &field.data_type {
-            let present = s.is_not_null();
+            // Composed with the ancestor's presence, not replacing it: a
+            // child array under a NULL ancestor may still hold values, so
+            // its own validity alone would re-admit a gated-out row.
+            let present = match parent_present {
+                Some(parent) => &s.is_not_null() & parent,
+                None => s.is_not_null(),
+            };
             let sc = s.struct_()?;
             for child in inner.fields() {
                 let child_s = sc.field_by_name(child.name.as_str())?;
