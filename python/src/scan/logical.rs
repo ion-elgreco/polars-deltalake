@@ -7,7 +7,6 @@ use polars::prelude::{
     BooleanChunked, Column, DataFrame, Expr, IntoLazy, LiteralValue, NamedFrom, PolarsResult,
     Scalar, StringChunked,
 };
-use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_str::PlSmallStr;
 
 use crate::engine::select_anchored;
@@ -246,10 +245,8 @@ impl LogicalScanIter {
 }
 
 fn collect_lazy(lazy: polars::prelude::LazyFrame) -> Result<DataFrame, delta_kernel::Error> {
-    Ok(lazy
-        .collect_with_engine(PolarsEngineMode::Streaming)
-        .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))?
-        .unwrap_single())
+    crate::engine::collect_streaming_single(lazy)
+        .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))
 }
 
 /// First index in `start..end` where `file_str.get(i) != value`, or `end`

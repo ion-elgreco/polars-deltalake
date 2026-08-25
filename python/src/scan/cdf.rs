@@ -13,7 +13,6 @@ use polars::prelude::{DataFrame, Expr, IntoLazy, Schema as PlSchema};
 use pyo3::prelude::*;
 use pyo3_polars::PySchema;
 
-use polars_plan::dsl::Engine as PolarsEngineMode;
 
 use crate::engine::{PolarsEngine, PolarsEngineData};
 use crate::errors::py_err;
@@ -199,12 +198,8 @@ impl CdfTableScan {
             })?;
             let mut df = pl_data.into_inner();
             if let Some(pred) = &polars_predicate {
-                df = df
-                    .lazy()
-                    .filter(pred.clone())
-                    .collect_with_engine(PolarsEngineMode::Streaming)
-                    .map_err(|e| anyhow::anyhow!("CDF post-filter failed: {e:#}"))?
-                    .unwrap_single();
+                df = crate::engine::collect_streaming_single(df.lazy().filter(pred.clone()))
+                    .map_err(|e| anyhow::anyhow!("CDF post-filter failed: {e:#}"))?;
             }
             Ok(df)
         }));

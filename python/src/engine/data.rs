@@ -18,6 +18,17 @@ use polars_arrow::array::{Array as ArrowArray, Utf8ViewArray};
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::errors::to_kernel_err;
 
+/// One streaming-engine collect returning the single result frame.
+/// `unwrap_single` panics if a collect ever returns `Multiple`; this is the
+/// one place to revisit if the engine choice or that contract changes.
+pub(crate) fn collect_streaming_single(
+    lf: LazyFrame,
+) -> polars::prelude::PolarsResult<DataFrame> {
+    Ok(lf
+        .collect_with_engine(polars_plan::dsl::Engine::Streaming)?
+        .unwrap_single())
+}
+
 /// Polars sizes a select from its expressions, so a list that names no
 /// column — every entry a broadcast literal — collapses the frame to a
 /// single row. A row index anchors the select to the input height.
