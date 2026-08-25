@@ -21,12 +21,24 @@ use crate::errors::to_kernel_err;
 /// One streaming-engine collect returning the single result frame.
 /// `unwrap_single` panics if a collect ever returns `Multiple`; this is the
 /// one place to revisit if the engine choice or that contract changes.
-pub(crate) fn collect_streaming_single(
-    lf: LazyFrame,
-) -> polars::prelude::PolarsResult<DataFrame> {
+pub(crate) fn collect_streaming_single(lf: LazyFrame) -> polars::prelude::PolarsResult<DataFrame> {
     Ok(lf
         .collect_with_engine(polars_plan::dsl::Engine::Streaming)?
         .unwrap_single())
+}
+
+/// The same collect, streamed as ordered `COLLECT_CHUNK_ROWS`-sized morsels.
+/// The positional flags are `maintain_order` and `check_types`; every batch
+/// consumer wants the same pair, so they are decided here.
+pub(crate) fn collect_streaming_batches(
+    lf: LazyFrame,
+) -> polars::prelude::PolarsResult<impl Iterator<Item = polars::prelude::PolarsResult<DataFrame>>> {
+    lf.collect_batches(
+        polars_plan::dsl::Engine::Streaming,
+        true,
+        std::num::NonZeroUsize::new(super::COLLECT_CHUNK_ROWS),
+        false,
+    )
 }
 
 /// Polars sizes a select from its expressions, so a list that names no
@@ -430,4 +442,36 @@ fn type_mismatch(field: &str, want: &str) -> Error {
     Error::UnexpectedColumnType(format!(
         "{field}: requested {want} but column has a different type"
     ))
+}
+
+#[cfg(test)]
+mod collect_tests {
+    use super::*;
+
+    /// The helper decides `maintain_order` and the morsel size for every
+    /// batch consumer. Pin both: ordered morsels, covering every input row.
+    #[test]
+    fn batches_are_ordered_and_cover_every_row() {
+        use polars::prelude::IntoLazy;
+
+        let expected: Vec<i64> = (0..10).collect();
+        let df = polars::df!("i" => expected.clone()).unwrap();
+        let batches: Vec<DataFrame> = collect_streaming_batches(df.lazy())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let seen: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column("i")
+                    .unwrap()
+                    .i64()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(seen, expected);
+    }
 }

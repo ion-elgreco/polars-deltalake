@@ -5,8 +5,6 @@
 //! terminal (last) node is collected with the streaming engine and handed
 //! back as `PolarsEngineData` batches.
 
-use std::num::NonZeroUsize;
-
 use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::{Expression, Scalar};
 use delta_kernel::plans::PlanResult;
@@ -24,7 +22,6 @@ use polars::prelude::{
     LazyFrame, MaintainOrderJoin, PolarsError, PolarsResult, Schema as PlSchema, Series,
     SortMultipleOptions, UnionArgs, col, concat,
 };
-use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
 use url::Url;
@@ -34,7 +31,7 @@ use crate::engine::handlers::{
     align_lazy, dsl_parquet_scan, ensure_no_field_id_matching, parse_ndjson_inferred,
     path_for_polars_io, unified_scan_args,
 };
-use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData, select_anchored};
+use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{
     column_path_to_expr, per_row_literals, projection_exprs, scalar_to_lit, translate_expr,
@@ -71,11 +68,8 @@ impl PolarsPlanExecutor {
             .pop()
             .ok_or_else(|| Error::Generic("execute_query: plan has no nodes".into()))?;
 
-        let chunk_size = NonZeroUsize::new(COLLECT_CHUNK_ROWS);
-        let batches = terminal
-            .lf
-            .collect_batches(PolarsEngineMode::Streaming, true, chunk_size, false)
-            .map_err(to_kernel_err)?;
+        let batches =
+            crate::engine::collect_streaming_batches(terminal.lf).map_err(to_kernel_err)?;
         let iter = batches.map(|r| -> DeltaResult<Box<dyn EngineData>> {
             let mut df = r.map_err(to_kernel_err)?;
             df.rechunk_mut();

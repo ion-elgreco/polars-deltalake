@@ -8,12 +8,11 @@ use delta_kernel::expressions::{Predicate, PredicateRef};
 use delta_kernel::scan::{PartitionValuesOptions, Scan};
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
 use polars::prelude::{DataFrame, Expr, Schema as PlSchema};
-use polars_plan::dsl::Engine as PolarsEngineMode;
 use pyo3::prelude::*;
 use pyo3_polars::PySchema;
 use url::Url;
 
-use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngine};
+use crate::engine::PolarsEngine;
 use crate::errors::py_err;
 use crate::translation::schema::KernelSchemaExt;
 use crate::translation::to_kernel::polars_expr_to_kernel_predicate;
@@ -328,9 +327,7 @@ impl TableScan {
             needs_rewrite,
         )?;
 
-        let chunk_size = std::num::NonZeroUsize::new(COLLECT_CHUNK_ROWS);
-        let batches = lazy
-            .collect_batches(PolarsEngineMode::Streaming, true, chunk_size, false)
+        let batches = crate::engine::collect_streaming_batches(lazy)
             .map_err(|e| anyhow::anyhow!("collect_batches failed: {e:#}"))?;
         let source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send> =
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));

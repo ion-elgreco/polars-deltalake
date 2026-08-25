@@ -31,14 +31,14 @@ use polars_buffer::Buffer;
 use polars_parquet::parquet::metadata::FileMetadata;
 use polars_parquet::parquet::{FOOTER_SIZE, PARQUET_MAGIC, read::deserialize_metadata};
 use polars_plan::dsl::{
-    CastColumnsPolicy, DslBuilder, Engine as PolarsEngineMode, ExtraColumnsPolicy,
-    MissingColumnsPolicy, ScanSources, UnifiedScanArgs,
+    CastColumnsPolicy, DslBuilder, ExtraColumnsPolicy, MissingColumnsPolicy, ScanSources,
+    UnifiedScanArgs,
 };
 use polars_utils::pl_path::{CloudScheme, PlRefPath};
 use polars_utils::pl_str::PlSmallStr;
 use url::Url;
 
-use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData};
+use crate::engine::PolarsEngineData;
 use crate::errors::to_kernel_err;
 use crate::translation::schema::{ArrowSchemaExt, KernelSchemaExt};
 
@@ -439,10 +439,7 @@ fn file_batches(
     if let Some(pred) = predicate {
         plan = plan.filter(pred.clone());
     }
-    let chunk_size = std::num::NonZeroUsize::new(COLLECT_CHUNK_ROWS);
-    let batches = plan
-        .collect_batches(PolarsEngineMode::Streaming, true, chunk_size, false)
-        .map_err(to_kernel_err)?;
+    let batches = crate::engine::collect_streaming_batches(plan).map_err(to_kernel_err)?;
     Ok(Box::new(batches.map(
         |r| -> DeltaResult<Box<dyn EngineData>> {
             let mut df = r.map_err(to_kernel_err)?;
