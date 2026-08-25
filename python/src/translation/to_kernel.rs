@@ -9,11 +9,16 @@
 use delta_kernel::expressions::{
     ColumnName, DecimalData, Expression, JunctionPredicateOp, Predicate, Scalar,
 };
-use delta_kernel::schema::{DataType as KernelDataType, DecimalType, StructType};
-use polars::prelude::{AnyValue, Expr, LiteralValue, Operator, Series, TimeUnit};
+use delta_kernel::schema::{DataType as KernelDataType, DecimalType, PrimitiveType, StructType};
+use polars::prelude::{
+    AnyValue, DataType as PlDataType, Expr, LiteralValue, Operator, Series, TimeUnit,
+};
+use polars_plan::dsl::DataTypeExpr;
 use polars_plan::dsl::function_expr::{BooleanFunction, FunctionExpr, StructFunction};
 use polars_plan::plans::DynLiteralValue;
 use polars_utils::pl_str::PlSmallStr;
+
+use crate::translation::schema::KernelDataTypeExt;
 
 /// Above this, refuse the IsIn → OR-chain rewrite
 const MAX_IN_LIST_KERNEL_EXPANSION: usize = 512;
@@ -30,8 +35,11 @@ pub(crate) fn polars_expr_to_kernel_predicate(
     match expr {
         Expr::BinaryExpr { left, op, right } => translate_binary(left, *op, right, schema),
         Expr::Function { input, function } => translate_function(input, function, schema),
-        // Drop the cast: kernel pruning isn't dtype-strict.
-        Expr::Cast { expr: inner, .. } => polars_expr_to_kernel_predicate(inner, schema),
+        Expr::Cast {
+            expr: inner, dtype, ..
+        } if cast_is_droppable(inner, dtype, schema) => {
+            polars_expr_to_kernel_predicate(inner, schema)
+        }
         Expr::Alias(inner, _) => polars_expr_to_kernel_predicate(inner, schema),
         Expr::Literal(lit) => lit_bool(lit).map(Predicate::literal),
         _ => None,
@@ -45,6 +53,13 @@ pub(crate) fn polars_expr_to_kernel_predicate(
 /// scan* on a reference it cannot resolve.
 fn column_ref(expr: &Expr, schema: &StructType) -> Option<ColumnName> {
     let path = column_path(expr)?;
+    column_leaf_type(&path, schema)?;
+    Some(ColumnName::new(path.iter().map(|s| s.to_string())))
+}
+
+/// Primitive leaf type `path` resolves to, or `None` if any segment is
+/// missing or a non-struct stands mid-path.
+fn column_leaf_type<'a>(path: &[PlSmallStr], schema: &'a StructType) -> Option<&'a PrimitiveType> {
     let (leaf, parents) = path.split_last()?;
     let mut level = schema;
     for segment in parents {
@@ -53,9 +68,41 @@ fn column_ref(expr: &Expr, schema: &StructType) -> Option<ColumnName> {
             _ => return None,
         }
     }
-    let leaf_type = &level.field(leaf.as_str())?.data_type;
-    matches!(leaf_type, KernelDataType::Primitive(_))
-        .then(|| ColumnName::new(path.iter().map(|s| s.to_string())))
+    match &level.field(leaf.as_str())?.data_type {
+        KernelDataType::Primitive(p) => Some(p),
+        _ => None,
+    }
+}
+
+/// Whether dropping a cast leaves a predicate kernel can safely skip files
+/// with. Kernel prunes a file when the pushed predicate is false for its
+/// stats, so a cast that *changes values* must not be dropped: on a
+/// `Float64` column holding `1.4`, `col.cast(Int32) == 1` is true while the
+/// stripped `col == 1` is false, and the file holding the matching row is
+/// pruned away. Only a cast over a non-column operand (polars folds the
+/// literal itself) or a lossless widening survives the trip.
+fn cast_is_droppable(inner: &Expr, dtype: &DataTypeExpr, schema: &StructType) -> bool {
+    let Some(path) = column_path(inner) else {
+        return true;
+    };
+    let Some(from) = column_leaf_type(&path, schema) else {
+        return true;
+    };
+    let DataTypeExpr::Literal(target) = dtype else {
+        return false;
+    };
+    let Ok(from_pl) = KernelDataType::Primitive(from.clone()).to_polars() else {
+        return false;
+    };
+    from_pl == *target
+        || matches!(
+            (&from_pl, target),
+            (
+                PlDataType::Int8,
+                PlDataType::Int16 | PlDataType::Int32 | PlDataType::Int64
+            ) | (PlDataType::Int16, PlDataType::Int32 | PlDataType::Int64)
+                | (PlDataType::Int32, PlDataType::Int64)
+        )
 }
 
 /// `SelectFields` is excluded: its selector expands to names later, so it is
@@ -321,7 +368,11 @@ fn polars_expr_to_kernel_expression(expr: &Expr, schema: &StructType) -> Option<
     }
     match expr {
         Expr::Alias(inner, _) => polars_expr_to_kernel_expression(inner, schema),
-        Expr::Cast { expr: inner, .. } => polars_expr_to_kernel_expression(inner, schema),
+        Expr::Cast {
+            expr: inner, dtype, ..
+        } if cast_is_droppable(inner, dtype, schema) => {
+            polars_expr_to_kernel_expression(inner, schema)
+        }
         Expr::Literal(lit) => Some(Expression::Literal(match lit {
             LiteralValue::Scalar(s) => any_value_to_scalar(&s.as_any_value())?,
             LiteralValue::Dyn(DynLiteralValue::Str(s)) => Scalar::String(s.to_string()),

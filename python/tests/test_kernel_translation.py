@@ -229,13 +229,54 @@ class TestPredicateEqualsBool:
 
 
 class TestCastUnwrap:
-    def test_cast_around_column(self, rich_table):
-        expr = pl.col("id").cast(pl.Int32) == 1
-        assert _kernel_count(rich_table, expr) == 1
+    def test_widening_cast_around_column(self, rich_table):
+        """A widening integer cast cannot change a value, so it unwraps."""
+        assert _kernel_count(rich_table, pl.col("small").cast(pl.Int64) == 1) == 1
+
+    def test_redundant_cast_around_column(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("id").cast(pl.Int64) == 1) == 1
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            pl.col("id").cast(pl.Int32) == 1,
+            pl.col("f").cast(pl.Int32) == 1,
+            pl.col("id").cast(pl.String) == "1",
+        ],
+        ids=["narrowing", "float-truncating", "stringify"],
+    )
+    def test_value_changing_cast_declines(self, rich_table, expr):
+        """Kernel skips a file whose stats falsify the pushed predicate, so a
+        cast that changes values must not be dropped on the way down."""
+        assert _kernel_count(rich_table, expr) == 0
 
     def test_alias_around_predicate(self, rich_table):
         expr = (pl.col("id") == 1).alias("masked")
         assert _kernel_count(rich_table, expr) == 1
+
+
+class TestCastPruningSoundness:
+    def test_truncating_cast_keeps_matching_rows(self, tmp_path: Path):
+        """`f.cast(Int32) == 1` matches 1.4; pushing the cast-stripped
+        `f == 1` down would skip the file whose stats are [1.4, 1.6]."""
+        table = str(tmp_path / "casts")
+        write_deltalake(
+            table,
+            pl.DataFrame({"id": [1, 2], "f": [1.4, 1.6]}).to_arrow(),
+        )
+        write_deltalake(
+            table,
+            pl.DataFrame({"id": [3, 4], "f": [10.0, 11.0]}).to_arrow(),
+            mode="append",
+        )
+        got = (
+            scan_delta(table)
+            .filter(pl.col("f").cast(pl.Int32) == 1)
+            .collect()
+            .sort("id")["id"]
+            .to_list()
+        )
+        assert got == [1, 2]
 
 
 class TestUntranslatable:
@@ -366,9 +407,14 @@ _E2E_CASES = [
     ),
     # Cast unwrap
     pytest.param(
-        pl.col("id").cast(pl.Int32) == 1,
+        pl.col("small").cast(pl.Int64) == 1,
         [1],
         id="cast-eq",
+    ),
+    pytest.param(
+        pl.col("id").cast(pl.Int32) == 1,
+        [1],
+        id="cast-eq-narrowing",
     ),
 ]
 
