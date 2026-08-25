@@ -312,8 +312,43 @@ fn read_batch(
     predicate: Option<&Expr>,
     physical_schema: &StructType,
 ) -> DeltaResult<FileDataReadResultIterator> {
-    let lazy = dsl_parquet_scan(paths, physical_schema, unified_scan_args(cloud_opts, None))?;
+    // Contract: engines must not merge engine data across file boundaries,
+    // so each file gets its own scan. Construction is deferred inside the
+    // flat_map so file N+1's streaming query starts only once file N drains;
+    // polars still parallelises row groups within a file.
+    let cloud_opts = cloud_opts.cloned();
+    let select_exprs = select_exprs.to_vec();
+    let predicate = predicate.cloned();
+    let physical_schema = physical_schema.clone();
+    let iter = paths.into_iter().flat_map(move |path| {
+        match file_batches(
+            path,
+            cloud_opts.as_ref(),
+            &select_exprs,
+            predicate.as_ref(),
+            &physical_schema,
+        ) {
+            Ok(batches) => batches,
+            Err(e) => Box::new(std::iter::once(Err(e))),
+        }
+    });
+    Ok(Box::new(iter))
+}
 
+type BatchIter = Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+
+fn file_batches(
+    path: PlRefPath,
+    cloud_opts: Option<&CloudOptions>,
+    select_exprs: &[Expr],
+    predicate: Option<&Expr>,
+    physical_schema: &StructType,
+) -> DeltaResult<BatchIter> {
+    let lazy = dsl_parquet_scan(
+        vec![path],
+        physical_schema,
+        unified_scan_args(cloud_opts, None),
+    )?;
     let mut plan = lazy.select(select_exprs);
     if let Some(pred) = predicate {
         plan = plan.filter(pred.clone());
@@ -352,6 +387,71 @@ pub(crate) fn path_for_polars_io(url: &Url) -> DeltaResult<PlRefPath> {
         }
     };
     Ok(PlRefPath::new(s))
+}
+
+#[cfg(test)]
+mod per_file_batch_tests {
+    use std::collections::HashMap;
+
+    use delta_kernel::schema::{DataType, StructField};
+    use polars::prelude::ParquetWriter;
+
+    use super::*;
+
+    /// `FileDataReadResultIterator` contract: data arrives in file order and
+    /// engines must not merge engine data across file boundaries.
+    #[test]
+    fn batches_do_not_span_files() {
+        let dir = std::env::temp_dir().join(format!("pldl-perfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, vals) in [("a.parquet", [1i64, 2, 3]), ("b.parquet", [4, 5, 6])] {
+            let mut df = polars::df!("x" => vals).unwrap();
+            ParquetWriter::new(std::fs::File::create(dir.join(name)).unwrap())
+                .finish(&mut df)
+                .unwrap();
+        }
+        let base = Url::from_directory_path(&dir).unwrap();
+        let rt = crate::engine::rt();
+        let storage =
+            Arc::new(ObjectStoreStorageHandler::new(&base, std::iter::empty(), rt).unwrap());
+        let handler = PolarsParquetHandler::new(storage, HashMap::new()).unwrap();
+
+        let schema = Arc::new(
+            StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap(),
+        );
+        let files: Vec<FileMeta> = ["a.parquet", "b.parquet"]
+            .iter()
+            .map(|n| FileMeta {
+                location: base.join(n).unwrap(),
+                last_modified: 0,
+                size: std::fs::metadata(dir.join(n)).unwrap().len(),
+            })
+            .collect();
+        let batches: Vec<_> = handler
+            .read_parquet_files(&files, schema, None)
+            .unwrap()
+            .collect::<DeltaResult<Vec<_>>>()
+            .unwrap();
+        let heights: Vec<usize> = batches.iter().map(|b| b.len()).collect();
+        assert_eq!(heights, vec![3, 3], "batches must not span files");
+        let xs: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.any_ref()
+                    .downcast_ref::<PolarsEngineData>()
+                    .unwrap()
+                    .dataframe()
+                    .column("x")
+                    .unwrap()
+                    .i64()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(xs, vec![1, 2, 3, 4, 5, 6], "file and row order hold");
+    }
 }
 
 #[cfg(test)]
