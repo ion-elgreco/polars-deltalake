@@ -37,7 +37,7 @@ use crate::engine::handlers::{
 use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{
-    column_path_to_expr, projection_exprs, scalar_to_lit, series_value_lit, translate_expr,
+    column_path_to_expr, per_row_literals, projection_exprs, scalar_to_lit, translate_expr,
     translate_predicate,
 };
 use crate::translation::schema::{KernelDataTypeExt, KernelSchemaExt};
@@ -319,8 +319,11 @@ impl PolarsPlanExecutor {
             })
             .collect::<DeltaResult<_>>()?;
 
+        let names: Vec<&str> = const_fields.iter().map(|f| f.name.as_str()).collect();
+        let per_row =
+            per_row_literals(&const_series, &names, df.height()).map_err(to_kernel_err)?;
         let mut entries = Vec::with_capacity(df.height());
-        for row in 0..df.height() {
+        for (row, literals) in per_row.into_iter().enumerate() {
             let rel = path
                 .get(row)
                 .ok_or_else(|| Error::Generic("DynamicScan path must not be null".into()))?;
@@ -336,13 +339,6 @@ impl PolarsPlanExecutor {
                     ));
                 }
             }
-            let literals = const_series
-                .iter()
-                .zip(const_fields.iter())
-                .map(|(series, field)| {
-                    series_value_lit(series, row, field.name.as_str()).map_err(to_kernel_err)
-                })
-                .collect::<DeltaResult<Vec<_>>>()?;
             entries.push(FileEntry { location, literals });
         }
 

@@ -32,6 +32,25 @@ pub(crate) fn series_value_lit(
     Ok(lit(scalar).alias(PlSmallStr::from_str(name)))
 }
 
+/// One aliased literal per (row, field) — the per-file constant scaffold
+/// shared by partition literals and DynamicScan file constants. Each series
+/// must already carry the output dtype (cast once per field, not per row).
+pub(crate) fn per_row_literals(
+    series_per_field: &[polars::prelude::Series],
+    names: &[&str],
+    row_count: usize,
+) -> polars::prelude::PolarsResult<Vec<Vec<Expr>>> {
+    (0..row_count)
+        .map(|row| {
+            series_per_field
+                .iter()
+                .zip(names)
+                .map(|(series, name)| series_value_lit(series, row, name))
+                .collect()
+        })
+        .collect()
+}
+
 /// Compound scalars (Array/Map/Struct/Decimal) round-trip through
 /// `build_series` so an empty list stays `[]` instead of collapsing to null
 /// — non-null typed empties are load-bearing for Delta log replay.

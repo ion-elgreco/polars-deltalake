@@ -27,7 +27,7 @@ use polars_utils::pl_str::PlSmallStr;
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::engine::{PolarsEngine, PolarsEngineData, path_for_polars_io, resolve_series_path};
 use crate::scan::predicate::renames_nested_fields;
-use crate::translation::from_kernel::{null_gated, series_value_lit};
+use crate::translation::from_kernel::{null_gated, per_row_literals};
 use crate::translation::schema::KernelDataTypeExt;
 
 /// Per-file work to apply post-read: physical→logical select + DV keep-mask.
@@ -283,18 +283,9 @@ fn partition_literals(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    (0..row_count)
-        .map(|row| {
-            partition_fields
-                .iter()
-                .zip(series_per_field.iter())
-                .map(|((field, _), series)| -> anyhow::Result<Expr> {
-                    series_value_lit(series, row, field.name.as_str())
-                        .map_err(|e| anyhow::anyhow!("partition value read: {e:#}"))
-                })
-                .collect()
-        })
-        .collect()
+    let names: Vec<&str> = partition_fields.iter().map(|(f, _)| f.name.as_str()).collect();
+    per_row_literals(&series_per_field, &names, row_count)
+        .map_err(|e| anyhow::anyhow!("partition value read: {e:#}"))
 }
 
 /// Rename nested struct fields to their logical names; `None` if nothing
