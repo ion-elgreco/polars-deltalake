@@ -325,11 +325,14 @@ impl PolarsPlanExecutor {
                 .base_url
                 .join(rel)
                 .map_err(|e| Error::Generic(format!("DynamicScan path join failed: {e}")))?;
+            // Kernel's contract requires the column to be a non-null LONG and
+            // nothing more; a zero-byte commit reads as an empty batch on the
+            // ScanJson path, so it must not abort here either.
             match size.get(row) {
-                Some(s) if s > 0 => {}
+                Some(s) if s >= 0 => {}
                 _ => {
                     return Err(Error::Generic(
-                        "DynamicScan file size must be a positive long".into(),
+                        "DynamicScan file size must be a non-negative long".into(),
                     ));
                 }
             }
@@ -957,5 +960,56 @@ mod scan_entries_tests {
         let df = eval_project(project, &input).unwrap().lf.collect().unwrap();
         assert_eq!(df.height(), 3, "literal-only projection must keep height");
         assert_eq!(df.get_column_names(), ["v"]);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_scan_size_tests {
+    use std::sync::Arc;
+
+    use delta_kernel::expressions::ColumnName;
+    use delta_kernel::schema::DataType;
+    use polars::prelude::IntoLazy;
+
+    use super::*;
+    use crate::engine::handlers::ObjectStoreStorageHandler;
+
+    /// Kernel's contract asks only for a non-null LONG. A zero-byte commit
+    /// is an empty batch on the ScanJson path, so the size column must not
+    /// abort the scan here either.
+    #[test]
+    fn zero_byte_file_is_accepted() {
+        let url = Url::parse("file:///t/").unwrap();
+        let rt = crate::engine::rt();
+        let storage =
+            Arc::new(ObjectStoreStorageHandler::new(&url, std::iter::empty(), rt).unwrap());
+        let executor = PolarsPlanExecutor::new(storage, None);
+
+        let schema: SchemaRef =
+            Arc::new(StructType::try_new([StructField::nullable("id", DataType::LONG)]).unwrap());
+        let df = polars::df!(
+            "path" => ["empty.parquet"],
+            "size" => [0i64],
+            "modtime" => [0i64],
+            "dv" => [None::<&str>],
+        )
+        .unwrap();
+        let input = NodeState {
+            lf: df.lazy(),
+            schema: schema.clone(),
+        };
+        let ds = DynamicScan {
+            schema,
+            file_type: FileType::Parquet,
+            base_url: url,
+            file_constant_columns: vec![],
+            path_column: ColumnName::new(["path"]),
+            file_size_column: ColumnName::new(["size"]),
+            last_modified_column: ColumnName::new(["modtime"]),
+            dv_column: ColumnName::new(["dv"]),
+        };
+        executor
+            .eval_dynamic_scan(ds, &input)
+            .expect("a zero-byte file must not abort the scan");
     }
 }
