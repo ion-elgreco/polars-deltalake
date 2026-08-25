@@ -478,7 +478,9 @@ fn translate_function(
             };
             Some(Predicate::and(lo, hi))
         }
-        FunctionExpr::Boolean(BooleanFunction::Not) | FunctionExpr::Negate => Some(Predicate::not(
+        // `Negate` is arithmetic unary minus, not logical NOT, and has no
+        // kernel predicate form.
+        FunctionExpr::Boolean(BooleanFunction::Not) => Some(Predicate::not(
             polars_expr_to_kernel_predicate(input.first()?, schema)?,
         )),
         FunctionExpr::Boolean(BooleanFunction::AllHorizontal) => {
@@ -791,6 +793,31 @@ mod predicate_position_tests {
         let folded = polars_expr_to_kernel_predicate(&col("id").eq(lit(true)), &long_schema());
         assert_ne!(folded, Some(truthy.clone()));
         assert_ne!(folded, Some(Predicate::not(truthy)));
+    }
+
+    /// `Negate` is polars' arithmetic unary minus; `Not` is logical NOT.
+    /// Translating the former as the latter inverts the file-skipping
+    /// decision, so it must be declined instead.
+    #[test]
+    fn arithmetic_negate_is_not_logical_not() {
+        let schema =
+            StructType::try_new([StructField::nullable("flag", KernelDataType::BOOLEAN)]).unwrap();
+        let negated = Expr::Function {
+            input: vec![col("flag")],
+            function: FunctionExpr::Negate,
+        };
+        assert_eq!(
+            polars_expr_to_kernel_predicate(&negated, &schema),
+            None,
+            "Negate has no kernel predicate form"
+        );
+        // Logical NOT is unaffected.
+        assert_eq!(
+            polars_expr_to_kernel_predicate(&col("flag").not(), &schema),
+            Some(Predicate::not(Predicate::from_expr(ColumnName::new([
+                "flag"
+            ]))))
+        );
     }
 
     /// A boolean column still translates — the restriction is on the type,
