@@ -60,15 +60,7 @@ fn column_ref(expr: &Expr, schema: &StructType) -> Option<ColumnName> {
 /// Primitive leaf type `path` resolves to, or `None` if any segment is
 /// missing or a non-struct stands mid-path.
 fn column_leaf_type<'a>(path: &[PlSmallStr], schema: &'a StructType) -> Option<&'a PrimitiveType> {
-    let (leaf, parents) = path.split_last()?;
-    let mut level = schema;
-    for segment in parents {
-        match &level.field(segment.as_str())?.data_type {
-            KernelDataType::Struct(inner) => level = inner,
-            _ => return None,
-        }
-    }
-    match &level.field(leaf.as_str())?.data_type {
+    match crate::translation::schema::resolve_leaf_dtype(schema, path.iter().map(|s| s.as_str()))? {
         KernelDataType::Primitive(p) => Some(p),
         _ => None,
     }

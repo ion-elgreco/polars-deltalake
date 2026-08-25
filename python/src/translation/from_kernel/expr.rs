@@ -427,20 +427,7 @@ fn resolve_column_dtype<'a>(
     name: &ColumnName,
     schema: Option<&'a StructType>,
 ) -> Option<&'a KernelDataType> {
-    let mut level: &'a StructType = schema?;
-    let mut segments = name.iter().peekable();
-    while let Some(segment) = segments.next() {
-        let dt = &level.field(segment)?.data_type;
-        if segments.peek().is_none() {
-            return Some(dt);
-        }
-        // Only a struct has children the next segment could name.
-        match dt {
-            KernelDataType::Struct(inner) => level = inner,
-            _ => return None,
-        }
-    }
-    None
+    crate::translation::schema::resolve_leaf_dtype(schema?, name.iter())
 }
 
 #[cfg(test)]

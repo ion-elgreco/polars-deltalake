@@ -16,6 +16,33 @@ use polars::prelude::{
 use polars_arrow::datatypes::{ArrowSchema, Field as ArrowField};
 use polars_utils::pl_str::PlSmallStr;
 
+/// Descend `segments` through struct nesting and return the leaf's declared
+/// type. `None` when a segment is missing, a non-struct stands mid-path, or
+/// `segments` is empty.
+pub(crate) fn resolve_leaf_dtype<'a, I, S>(
+    schema: &'a StructType,
+    segments: I,
+) -> Option<&'a KernelDataType>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut level = schema;
+    let mut iter = segments.into_iter().peekable();
+    while let Some(segment) = iter.next() {
+        let dt = &level.field(segment.as_ref())?.data_type;
+        if iter.peek().is_none() {
+            return Some(dt);
+        }
+        // Only a struct has children the next segment could name.
+        match dt {
+            KernelDataType::Struct(inner) => level = inner,
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(crate) trait KernelSchemaExt {
     fn to_polars(&self) -> anyhow::Result<Arc<PlSchema>>;
 }
