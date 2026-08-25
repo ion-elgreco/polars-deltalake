@@ -281,7 +281,13 @@ fn map_from_struct_expr(value_expr: Expr, fields: &[polars::prelude::Field]) -> 
             ])
         })
         .collect();
-    concat_list(entries).map_err(to_kernel_err)
+    // `concat_list` over literal keys is non-null even where the source
+    // object is absent, which would turn a missing map into a map of nulls
+    // and slip past the non-nullable guard. Same gate as the Struct arm.
+    Ok(null_gated(
+        value_expr.is_not_null(),
+        concat_list(entries).map_err(to_kernel_err)?,
+    ))
 }
 
 fn null_expr_for_kernel(kernel_dt: &KernelDataType) -> DeltaResult<Expr> {
@@ -383,6 +389,28 @@ mod align_nullability_tests {
             Some(false),
             "the parent gate must already read false under a null ancestor"
         );
+    }
+
+    /// A Map column is rebuilt from literal keys, which produces a non-null
+    /// list even where the source object is absent. Without the outer gate
+    /// a missing non-nullable map reads back as a map of nulls and slips
+    /// past the presence check instead of aborting.
+    #[test]
+    fn absent_non_nullable_map_errors() {
+        use delta_kernel::schema::MapType;
+
+        let schema = StructType::try_new([StructField::not_null(
+            "pv",
+            KernelDataType::Map(Box::new(MapType::new(
+                KernelDataType::STRING,
+                KernelDataType::STRING,
+                true,
+            ))),
+        )])
+        .unwrap();
+        let err = aligned("{\"pv\":{\"p\":\"x\"}}\n{\"z\":1}", &schema)
+            .expect_err("a missing non-nullable map must error, not null-fill");
+        assert!(err.to_string().contains("pv"), "got: {err}");
     }
 
     /// ScanJson contract: a missing value for a non-nullable field under a
