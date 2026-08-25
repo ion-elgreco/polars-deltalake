@@ -101,6 +101,12 @@ impl PolarsEngine {
     pub(crate) fn cloud_options(&self) -> Option<&polars::io::cloud::CloudOptions> {
         self.parquet.cloud_options()
     }
+
+    /// Concrete accessor — the `Engine::plan_executor` trait method returns
+    /// an `Option` only for kernel's boundary; here it always exists.
+    pub(crate) fn executor(&self) -> &Arc<PolarsPlanExecutor> {
+        &self.executor
+    }
 }
 
 impl Engine for PolarsEngine {

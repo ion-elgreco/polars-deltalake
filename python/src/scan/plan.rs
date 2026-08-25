@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::engine_data::{GetData, RowVisitor};
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::plans::Operation;
+use delta_kernel::plans::{Operation, PlanExecutor};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
@@ -80,9 +80,7 @@ enum FieldSource {
 }
 
 pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result<ResolvedScan> {
-    let executor = engine
-        .plan_executor()
-        .expect("PolarsEngine always provides a plan executor");
+    let executor = engine.executor();
 
     let plan = scan
         .declarative_metadata_scan_plan(engine as &dyn Engine)
