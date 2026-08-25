@@ -20,14 +20,14 @@ use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, Str
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::{DeltaResult, Engine};
 use polars::prelude::as_struct as polars_as_struct;
-use polars::prelude::{DataFrame, Expr, LiteralValue, col, lit, when};
+use polars::prelude::{DataFrame, Expr, col, lit};
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::engine::{PolarsEngine, PolarsEngineData, path_for_polars_io, resolve_series_path};
 use crate::scan::predicate::renames_nested_fields;
-use crate::translation::from_kernel::series_value_lit;
+use crate::translation::from_kernel::{null_gated, series_value_lit};
 use crate::translation::schema::KernelDataTypeExt;
 
 /// Per-file work to apply post-read: physical→logical select + DV keep-mask.
@@ -263,9 +263,7 @@ fn logical_names(expr: Expr, dtype: &KernelDataType, mode: ColumnMappingMode) ->
                 .collect();
             // `as_struct` alone makes every row valid; downstream filters
             // select on this column's own nulls.
-            when(expr.clone().is_not_null())
-                .then(polars_as_struct(children))
-                .otherwise(lit(LiteralValue::untyped_null()))
+            null_gated(expr.clone().is_not_null(), polars_as_struct(children))
         }
         // Elements, keys and values are anonymous; only structs inside them
         // have names.

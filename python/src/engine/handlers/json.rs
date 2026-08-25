@@ -18,7 +18,7 @@ use polars::io::json::{JsonFormat, JsonReader};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{
     Column, DataFrame, DataType as PlDataType, Expr, Field as PlField, IntoLazy, LazyFrame,
-    PolarsError, Schema as PlSchema, col, concat_list, lit, when,
+    PolarsError, Schema as PlSchema, col, concat_list, lit,
 };
 use polars_utils::pl_str::PlSmallStr;
 use url::Url;
@@ -26,7 +26,7 @@ use url::Url;
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::engine::PolarsEngineData;
 use crate::errors::to_kernel_err;
-use crate::translation::from_kernel::empty_typed_list_expr;
+use crate::translation::from_kernel::{empty_typed_list_expr, null_gated};
 use crate::translation::schema::KernelDataTypeExt;
 
 use super::storage::ObjectStoreStorageHandler;
@@ -219,9 +219,7 @@ fn align(
                     .map(|e| e.alias(PlSmallStr::from_str(child.name.as_str())))
                 })
                 .collect::<DeltaResult<_>>()?;
-            when(presence)
-                .then(polars_as_struct(children))
-                .otherwise(lit(polars::prelude::LiteralValue::untyped_null()))
+            null_gated(presence, polars_as_struct(children))
         }
         // Primitives, Arrays, and any shape mismatch — let polars cast the
         // inferred column to the kernel-declared type.
