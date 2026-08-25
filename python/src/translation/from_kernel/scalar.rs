@@ -419,9 +419,14 @@ pub(crate) fn build_series(
                         Scalar::Map(md) => {
                             let pairs = md.pairs();
                             if pairs.is_empty() {
+                                // Typed from the declared key/value types, or
+                                // an empty `Map<String, Long>` row would not
+                                // vstack with its null siblings.
                                 empty_typed_list_expr(polars_as_struct(vec![
-                                    lit("").alias(MAP_KEY_FIELD),
-                                    lit("").alias(MAP_VALUE_FIELD),
+                                    scalar_to_lit(&Scalar::Null(map.key_type.clone()))
+                                        .alias(MAP_KEY_FIELD),
+                                    scalar_to_lit(&Scalar::Null(map.value_type.clone()))
+                                        .alias(MAP_VALUE_FIELD),
                                 ]))
                             } else {
                                 let entries: Vec<Expr> = pairs
@@ -654,5 +659,28 @@ mod timestamp_variant_tests {
                 .dtype(),
             &PlDataType::Datetime(TimeUnit::Microseconds, None)
         );
+    }
+}
+
+#[cfg(test)]
+mod map_value_type_tests {
+    use super::*;
+    use delta_kernel::expressions::MapData;
+    use delta_kernel::schema::MapType;
+
+    /// An empty map row was seeded from a hardcoded String/String literal,
+    /// so it would not vstack with a null sibling of the declared type —
+    /// and carried the wrong dtype outright when every row was empty.
+    #[test]
+    fn empty_map_takes_its_declared_value_type() {
+        let map_type = MapType::new(KernelDataType::STRING, KernelDataType::LONG, true);
+        let empty = Scalar::Map(
+            MapData::try_new(map_type.clone(), Vec::<(Scalar, Scalar)>::new()).unwrap(),
+        );
+        let dt = KernelDataType::Map(Box::new(map_type));
+        let null = Scalar::Null(dt.clone());
+
+        let series = build_series("m", &dt, &[&empty, &null]).unwrap();
+        assert_eq!(series.dtype(), &dt.to_polars().unwrap());
     }
 }
