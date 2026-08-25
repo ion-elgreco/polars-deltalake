@@ -140,59 +140,99 @@ fn numeric_prim(t: &PrimitiveType) -> bool {
     )
 }
 
-/// Convert a numeric scalar to `target` only when the value survives the
-/// round trip exactly. Kernel compares stats strictly same-type, so a
-/// literal left wider than its column never skips; an inexact conversion
-/// must decline — `f32_col == 2.9f64` is false on every row, while the
-/// narrowed `f32_col == 2.9f32` is satisfiable.
-fn narrow_scalar_exact(s: &Scalar, target: &PrimitiveType) -> Option<Scalar> {
-    let int_val = |s: &Scalar| -> Option<i64> {
-        Some(match s {
-            Scalar::Byte(v) => i64::from(*v),
-            Scalar::Short(v) => i64::from(*v),
-            Scalar::Integer(v) => i64::from(*v),
-            Scalar::Long(v) => *v,
-            _ => return None,
-        })
+/// Outcome of retyping a numeric literal to a column's exact type.
+enum Narrowing {
+    /// The same value, spelled in `target`.
+    Exact(Scalar),
+    /// `target` has no value equal to the literal, so an equality against it
+    /// is false for every row. Only sound in equality position.
+    NoValueMatches,
+    /// Not decidable here — the caller must decline rather than assume.
+    Undecidable,
+}
+
+/// Largest magnitude below which every f64 integer is also exactly the i64 of
+/// the same value; above it an integer column value can round to a different
+/// f64 than itself, so comparisons stop agreeing with polars'.
+const F64_EXACT_INT_LIMIT: f64 = (1u64 << 53) as f64;
+
+/// The i64 a float names exactly, if it names one at all.
+fn float_as_exact_int(v: f64) -> Option<i64> {
+    (v.fract() == 0.0 && v.abs() < F64_EXACT_INT_LIMIT).then(|| v as i64)
+}
+
+/// Retype a numeric scalar to `target`. Kernel compares stats strictly
+/// same-type, so a literal left wider than its column never skips; an
+/// inexact conversion is not `Exact` — `f32_col == 2.9f64` is false on
+/// every row, while the narrowed `f32_col == 2.9f32` is satisfiable.
+fn narrow_scalar(s: &Scalar, target: &PrimitiveType) -> Narrowing {
+    // A float that names no integer (fractional, NaN, infinite) equals no
+    // value of an integer column; one too large to be exact is undecidable.
+    let int_val = |s: &Scalar| -> Result<i64, Narrowing> {
+        match s {
+            Scalar::Byte(v) => Ok(i64::from(*v)),
+            Scalar::Short(v) => Ok(i64::from(*v)),
+            Scalar::Integer(v) => Ok(i64::from(*v)),
+            Scalar::Long(v) => Ok(*v),
+            Scalar::Float(v) => float_as_exact_int(f64::from(*v)).ok_or(
+                if f64::from(*v).abs() < F64_EXACT_INT_LIMIT {
+                    Narrowing::NoValueMatches
+                } else {
+                    Narrowing::Undecidable
+                },
+            ),
+            Scalar::Double(v) => float_as_exact_int(*v).ok_or(if v.abs() < F64_EXACT_INT_LIMIT {
+                Narrowing::NoValueMatches
+            } else {
+                Narrowing::Undecidable
+            }),
+            _ => Err(Narrowing::Undecidable),
+        }
     };
-    Some(match target {
-        PrimitiveType::Byte => Scalar::Byte(i8::try_from(int_val(s)?).ok()?),
-        PrimitiveType::Short => Scalar::Short(i16::try_from(int_val(s)?).ok()?),
-        PrimitiveType::Integer => Scalar::Integer(i32::try_from(int_val(s)?).ok()?),
-        PrimitiveType::Long => Scalar::Long(int_val(s)?),
+    // Out of range means no value of `target` equals it.
+    let fit = |v: Result<i64, Narrowing>, f: fn(i64) -> Option<Scalar>| match v {
+        Ok(i) => match f(i) {
+            Some(s) => Narrowing::Exact(s),
+            None => Narrowing::NoValueMatches,
+        },
+        Err(n) => n,
+    };
+    match target {
+        PrimitiveType::Byte => fit(int_val(s), |i| i8::try_from(i).ok().map(Scalar::Byte)),
+        PrimitiveType::Short => fit(int_val(s), |i| i16::try_from(i).ok().map(Scalar::Short)),
+        PrimitiveType::Integer => fit(int_val(s), |i| i32::try_from(i).ok().map(Scalar::Integer)),
+        PrimitiveType::Long => fit(int_val(s), |i| Some(Scalar::Long(i))),
         PrimitiveType::Float => match s {
             Scalar::Double(v) => {
                 let f = *v as f32;
                 if f64::from(f) == *v {
-                    Scalar::Float(f)
+                    Narrowing::Exact(Scalar::Float(f))
                 } else {
-                    return None;
+                    Narrowing::NoValueMatches
                 }
             }
-            _ => {
-                let i = int_val(s)?;
+            _ => fit(int_val(s), |i| {
                 let f = i as f32;
-                if f as i64 == i {
-                    Scalar::Float(f)
-                } else {
-                    return None;
-                }
-            }
+                (f as i64 == i).then_some(Scalar::Float(f))
+            }),
         },
         PrimitiveType::Double => match s {
-            Scalar::Float(v) => Scalar::Double(f64::from(*v)),
-            _ => {
-                let i = int_val(s)?;
+            Scalar::Float(v) => Narrowing::Exact(Scalar::Double(f64::from(*v))),
+            _ => fit(int_val(s), |i| {
                 let f = i as f64;
-                if f as i64 == i {
-                    Scalar::Double(f)
-                } else {
-                    return None;
-                }
-            }
+                (f as i64 == i).then_some(Scalar::Double(f))
+            }),
         },
-        _ => return None,
-    })
+        _ => Narrowing::Undecidable,
+    }
+}
+
+/// [`narrow_scalar`] for callers that can only use an exact retyping.
+fn narrow_scalar_exact(s: &Scalar, target: &PrimitiveType) -> Option<Scalar> {
+    match narrow_scalar(s, target) {
+        Narrowing::Exact(s) => Some(s),
+        Narrowing::NoValueMatches | Narrowing::Undecidable => None,
+    }
 }
 
 /// Align a numeric literal operand to its column's exact type. Non-numeric
@@ -360,19 +400,28 @@ fn translate_function(
                 return None;
             }
             let lhs_kernel = polars_expr_to_kernel_expression(lhs, schema)?;
-            // Numeric elements narrow to the column's exact type; an inexact
-            // element can equal no column value, so its disjunct drops.
+            // Numeric elements narrow to the column's exact type. An element
+            // the column can never equal drops its disjunct; one that cannot
+            // be retyped at all declines the conjunct, because dropping it
+            // would narrow the set kernel skips on.
             let elements: Vec<Scalar> = match &lhs_kernel {
                 Expression::Column(name) => {
                     match column_leaf_prim(name, schema).filter(numeric_prim) {
-                        Some(target) => elements
-                            .into_iter()
-                            .filter_map(|s| match scalar_numeric_prim(&s) {
-                                Some(sp) if sp == target => Some(s),
-                                Some(_) => narrow_scalar_exact(&s, &target),
-                                None => Some(s),
-                            })
-                            .collect(),
+                        Some(target) => {
+                            let mut kept = Vec::with_capacity(elements.len());
+                            for s in elements {
+                                match scalar_numeric_prim(&s) {
+                                    Some(sp) if sp == target => kept.push(s),
+                                    Some(_) => match narrow_scalar(&s, &target) {
+                                        Narrowing::Exact(s) => kept.push(s),
+                                        Narrowing::NoValueMatches => {}
+                                        Narrowing::Undecidable => return None,
+                                    },
+                                    None => kept.push(s),
+                                }
+                            }
+                            kept
+                        }
                         None => elements,
                     }
                 }
@@ -651,6 +700,58 @@ mod tests {
         assert_eq!(
             datetime_scalar(i64::MAX, TimeUnit::Milliseconds, true),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod is_in_narrowing_tests {
+    use super::*;
+    use delta_kernel::schema::StructField;
+    use polars::prelude::{NamedFrom, col, lit};
+
+    fn long_schema() -> StructType {
+        StructType::try_new([StructField::nullable("id", KernelDataType::LONG)]).unwrap()
+    }
+
+    fn translate(elements: &[f64]) -> Option<Predicate> {
+        let set = Series::new(PlSmallStr::from_static("set"), elements);
+        polars_expr_to_kernel_predicate(&col("id").is_in(lit(set), false), &long_schema())
+    }
+
+    /// A float-spelled element naming an integer exactly must survive
+    /// narrowing. Dropping it emptied the set, and an empty set is
+    /// vacuously false, so kernel pruned every file and the rows were lost.
+    #[test]
+    fn float_spelled_integral_elements_are_kept() {
+        let pred = translate(&[1.0, 2.0]).expect("integral float elements must translate");
+        assert_ne!(
+            pred,
+            Predicate::literal(false),
+            "narrowable elements must not collapse the set to a false predicate"
+        );
+    }
+
+    /// An element the column can never equal drops its own disjunct only.
+    #[test]
+    fn fractional_element_drops_its_disjunct() {
+        let pred = translate(&[1.0, 2.5]).expect("one narrowable element must translate");
+        assert_ne!(pred, Predicate::literal(false));
+        assert_eq!(
+            translate(&[2.5]),
+            Some(Predicate::literal(false)),
+            "a set no column value can equal is vacuously false"
+        );
+    }
+
+    /// Beyond 2^53 a float names no i64 exactly, so the retyping is not
+    /// decidable here and the whole conjunct must be declined.
+    #[test]
+    fn inexact_magnitude_declines_the_conjunct() {
+        assert_eq!(
+            translate(&[1.0e300]),
+            None,
+            "an undecidable element must decline, not prune"
         );
     }
 }
