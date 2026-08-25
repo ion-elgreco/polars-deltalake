@@ -200,10 +200,7 @@ impl ExpressionEvaluator for PolarsExpressionEvaluator {
         }
 
         let exprs: Vec<Expr> = self.ops.iter().map(op_to_expr).collect();
-        let result = df
-            .clone()
-            .lazy()
-            .select(exprs)
+        let result = crate::engine::select_anchored(df.clone().lazy(), &exprs)
             .collect()
             .map_err(to_kernel_err)?;
         Ok(Box::new(PolarsEngineData::new(result)))
@@ -354,4 +351,24 @@ pub(super) fn downcast_engine_data(batch: &dyn EngineData) -> DeltaResult<&Polar
                 "PolarsEvaluationHandler received EngineData that is not PolarsEngineData".into(),
             )
         })
+}
+
+#[cfg(test)]
+mod evaluator_height_tests {
+    use super::*;
+
+    /// Kernel contract: one value per input row. A `Computed` op that
+    /// references no column (a struct/array/binary literal falls through
+    /// `classify_single` to `Computed`) must not collapse the lazy path.
+    #[test]
+    fn column_free_computed_op_keeps_batch_height() {
+        let evaluator = PolarsExpressionEvaluator {
+            ops: vec![ColumnOp::Computed {
+                expr: lit(7i64).alias("v"),
+            }],
+        };
+        let df = polars::df!("x" => [1i64, 2, 3]).unwrap();
+        let out = evaluator.evaluate(&PolarsEngineData::new(df)).unwrap();
+        assert_eq!(out.len(), 3, "one output row per input row");
+    }
 }
