@@ -1,17 +1,21 @@
-//! `delta_kernel::ParquetHandler` over polars-io. Every `read_parquet_files`
-//! call hands the whole file batch to a single `DslBuilder::scan_parquet`
-//! plan with the kernel physical schema attached and polars-io's
-//! `missing_struct_fields=Insert` / `extra_columns=Ignore` policies set, so
-//! polars-io's multi-file scan does cross-file / row-group / column
-//! parallelism in its own scheduler and reads come back already shaped to
-//! the kernel contract.
+//! `delta_kernel::ParquetHandler` over polars-io. Each file gets its own
+//! `DslBuilder::scan_parquet` plan (the kernel contract forbids merging
+//! engine data across file boundaries) with the kernel physical schema
+//! attached and polars-io's `missing_struct_fields=Insert` /
+//! `extra_columns=Ignore` policies set; polars-io parallelises row groups
+//! and columns within the file, and reads come back already shaped to the
+//! kernel contract. RowIndex / FilePath metadata columns are synthesized
+//! per file, never read from the data pages.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::PredicateRef;
-use delta_kernel::schema::{ColumnMetadataKey, DataType as KernelDataType, SchemaRef, StructType};
+use delta_kernel::schema::{
+    ColumnMetadataKey, DataType as KernelDataType, MetadataColumnSpec, SchemaRef, StructField,
+    StructType,
+};
 use delta_kernel::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
     StorageHandler,
@@ -19,7 +23,10 @@ use delta_kernel::{
 use polars::io::cloud::CloudOptions;
 use polars::io::parquet::read::{ParquetOptions, infer_schema};
 use polars::lazy::frame::LazyFrame;
-use polars::prelude::{DataFrame, Expr};
+use polars::prelude::{
+    ChunkFull, Column, DataFrame, DataType as PlDataType, Expr, IntoColumn, IntoSeries, NamedFrom,
+    Series, StringChunked, col, lit,
+};
 use polars_buffer::Buffer;
 use polars_parquet::parquet::metadata::FileMetadata;
 use polars_parquet::parquet::{FOOTER_SIZE, PARQUET_MAGIC, read::deserialize_metadata};
@@ -97,20 +104,70 @@ impl ParquetHandler for PolarsParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        // Empty projection (kernel needs only the row count so its
-        // logical-transform can emit literal columns — e.g. CDF metadata,
-        // all-partition projections): read `num_rows` from each footer and
-        // skip the data scan entirely
-        if physical_schema.fields().next().is_none() {
-            // One batch per file: the contract forbids merging engine data
-            // across file boundaries, and a caller splitting a selection
-            // vector per file cannot attribute rows in a summed batch.
-            let heights = files
+        // Metadata columns are synthesized per file, never read from the
+        // data pages: RowIndex is the 0-based position within each file,
+        // FilePath the file's URL. Anything else must error loudly — the
+        // Insert policy would otherwise null-fill it silently.
+        let mut row_index: Option<PlSmallStr> = None;
+        let mut file_path: Option<PlSmallStr> = None;
+        let mut meta_cols: Vec<(PlSmallStr, MetadataColumnSpec)> = Vec::new();
+        for f in physical_schema.fields() {
+            let Some(spec) = f.get_metadata_column_spec() else {
+                continue;
+            };
+            let name = PlSmallStr::from_str(f.name.as_str());
+            let slot = match spec {
+                MetadataColumnSpec::RowIndex => &mut row_index,
+                MetadataColumnSpec::FilePath => &mut file_path,
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "read_parquet_files: metadata column {other:?} is not supported"
+                    )));
+                }
+            };
+            if slot.replace(name.clone()).is_some() {
+                return Err(Error::Unsupported(format!(
+                    "read_parquet_files: more than one {spec:?} metadata column"
+                )));
+            }
+            meta_cols.push((name, spec));
+        }
+        let read_fields: Vec<StructField> = physical_schema
+            .fields()
+            .filter(|f| f.get_metadata_column_spec().is_none())
+            .cloned()
+            .collect();
+        let read_schema = StructType::try_new(read_fields)?;
+
+        // Footer fast path — nothing needed from the data pages (empty or
+        // metadata-only projection): `num_rows` drives synthesis, one batch
+        // per file per the no-merging contract.
+        if read_schema.fields().next().is_none() {
+            let per_file = files
                 .iter()
-                .map(|f| fetch_parquet_metadata(self.storage.as_ref(), f).map(|m| m.num_rows))
+                .map(|f| {
+                    fetch_parquet_metadata(self.storage.as_ref(), f)
+                        .map(|m| (m.num_rows, f.location.clone()))
+                })
                 .collect::<DeltaResult<Vec<_>>>()?;
-            return Ok(Box::new(heights.into_iter().map(|rows| {
-                let df = DataFrame::empty_with_height(rows);
+            return Ok(Box::new(per_file.into_iter().map(move |(rows, location)| {
+                let columns: Vec<Column> = meta_cols
+                    .iter()
+                    .map(|(name, spec)| match spec {
+                        MetadataColumnSpec::RowIndex => {
+                            Series::new(name.clone(), (0..rows as i64).collect::<Vec<i64>>())
+                                .into_column()
+                        }
+                        _ => StringChunked::full(name.clone(), location.as_str(), rows)
+                            .into_series()
+                            .into_column(),
+                    })
+                    .collect();
+                let df = if columns.is_empty() {
+                    DataFrame::empty_with_height(rows)
+                } else {
+                    DataFrame::new(rows, columns).map_err(to_kernel_err)?
+                };
                 Ok(Box::new(PolarsEngineData::new(df)) as Box<dyn EngineData>)
             })));
         }
@@ -123,9 +180,9 @@ impl ParquetHandler for PolarsParquetHandler {
 
         let select_exprs = crate::scan::select_exprs_for_schema(physical_schema.as_ref());
 
-        let paths: Vec<PlRefPath> = files
+        let paths: Vec<(PlRefPath, String)> = files
             .iter()
-            .map(|f| path_for_polars_io(&f.location))
+            .map(|f| Ok((path_for_polars_io(&f.location)?, f.location.to_string())))
             .collect::<DeltaResult<_>>()?;
 
         read_batch(
@@ -133,7 +190,9 @@ impl ParquetHandler for PolarsParquetHandler {
             self.cloud_opts.as_ref(),
             &select_exprs,
             polars_predicate.as_ref(),
-            physical_schema.as_ref(),
+            &read_schema,
+            row_index,
+            file_path,
         )
     }
 
@@ -305,12 +364,15 @@ pub(crate) fn unified_scan_args(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_batch(
-    paths: Vec<PlRefPath>,
+    paths: Vec<(PlRefPath, String)>,
     cloud_opts: Option<&CloudOptions>,
     select_exprs: &[Expr],
     predicate: Option<&Expr>,
-    physical_schema: &StructType,
+    read_schema: &StructType,
+    row_index: Option<PlSmallStr>,
+    file_path: Option<PlSmallStr>,
 ) -> DeltaResult<FileDataReadResultIterator> {
     // Contract: engines must not merge engine data across file boundaries,
     // so each file gets its own scan. Construction is deferred inside the
@@ -319,14 +381,17 @@ fn read_batch(
     let cloud_opts = cloud_opts.cloned();
     let select_exprs = select_exprs.to_vec();
     let predicate = predicate.cloned();
-    let physical_schema = physical_schema.clone();
-    let iter = paths.into_iter().flat_map(move |path| {
+    let read_schema = read_schema.clone();
+    let iter = paths.into_iter().flat_map(move |(path, location)| {
         match file_batches(
             path,
+            &location,
             cloud_opts.as_ref(),
             &select_exprs,
             predicate.as_ref(),
-            &physical_schema,
+            &read_schema,
+            row_index.as_ref(),
+            file_path.as_ref(),
         ) {
             Ok(batches) => batches,
             Err(e) => Box::new(std::iter::once(Err(e))),
@@ -337,18 +402,39 @@ fn read_batch(
 
 type BatchIter = Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
 
+#[allow(clippy::too_many_arguments)]
 fn file_batches(
     path: PlRefPath,
+    location: &str,
     cloud_opts: Option<&CloudOptions>,
     select_exprs: &[Expr],
     predicate: Option<&Expr>,
-    physical_schema: &StructType,
+    read_schema: &StructType,
+    row_index: Option<&PlSmallStr>,
+    file_path: Option<&PlSmallStr>,
 ) -> DeltaResult<BatchIter> {
-    let lazy = dsl_parquet_scan(
-        vec![path],
-        physical_schema,
-        unified_scan_args(cloud_opts, None),
-    )?;
+    let mut args = unified_scan_args(cloud_opts, None);
+    if let Some(name) = row_index {
+        args.row_index = Some(polars::prelude::RowIndex {
+            name: name.clone(),
+            offset: 0,
+        });
+    }
+    let lazy = dsl_parquet_scan(vec![path], read_schema, args)?;
+    let mut synthesized: Vec<Expr> = Vec::new();
+    if let Some(name) = row_index {
+        // The plan contract types metadata columns LONG; polars' row index
+        // is IDX_DTYPE (u32).
+        synthesized.push(col(name.clone()).cast(PlDataType::Int64));
+    }
+    if let Some(name) = file_path {
+        synthesized.push(lit(location).alias(name.clone()));
+    }
+    let lazy = if synthesized.is_empty() {
+        lazy
+    } else {
+        lazy.with_columns(synthesized)
+    };
     let mut plan = lazy.select(select_exprs);
     if let Some(pred) = predicate {
         plan = plan.filter(pred.clone());
@@ -451,6 +537,116 @@ mod per_file_batch_tests {
             })
             .collect();
         assert_eq!(xs, vec![1, 2, 3, 4, 5, 6], "file and row order hold");
+    }
+
+    /// ParquetHandler contract: a RowIndex metadata column carries the
+    /// 0-based row position within each file (restarting per file) and a
+    /// FilePath column the file's path — populated, not null-filled.
+    #[test]
+    fn metadata_columns_are_synthesized() {
+        use delta_kernel::schema::MetadataColumnSpec;
+
+        let dir = std::env::temp_dir().join(format!("pldl-metacol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, vals) in [("a.parquet", vec![10i64, 20, 30]), ("b.parquet", vec![40])] {
+            let mut df = polars::df!("x" => vals).unwrap();
+            ParquetWriter::new(std::fs::File::create(dir.join(name)).unwrap())
+                .finish(&mut df)
+                .unwrap();
+        }
+        let base = Url::from_directory_path(&dir).unwrap();
+        let rt = crate::engine::rt();
+        let storage =
+            Arc::new(ObjectStoreStorageHandler::new(&base, std::iter::empty(), rt).unwrap());
+        let handler = PolarsParquetHandler::new(storage, HashMap::new()).unwrap();
+
+        let schema = Arc::new(
+            StructType::try_new([
+                StructField::not_null("x", DataType::LONG),
+                StructField::create_metadata_column("ridx", MetadataColumnSpec::RowIndex),
+                StructField::create_metadata_column("fname", MetadataColumnSpec::FilePath),
+            ])
+            .unwrap(),
+        );
+        let files: Vec<FileMeta> = ["a.parquet", "b.parquet"]
+            .iter()
+            .map(|n| FileMeta {
+                location: base.join(n).unwrap(),
+                last_modified: 0,
+                size: std::fs::metadata(dir.join(n)).unwrap().len(),
+            })
+            .collect();
+        let batches: Vec<_> = handler
+            .read_parquet_files(&files, schema, None)
+            .unwrap()
+            .collect::<DeltaResult<Vec<_>>>()
+            .unwrap();
+
+        let mut ridx = Vec::new();
+        let mut fnames = Vec::new();
+        for b in &batches {
+            let df = b
+                .any_ref()
+                .downcast_ref::<PolarsEngineData>()
+                .unwrap()
+                .dataframe();
+            let col = df.column("ridx").unwrap();
+            assert_eq!(col.dtype(), &polars::prelude::DataType::Int64);
+            ridx.extend(col.i64().unwrap().iter().map(|v| v.unwrap()));
+            fnames.extend(
+                df.column("fname")
+                    .unwrap()
+                    .str()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.unwrap().to_string()),
+            );
+        }
+        assert_eq!(ridx, vec![0, 1, 2, 0], "row index restarts per file");
+        assert!(
+            fnames[0].ends_with("a.parquet") && fnames[3].ends_with("b.parquet"),
+            "got: {fnames:?}"
+        );
+    }
+
+    /// Unsupported metadata specs must error loudly rather than come back
+    /// as silently null-filled data columns.
+    #[test]
+    fn unsupported_metadata_spec_errors() {
+        use delta_kernel::schema::MetadataColumnSpec;
+
+        let dir = std::env::temp_dir().join(format!("pldl-metaerr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut df = polars::df!("x" => [1i64]).unwrap();
+        ParquetWriter::new(std::fs::File::create(dir.join("a.parquet")).unwrap())
+            .finish(&mut df)
+            .unwrap();
+        let base = Url::from_directory_path(&dir).unwrap();
+        let rt = crate::engine::rt();
+        let storage =
+            Arc::new(ObjectStoreStorageHandler::new(&base, std::iter::empty(), rt).unwrap());
+        let handler = PolarsParquetHandler::new(storage, HashMap::new()).unwrap();
+
+        let schema = Arc::new(
+            StructType::try_new([
+                StructField::not_null("x", DataType::LONG),
+                StructField::create_metadata_column("rid", MetadataColumnSpec::RowId),
+            ])
+            .unwrap(),
+        );
+        let files = vec![FileMeta {
+            location: base.join("a.parquet").unwrap(),
+            last_modified: 0,
+            size: std::fs::metadata(dir.join("a.parquet")).unwrap().len(),
+        }];
+        let result = handler
+            .read_parquet_files(&files, schema, None)
+            .and_then(|it| it.collect::<DeltaResult<Vec<_>>>());
+        let err = match result {
+            Ok(_) => panic!("RowId is unsupported and must error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("metadata column"), "got: {err}");
     }
 }
 
