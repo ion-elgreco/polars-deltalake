@@ -127,7 +127,7 @@ pub(crate) struct LogicalScanIter {
     /// applied after the select list materializes partition values.
     orphan_predicate: Option<Expr>,
     /// Index-aligned with `rewrites`: the pre-parsed fast path for each
-    /// select list, when it qualifies and no predicate needs the lazy path.
+    /// select list, when it qualifies.
     simple: Vec<Option<SimpleSelect>>,
     /// One inner frame may span multiple files; we slice into per-file
     /// frames here and drain before pulling the next inner frame.
@@ -142,13 +142,9 @@ impl LogicalScanIter {
         physical_predicate: Option<Expr>,
         orphan_predicate: Option<Expr>,
     ) -> Self {
-        let any_predicate = physical_predicate.is_some() || orphan_predicate.is_some();
         let simple = rewrites
             .iter()
-            .map(|r| match (&r.select, any_predicate) {
-                (Some(select), false) => SimpleSelect::parse(select),
-                _ => None,
-            })
+            .map(|r| r.select.as_deref().and_then(SimpleSelect::parse))
             .collect();
         Self {
             source,
@@ -224,32 +220,52 @@ impl LogicalScanIter {
                 .map_err(|e| delta_kernel::Error::Generic(format!("DV filter: {e}")))?;
         }
 
-        if let Some(fast) = &self.simple[idx] {
-            df = fast
-                .apply(&df)
-                .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))?;
-        } else if rewrite.select.is_some()
-            || self.physical_predicate.is_some()
-            || self.orphan_predicate.is_some()
-        {
-            let mut lazy = df.lazy();
-            // Physical names are still in place here, before the select.
-            if let Some(pred) = &self.physical_predicate {
-                lazy = lazy.filter(pred.clone());
+        // Physical names are still in place here, before the select.
+        if let Some(pred) = &self.physical_predicate {
+            df = collect_lazy(df.lazy().filter(pred.clone()))?;
+        }
+        match (&self.simple[idx], &rewrite.select) {
+            (Some(fast), _) => {
+                df = fast.apply(&df).map_err(|e| {
+                    delta_kernel::Error::Generic(format!("logical rewrite eval: {e}"))
+                })?;
             }
-            if let Some(select) = &rewrite.select {
-                lazy = lazy.select(select.clone());
-            }
-            if let Some(pred) = &self.orphan_predicate {
-                lazy = lazy.filter(pred.clone());
-            }
-            df = lazy
-                .collect_with_engine(PolarsEngineMode::Streaming)
-                .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))?
-                .unwrap_single();
+            (None, Some(select)) => df = collect_lazy(select_anchored(df, select))?,
+            (None, None) => {}
+        }
+        if let Some(pred) = &self.orphan_predicate {
+            df = collect_lazy(df.lazy().filter(pred.clone()))?;
         }
         Ok(df)
     }
+}
+
+fn collect_lazy(lazy: polars::prelude::LazyFrame) -> Result<DataFrame, delta_kernel::Error> {
+    Ok(lazy
+        .collect_with_engine(PolarsEngineMode::Streaming)
+        .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))?
+        .unwrap_single())
+}
+
+/// Polars sizes a select from its expressions, so a list that names no
+/// column — an all-partition projection, whose entries are every one a
+/// broadcast literal — collapses the file to a single row. A row index
+/// anchors the select to the input height.
+fn select_anchored(df: DataFrame, select: &[Expr]) -> polars::prelude::LazyFrame {
+    const ANCHOR: &str = "__pldl_rows__";
+    let references_column = select
+        .iter()
+        .any(|e| !polars_plan::utils::expr_to_leaf_column_names(e).is_empty());
+    if references_column {
+        return df.lazy().select(select);
+    }
+    let anchor = PlSmallStr::from_static(ANCHOR);
+    let mut exprs = select.to_vec();
+    exprs.push(polars::prelude::col(anchor.clone()));
+    df.lazy()
+        .with_row_index(anchor.clone(), None)
+        .select(exprs)
+        .drop(polars::prelude::cols([anchor]))
 }
 
 /// First index in `start..end` where `file_str.get(i) != value`, or `end`
@@ -347,5 +363,23 @@ mod simple_select_tests {
 
         let multi = lit(Series::new("s".into(), [1i64, 2])).alias("part");
         assert!(SimpleSelect::parse(&[multi]).is_none());
+    }
+
+    /// An all-partition projection selects nothing but literals; polars sizes
+    /// that select from the expressions and would return one row per file.
+    #[test]
+    fn column_free_select_keeps_the_input_height() {
+        let frame = df!("phys" => [1i64, 2, 3])
+            .unwrap()
+            .select(["phys"])
+            .unwrap();
+        let frame = frame.drop("phys").unwrap();
+        assert_eq!(frame.height(), 3);
+        assert_eq!(frame.width(), 0);
+
+        let select = vec![lit(7i64).alias("part")];
+        let out = super::select_anchored(frame, &select).collect().unwrap();
+        assert_eq!(out.height(), 3);
+        assert_eq!(out.get_column_names(), ["part"]);
     }
 }
