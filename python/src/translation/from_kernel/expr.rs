@@ -111,21 +111,33 @@ fn json_decode_lenient(raw: Expr, dtype: PlDataType) -> Expr {
     let output = dtype.clone();
     raw.map(
         move |column| {
-            let blanked: StringChunked = column
-                .str()?
-                .iter()
-                .map(|v| v.filter(|s| !s.trim().is_empty()))
-                .collect();
-            let decoded = match blanked.json_decode(Some(dtype.clone()), None) {
-                Ok(series) => series,
-                Err(_) => {
+            let ca = column.str()?;
+            let blank = |s: &str| s.trim().is_empty();
+            let blanked: Cow<StringChunked> = if ca.iter().any(|v| v.is_some_and(blank)) {
+                Cow::Owned(ca.iter().map(|v| v.filter(|s| !blank(s))).collect())
+            } else {
+                Cow::Borrowed(ca)
+            };
+            // The decoder is line-oriented, so a value holding several
+            // documents inflates the output; a length mismatch means some
+            // value is unparsable-as-one-document and must go NULL.
+            let n = blanked.len();
+            let decoded = match blanked
+                .json_decode(Some(dtype.clone()), None)
+                .ok()
+                .filter(|s| s.len() == n)
+            {
+                Some(series) => series,
+                None => {
                     let mut out = Series::new_empty(PlSmallStr::EMPTY, &dtype);
                     for value in blanked.iter() {
                         let one = Series::new(PlSmallStr::EMPTY, [value]);
                         let decoded = one
                             .str()
                             .and_then(|ca| ca.json_decode(Some(dtype.clone()), None))
-                            .unwrap_or_else(|_| Series::full_null(PlSmallStr::EMPTY, 1, &dtype));
+                            .ok()
+                            .filter(|s| s.len() == 1)
+                            .unwrap_or_else(|| Series::full_null(PlSmallStr::EMPTY, 1, &dtype));
                         out.append(&decoded)?;
                     }
                     out
@@ -661,6 +673,63 @@ mod parse_json_tests {
             col.get(1).unwrap()
         );
         assert!(matches!(col.get(2).unwrap(), AnyValue::Null));
+    }
+
+    /// A value holding two comma-separated documents is one unparsable JSON
+    /// value, but polars' NDJSON decoder happily emits two rows for it. The
+    /// contract is one output row per input value, offenders going NULL.
+    #[test]
+    fn multi_document_value_decodes_to_null_not_extra_rows() {
+        let schema = Arc::new(
+            StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap(),
+        );
+        let expr = Expression::parse_json(ColumnName::new(["stats"]), schema.clone());
+        let output_type = KernelDataType::Struct(Box::new((*schema).clone()));
+        let frame = df!("stats" => [Some("{\"a\":1},{\"a\":2}"), Some("{\"a\":5}")]).unwrap();
+
+        let translated = translate_expr(&expr, Some(&output_type), None).unwrap();
+        let out = frame
+            .lazy()
+            .select([translated.alias("out")])
+            .collect()
+            .unwrap();
+        let col = out.column("out").unwrap();
+
+        assert_eq!(col.len(), 2, "one output row per input value");
+        assert!(
+            matches!(col.get(0).unwrap(), AnyValue::Null),
+            "multi-document value must decode to NULL, got {:?}",
+            col.get(0).unwrap()
+        );
+        assert!(!matches!(col.get(1).unwrap(), AnyValue::Null));
+    }
+
+    /// Same contract through the per-value retry arm: a malformed value
+    /// forces the batch fallback, and a multi-document value inside that
+    /// loop must still contribute exactly one (NULL) row.
+    #[test]
+    fn retry_arm_keeps_one_row_per_value() {
+        let schema = Arc::new(
+            StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap(),
+        );
+        let expr = Expression::parse_json(ColumnName::new(["stats"]), schema.clone());
+        let output_type = KernelDataType::Struct(Box::new((*schema).clone()));
+        let frame =
+            df!("stats" => [Some("not json"), Some("{\"a\":1},{\"a\":2}"), Some("{\"a\":5}")])
+                .unwrap();
+
+        let translated = translate_expr(&expr, Some(&output_type), None).unwrap();
+        let out = frame
+            .lazy()
+            .select([translated.alias("out")])
+            .collect()
+            .unwrap();
+        let col = out.column("out").unwrap();
+
+        assert_eq!(col.len(), 3, "one output row per input value");
+        assert!(matches!(col.get(0).unwrap(), AnyValue::Null));
+        assert!(matches!(col.get(1).unwrap(), AnyValue::Null));
+        assert!(!matches!(col.get(2).unwrap(), AnyValue::Null));
     }
 }
 

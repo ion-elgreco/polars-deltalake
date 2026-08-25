@@ -48,7 +48,16 @@ def _rewrite_add_stats(table_path: Path, stats: str, version: int = 0) -> None:
 
 @pytest.mark.parametrize(
     "stats",
-    ["", "   ", "\t\n", "not json", '{"numRecords":', "42", "null"],
+    [
+        "",
+        "   ",
+        "\t\n",
+        "not json",
+        '{"numRecords":',
+        "42",
+        "null",
+        '{"numRecords":1},{"numRecords":2}',
+    ],
     ids=[
         "empty",
         "spaces",
@@ -57,6 +66,7 @@ def _rewrite_add_stats(table_path: Path, stats: str, version: int = 0) -> None:
         "truncated",
         "scalar",
         "json-null",
+        "multi-doc",
     ],
 )
 def test_unparsable_stats_reads_every_row(tmp_path: Path, stats: str) -> None:
