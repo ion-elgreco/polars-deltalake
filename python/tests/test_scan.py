@@ -520,9 +520,8 @@ class TestMixedAtomicConjunct:
 
 class TestDeletionVectors:
     """`deltalake` never writes deletion vectors — it rewrites the file even
-    with `delta.enableDeletionVectors` set — so the three DELETE tests below
-    exercise the rewrite path, not the keep-mask, whatever their names
-    suggest. `test_dv_with_predicate` reaches it via the DAT fixture."""
+    with `delta.enableDeletionVectors` set. Only `test_dv_with_predicate`,
+    which reads the DAT fixture, reaches the keep-mask."""
 
     def test_delete_via_rewrite(self, tmp_path):
         """Plain DELETE (no DV protocol) — deltalake rewrites the file."""
@@ -539,8 +538,8 @@ class TestDeletionVectors:
         assert out["name"].to_list() == ["a", "b"]
 
     def test_dv_enabled_delete(self, tmp_path):
-        """DV-enabled DELETE — exercises kernel's selection-vector application
-        path and our `EngineData::apply_selection_vector`."""
+        """DELETE on a DV-enabled table — `deltalake` still rewrites the
+        file, so this covers the rewrite path with the DV protocol on."""
         from deltalake import DeltaTable, write_deltalake
 
         table_path = str(tmp_path / "dv")
@@ -557,8 +556,8 @@ class TestDeletionVectors:
         assert out["id"].to_list() == [1, 3, 5]
 
     def test_dv_with_projection(self, tmp_path):
-        """DV + projection — verifies that selection vectors apply before the
-        polars projection so deleted rows don't leak into the projected output."""
+        """DELETE + projection on a DV-enabled table — deleted rows must not
+        leak into the projected output."""
         from deltalake import DeltaTable, write_deltalake
 
         table_path = str(tmp_path / "dv_proj")

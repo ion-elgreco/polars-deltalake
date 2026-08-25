@@ -14,7 +14,7 @@ use polars_utils::pl_str::PlSmallStr;
 pub(crate) const FILE_ID_COL: &str = "__pldl_file__";
 
 /// `scan_parquet` plan over `paths`. `include_file_id` injects FILE_ID_COL
-/// so the read path can slice rows back to source files for DV / Transform.
+/// so the read path can slice rows back to source files for DV / select.
 pub(crate) fn build_lazy_scan(
     paths: Vec<PlRefPath>,
     cloud_opts: Option<&CloudOptions>,

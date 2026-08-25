@@ -247,7 +247,7 @@ pub(crate) fn rewrite_predicate_to_physical(
         let phys = field.physical_name(mode);
         // A flat name rewrite fixes only the root, so nested-renamed columns
         // stay out: the check below then declines the whole predicate, which
-        // runs after `transform_to_logical` on logical names instead.
+        // runs after the physical→logical select on logical names instead.
         if phys_names.contains(phys) && !renames_nested_fields(&field.data_type, mode) {
             logical_to_phys.insert(field.name.to_string(), PlSmallStr::from_str(phys));
         }

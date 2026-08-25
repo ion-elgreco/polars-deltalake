@@ -115,7 +115,8 @@ fn next_output<'a>(
 }
 
 /// Prepend computed fields, then walk input fields applying per-field
-/// replace/insert directives from `field_transforms`. Output ordering must
+/// replace/insert directives from `field_patches`, then append
+/// `appended_fields`. Output ordering must
 /// match `output_struct` position-by-position — kernel consumes the output
 /// schema in lockstep with prepends, pass-throughs, and inserts.
 pub(super) fn translate_transform(
@@ -203,8 +204,8 @@ mod missing_patch_tests {
             prepended_fields: vec![],
             appended_fields: vec![],
         };
-        let output = StructType::try_new([StructField::nullable("keep", KernelDataType::LONG)])
-            .unwrap();
+        let output =
+            StructType::try_new([StructField::nullable("keep", KernelDataType::LONG)]).unwrap();
         let kept = StructField::nullable("keep", KernelDataType::LONG);
 
         let err = match walk_transform_slots(&patch, &output, &[&kept]) {
