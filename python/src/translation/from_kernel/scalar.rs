@@ -85,15 +85,13 @@ pub(crate) fn scalar_to_lit(scalar: &Scalar) -> Expr {
             Ok(polars_dt) => lit(polars::prelude::LiteralValue::untyped_null()).cast(polars_dt),
             Err(_) => lit(polars::prelude::LiteralValue::untyped_null()),
         },
-        // Intervals only occur in kernel-side expression evaluation, never in
-        // Delta data. Day-time is µs → Duration; year-month is a month count
-        // with no polars dtype, kept as Int32 so same-kind comparisons stay
-        // consistent.
-        Scalar::IntervalDayTime(v) => lit(PolarsScalar::new(
-            PlDataType::Duration(TimeUnit::Microseconds),
-            AnyValue::Duration(*v, TimeUnit::Microseconds),
-        )),
-        Scalar::IntervalYearMonth(v) => lit(*v),
+        // Intervals only occur in kernel-side expression evaluation, never
+        // in Delta data; the dtype decision (day-time µs → Duration,
+        // year-month → typed Int32 month count) lives in
+        // `try_to_polars_scalar`.
+        Scalar::IntervalDayTime(_) | Scalar::IntervalYearMonth(_) => lit(
+            try_to_polars_scalar(scalar).expect("interval scalars are always representable"),
+        ),
         Scalar::Array(_) | Scalar::Map(_) | Scalar::Struct(_) | Scalar::Decimal(_) => {
             build_series("__lit__", &scalar.data_type(), &[scalar])
                 .map(lit)
