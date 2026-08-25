@@ -68,7 +68,10 @@ impl EvaluationHandler for PolarsEvaluationHandler {
         output_type: KernelDataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         let ops = build_column_ops(input_schema.as_ref(), expression.as_ref(), &output_type)?;
-        Ok(Arc::new(PolarsExpressionEvaluator { ops }))
+        Ok(Arc::new(PolarsExpressionEvaluator::new(
+            ops,
+            input_schema.num_fields(),
+        )))
     }
 
     fn new_predicate_evaluator(
@@ -171,18 +174,34 @@ enum ColumnOp {
 
 struct PolarsExpressionEvaluator {
     ops: Vec<ColumnOp>,
+    /// Both derived from `ops` at construction: recomputing them per batch
+    /// would re-clone every expr tree on the log-replay hot path.
+    lazy_exprs: Vec<Expr>,
+    all_simple: bool,
+    /// `Passthrough` addresses input columns by position, so the fast path
+    /// only holds for a batch as wide as the schema it was built from.
+    input_width: usize,
+}
+
+impl PolarsExpressionEvaluator {
+    fn new(ops: Vec<ColumnOp>, input_width: usize) -> Self {
+        let lazy_exprs = ops.iter().map(op_to_expr).collect();
+        let all_simple = !ops.iter().any(|op| matches!(op, ColumnOp::Computed { .. }));
+        Self {
+            ops,
+            lazy_exprs,
+            all_simple,
+            input_width,
+        }
+    }
 }
 
 impl ExpressionEvaluator for PolarsExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let df = downcast_engine_data(batch)?.dataframe();
         let height = df.height();
-        let all_simple = !self
-            .ops
-            .iter()
-            .any(|op| matches!(op, ColumnOp::Computed { .. }));
 
-        if all_simple {
+        if self.all_simple && df.width() == self.input_width {
             let input_cols = df.columns();
             let columns: Vec<Column> = self
                 .ops
@@ -203,8 +222,10 @@ impl ExpressionEvaluator for PolarsExpressionEvaluator {
             return Ok(Box::new(PolarsEngineData::new(result)));
         }
 
-        let exprs: Vec<Expr> = self.ops.iter().map(op_to_expr).collect();
-        let result = crate::engine::select_anchored(df.clone().lazy(), &exprs)
+        // Resolves passthroughs by name, so a batch that does not match the
+        // declared input schema errors here instead of silently picking the
+        // column that happens to sit at that position.
+        let result = crate::engine::select_anchored(df.clone().lazy(), &self.lazy_exprs)
             .collect()
             .map_err(to_kernel_err)?;
         Ok(Box::new(PolarsEngineData::new(result)))
@@ -377,16 +398,45 @@ mod evaluator_height_tests {
         assert!(result.is_err(), "type mismatch must error, not panic");
     }
 
+    /// `Passthrough` addresses input columns by position, so a batch that
+    /// is narrower than the declared input schema must fall back to the
+    /// name-resolving path and error — not index past the column vector.
+    #[test]
+    fn narrow_batch_errors_instead_of_indexing_past_the_end() {
+        let handler = PolarsEvaluationHandler::new();
+        let input_schema = Arc::new(
+            StructType::try_new([
+                StructField::nullable("a", KernelDataType::LONG),
+                StructField::nullable("b", KernelDataType::LONG),
+            ])
+            .unwrap(),
+        );
+        let evaluator = handler
+            .new_expression_evaluator(
+                input_schema,
+                Arc::new(Expression::column(["b"])),
+                KernelDataType::LONG,
+            )
+            .unwrap();
+        let df = polars::df!("a" => [1i64]).unwrap();
+        let out = evaluator.evaluate(&PolarsEngineData::new(df));
+        assert!(
+            out.is_err(),
+            "a batch narrower than the declared schema must error"
+        );
+    }
+
     /// Kernel contract: one value per input row. A `Computed` op that
     /// references no column (a struct/array/binary literal falls through
     /// `classify_single` to `Computed`) must not collapse the lazy path.
     #[test]
     fn column_free_computed_op_keeps_batch_height() {
-        let evaluator = PolarsExpressionEvaluator {
-            ops: vec![ColumnOp::Computed {
+        let evaluator = PolarsExpressionEvaluator::new(
+            vec![ColumnOp::Computed {
                 expr: lit(7i64).alias("v"),
             }],
-        };
+            1,
+        );
         let df = polars::df!("x" => [1i64, 2, 3]).unwrap();
         let out = evaluator.evaluate(&PolarsEngineData::new(df)).unwrap();
         assert_eq!(out.len(), 3, "one output row per input row");
