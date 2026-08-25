@@ -29,7 +29,9 @@ pub(crate) fn polars_expr_to_kernel_predicate(
     expr: &Expr,
     schema: &StructType,
 ) -> Option<Predicate> {
-    if let Some(name) = column_ref(expr, schema) {
+    // `Predicate::from_expr` is a truthiness test, so only a boolean column
+    // means here what it means in polars.
+    if let Some(name) = boolean_column_ref(expr, schema) {
         return Some(Predicate::from_expr(name));
     }
     match expr {
@@ -55,6 +57,13 @@ fn column_ref(expr: &Expr, schema: &StructType) -> Option<ColumnName> {
     let path = column_path(expr)?;
     column_leaf_type(&path, schema)?;
     Some(ColumnName::new(path.iter().map(|s| s.to_string())))
+}
+
+/// [`column_ref`] restricted to boolean leaves, for predicate position.
+fn boolean_column_ref(expr: &Expr, schema: &StructType) -> Option<ColumnName> {
+    let path = column_path(expr)?;
+    matches!(column_leaf_type(&path, schema)?, PrimitiveType::Boolean)
+        .then(|| ColumnName::new(path.iter().map(|s| s.to_string())))
 }
 
 /// Primitive leaf type `path` resolves to, or `None` if any segment is
@@ -752,6 +761,47 @@ mod is_in_narrowing_tests {
             translate(&[1.0e300]),
             None,
             "an undecidable element must decline, not prune"
+        );
+    }
+}
+
+#[cfg(test)]
+mod predicate_position_tests {
+    use super::*;
+    use delta_kernel::schema::StructField;
+    use polars::prelude::{col, lit};
+
+    fn long_schema() -> StructType {
+        StructType::try_new([StructField::nullable("id", KernelDataType::LONG)]).unwrap()
+    }
+
+    /// `Predicate::from_expr` is a truthiness test, so a non-boolean column
+    /// in predicate position would be pushed as `n IS TRUE` and skipped
+    /// against stats that mean something else.
+    #[test]
+    fn non_boolean_column_is_not_a_predicate() {
+        assert_eq!(
+            polars_expr_to_kernel_predicate(&col("id"), &long_schema()),
+            None,
+            "a LONG column is not a truth value"
+        );
+        // The reported route in: `== True` folds the literal away first, so
+        // the fold must not hand back a bare truthiness test on a LONG.
+        let truthy = Predicate::from_expr(ColumnName::new(["id"]));
+        let folded = polars_expr_to_kernel_predicate(&col("id").eq(lit(true)), &long_schema());
+        assert_ne!(folded, Some(truthy.clone()));
+        assert_ne!(folded, Some(Predicate::not(truthy)));
+    }
+
+    /// A boolean column still translates — the restriction is on the type,
+    /// not on bare column references.
+    #[test]
+    fn boolean_column_is_a_predicate() {
+        let schema =
+            StructType::try_new([StructField::nullable("flag", KernelDataType::BOOLEAN)]).unwrap();
+        assert_eq!(
+            polars_expr_to_kernel_predicate(&col("flag"), &schema),
+            Some(Predicate::from_expr(ColumnName::new(["flag"])))
         );
     }
 }
