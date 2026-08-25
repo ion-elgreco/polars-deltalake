@@ -377,9 +377,7 @@ class TestFloat32Pushdown:
             if "add" in json.loads(line)
         ]
         low = next(
-            a["path"]
-            for a in adds
-            if json.loads(a["stats"])["maxValues"]["g"] < 50
+            a["path"] for a in adds if json.loads(a["stats"])["maxValues"]["g"] < 50
         )
         Path(f32_table, low).unlink()
 
