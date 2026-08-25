@@ -79,14 +79,15 @@ fn column_leaf_type<'a>(path: &[PlSmallStr], schema: &'a StructType) -> Option<&
 /// stats, so a cast that *changes values* must not be dropped: on a
 /// `Float64` column holding `1.4`, `col.cast(Int32) == 1` is true while the
 /// stripped `col == 1` is false, and the file holding the matching row is
-/// pruned away. Only a cast over a non-column operand (polars folds the
-/// literal itself) or a lossless widening survives the trip.
+/// pruned away. Only a lossless widening over a resolvable column survives
+/// the trip — a raw expression can carry an unfolded value-changing cast on
+/// a literal, so a non-column operand declines.
 fn cast_is_droppable(inner: &Expr, dtype: &DataTypeExpr, schema: &StructType) -> bool {
     let Some(path) = column_path(inner) else {
-        return true;
+        return false;
     };
     let Some(from) = column_leaf_type(&path, schema) else {
-        return true;
+        return false;
     };
     let DataTypeExpr::Literal(target) = dtype else {
         return false;

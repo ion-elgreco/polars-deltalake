@@ -16,7 +16,7 @@ import polars as pl
 import pytest
 from deltalake import write_deltalake
 
-from polars_deltalake import TableState, scan_delta
+from polars_deltalake import TableScan, TableState, scan_delta
 
 
 @pytest.fixture
@@ -254,6 +254,11 @@ class TestCastUnwrap:
         expr = (pl.col("id") == 1).alias("masked")
         assert _kernel_count(rich_table, expr) == 1
 
+    def test_literal_cast_declines(self, rich_table):
+        """A cast over a literal changes the compared value; dropping it
+        would push the pre-cast literal into the skipping predicate."""
+        assert _kernel_count(rich_table, pl.col("f") == pl.lit(2.9).cast(pl.Int64)) == 0
+
 
 class TestCastPruningSoundness:
     def test_truncating_cast_keeps_matching_rows(self, tmp_path: Path):
@@ -276,6 +281,26 @@ class TestCastPruningSoundness:
             .sort("id")["id"]
             .to_list()
         )
+        assert got == [1, 2]
+
+    def test_literal_cast_via_raw_configure(self, tmp_path: Path):
+        """polars folds literal casts before the IO plugin sees them, but the
+        exported ``TableScan.configure`` receives raw exprs. ``f == 2.9`` must
+        not reach kernel: file A's stats [2.0, 2.0] falsify it, pruning the
+        file that holds the rows the evaluated predicate (f == 2.0) matches."""
+        table = str(tmp_path / "casts2")
+        write_deltalake(table, pl.DataFrame({"id": [1, 2], "f": [2.0, 2.0]}).to_arrow())
+        write_deltalake(
+            table,
+            pl.DataFrame({"id": [3], "f": [10.0]}).to_arrow(),
+            mode="append",
+        )
+        scan = TableScan(TableState(table))
+        scan.configure(None, None, pl.col("f") == pl.lit(2.9).cast(pl.Int64))
+        frames = []
+        while (df := scan.next()) is not None:
+            frames.append(df)
+        got = sorted(pl.concat(frames)["id"].to_list()) if frames else []
         assert got == [1, 2]
 
 
