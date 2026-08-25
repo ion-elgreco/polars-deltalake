@@ -24,7 +24,7 @@ use polars_utils::pl_str::PlSmallStr;
 use url::Url;
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
-use crate::engine::PolarsEngineData;
+use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{empty_typed_list_expr, null_gated};
 use crate::translation::schema::KernelDataTypeExt;
@@ -145,7 +145,7 @@ pub(crate) fn align_lazy(
     kernel_schema: &delta_kernel::schema::StructType,
 ) -> DeltaResult<LazyFrame> {
     let polars_schema = df.schema().clone();
-    let mut select_exprs: Vec<Expr> = kernel_schema
+    let select_exprs: Vec<Expr> = kernel_schema
         .fields()
         .map(|field| {
             let inferred = polars_schema.get(field.name.as_str());
@@ -154,25 +154,9 @@ pub(crate) fn align_lazy(
         })
         .collect::<DeltaResult<_>>()?;
 
-    // Polars sizes a select from its expressions, so a list that names no
-    // column collapses the frame to one row — the file names none of the
-    // requested fields, or every one it does name aligns to a literal (an
-    // empty inferred struct for a Map). A row index anchors the height.
-    let references_column = select_exprs
-        .iter()
-        .any(|e| !polars_plan::utils::expr_to_leaf_column_names(e).is_empty());
-    if !references_column {
-        const ANCHOR: &str = "__pldl_rows__";
-        let anchor = PlSmallStr::from_static(ANCHOR);
-        select_exprs.push(col(anchor.clone()));
-        return Ok(df
-            .lazy()
-            .with_row_index(anchor.clone(), None)
-            .select(select_exprs)
-            .drop(polars::prelude::cols([anchor])));
-    }
-
-    Ok(df.lazy().select(select_exprs))
+    // The file may name none of the requested fields, or every one it does
+    // name aligns to a literal (an empty inferred struct for a Map).
+    Ok(select_anchored(df.lazy(), &select_exprs))
 }
 
 /// Top-level callers pass `col(name)`; nested walks pass the appropriate

@@ -9,14 +9,33 @@ use delta_kernel::expressions::{ArrayData, ColumnName};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
-    BinaryChunked, BooleanChunked, DataFrame, DataType as PlDataType, Float32Chunked,
-    Float64Chunked, Int8Chunked, Int16Chunked, Int32Chunked, Int64Chunked, IntoColumn, ListChunked,
-    NamedFrom, Series, StringChunked,
+    BinaryChunked, BooleanChunked, DataFrame, DataType as PlDataType, Expr, Float32Chunked,
+    Float64Chunked, Int8Chunked, Int16Chunked, Int32Chunked, Int64Chunked, IntoColumn, LazyFrame,
+    ListChunked, NamedFrom, Series, StringChunked, col, cols,
 };
 use polars_arrow::array::{Array as ArrowArray, Utf8ViewArray};
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::errors::to_kernel_err;
+
+/// Polars sizes a select from its expressions, so a list that names no
+/// column — every entry a broadcast literal — collapses the frame to a
+/// single row. A row index anchors the select to the input height.
+pub(crate) fn select_anchored(lf: LazyFrame, select: &[Expr]) -> LazyFrame {
+    const ANCHOR: &str = "__pldl_rows__";
+    let references_column = select
+        .iter()
+        .any(|e| !polars_plan::utils::expr_to_leaf_column_names(e).is_empty());
+    if references_column {
+        return lf.select(select);
+    }
+    let anchor = polars_utils::pl_str::PlSmallStr::from_static(ANCHOR);
+    let mut exprs = select.to_vec();
+    exprs.push(col(anchor.clone()));
+    lf.with_row_index(anchor.clone(), None)
+        .select(exprs)
+        .drop(cols([anchor]))
+}
 
 pub(crate) struct PolarsEngineData {
     df: DataFrame,

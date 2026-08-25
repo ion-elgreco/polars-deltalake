@@ -18,6 +18,7 @@ mod handlers;
 
 pub(crate) use data::PolarsEngineData;
 pub(crate) use data::resolve_path as resolve_series_path;
+pub(crate) use data::select_anchored;
 pub(crate) use executor::PolarsPlanExecutor;
 
 #[cfg(test)]

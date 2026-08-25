@@ -20,7 +20,7 @@ use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, Str
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::{DeltaResult, Engine};
 use polars::prelude::as_struct as polars_as_struct;
-use polars::prelude::{DataFrame, Expr, col, lit};
+use polars::prelude::{DataFrame, Expr, col};
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
 

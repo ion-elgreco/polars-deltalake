@@ -10,6 +10,7 @@ use polars::prelude::{
 use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_str::PlSmallStr;
 
+use crate::engine::select_anchored;
 use crate::scan::plan::{DvState, LogicalRewrite};
 use crate::scan::read::FILE_ID_COL;
 
@@ -230,7 +231,7 @@ impl LogicalScanIter {
                     delta_kernel::Error::Generic(format!("logical rewrite eval: {e}"))
                 })?;
             }
-            (None, Some(select)) => df = collect_lazy(select_anchored(df, select))?,
+            (None, Some(select)) => df = collect_lazy(select_anchored(df.lazy(), select))?,
             (None, None) => {}
         }
         if let Some(pred) = &self.orphan_predicate {
@@ -245,27 +246,6 @@ fn collect_lazy(lazy: polars::prelude::LazyFrame) -> Result<DataFrame, delta_ker
         .collect_with_engine(PolarsEngineMode::Streaming)
         .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))?
         .unwrap_single())
-}
-
-/// Polars sizes a select from its expressions, so a list that names no
-/// column — an all-partition projection, whose entries are every one a
-/// broadcast literal — collapses the file to a single row. A row index
-/// anchors the select to the input height.
-fn select_anchored(df: DataFrame, select: &[Expr]) -> polars::prelude::LazyFrame {
-    const ANCHOR: &str = "__pldl_rows__";
-    let references_column = select
-        .iter()
-        .any(|e| !polars_plan::utils::expr_to_leaf_column_names(e).is_empty());
-    if references_column {
-        return df.lazy().select(select);
-    }
-    let anchor = PlSmallStr::from_static(ANCHOR);
-    let mut exprs = select.to_vec();
-    exprs.push(polars::prelude::col(anchor.clone()));
-    df.lazy()
-        .with_row_index(anchor.clone(), None)
-        .select(exprs)
-        .drop(polars::prelude::cols([anchor]))
 }
 
 /// First index in `start..end` where `file_str.get(i) != value`, or `end`
@@ -378,7 +358,7 @@ mod simple_select_tests {
         assert_eq!(frame.width(), 0);
 
         let select = vec![lit(7i64).alias("part")];
-        let out = super::select_anchored(frame, &select).collect().unwrap();
+        let out = select_anchored(frame.lazy(), &select).collect().unwrap();
         assert_eq!(out.height(), 3);
         assert_eq!(out.get_column_names(), ["part"]);
     }
