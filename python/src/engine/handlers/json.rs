@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use delta_kernel::engine_data::EngineData;
-use delta_kernel::expressions::{ColumnName, PredicateRef};
+use delta_kernel::expressions::PredicateRef;
 use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField};
 use delta_kernel::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, JsonHandler, StorageHandler,
@@ -57,7 +57,15 @@ impl JsonHandler for PolarsJsonHandler {
         }
         let mut blob = String::with_capacity(lines.iter().map(|s| s.len() + 1).sum());
         for line in &lines {
-            blob.push_str(line);
+            // One document may span lines (pretty-printed stats). JSON
+            // forbids raw control characters inside string literals, so a
+            // raw newline can only be inter-token whitespace — replacing it
+            // keeps the value and keeps the NDJSON framing one-per-line.
+            if line.contains(['\n', '\r']) {
+                blob.push_str(&line.replace(['\n', '\r'], " "));
+            } else {
+                blob.push_str(line);
+            }
             blob.push('\n');
         }
         let df = parse_ndjson_inferred(blob.as_bytes())?;
@@ -274,47 +282,36 @@ fn null_expr_for_kernel(kernel_dt: &KernelDataType) -> DeltaResult<Expr> {
     Ok(lit(polars::prelude::LiteralValue::untyped_null()).cast(polars_dt))
 }
 
+/// The JsonHandler contract fixes the input to "a single column batch of
+/// string type" without naming the column, so read it positionally — the
+/// reference engine does the same (`json_strings.column(0)`).
 fn extract_json_strings(data: &dyn EngineData) -> DeltaResult<Vec<String>> {
-    use delta_kernel::engine_data::{GetData, RowVisitor};
-    use delta_kernel::schema::{DataType, PrimitiveType};
-
-    struct Collector {
-        out: Vec<String>,
+    let df = data
+        .any_ref()
+        .downcast_ref::<PolarsEngineData>()
+        .ok_or_else(|| {
+            Error::Generic("parse_json received EngineData that is not PolarsEngineData".into())
+        })?
+        .dataframe();
+    if df.width() != 1 {
+        return Err(Error::Generic(format!(
+            "parse_json: expected a single string column, got {} columns",
+            df.width()
+        )));
     }
-
-    impl RowVisitor for Collector {
-        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-            static NAMES: std::sync::OnceLock<Vec<ColumnName>> = std::sync::OnceLock::new();
-            static TYPES: std::sync::OnceLock<Vec<DataType>> = std::sync::OnceLock::new();
-            let names = NAMES.get_or_init(|| vec![ColumnName::new(["json"])]);
-            let types = TYPES.get_or_init(|| vec![DataType::Primitive(PrimitiveType::String)]);
-            (names.as_slice(), types.as_slice())
-        }
-        fn visit<'a>(
-            &mut self,
-            row_count: usize,
-            getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
-            let getter = getters[0];
-            for i in 0..row_count {
-                let s: Option<&str> = getter.get_str(i, "json")?;
-                // polars drops blank NDJSON lines; `{}` keeps the row and
-                // null-fills it, matching kernel's reference decoder.
-                self.out.push(match s {
-                    Some(v) if !v.trim().is_empty() => v.to_string(),
-                    _ => "{}".to_string(),
-                });
-            }
-            Ok(())
-        }
-    }
-
-    let mut collector = Collector {
-        out: Vec::with_capacity(data.len()),
-    };
-    let names = [ColumnName::new(["json"])];
-    data.visit_rows(&names, &mut collector)?;
-    Ok(collector.out)
+    let strings = df.columns()[0]
+        .as_materialized_series()
+        .str()
+        .map_err(to_kernel_err)?;
+    Ok(strings
+        .iter()
+        .map(|s| match s {
+            // polars drops blank NDJSON lines; `{}` keeps the row and
+            // null-fills it, matching kernel's reference decoder.
+            Some(v) if !v.trim().is_empty() => v.to_string(),
+            _ => "{}".to_string(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -417,6 +414,8 @@ mod align_nullability_tests {
 
 #[cfg(test)]
 mod json_string_tests {
+    use delta_kernel::schema::StructType;
+
     use super::*;
 
     /// polars silently drops a blank NDJSON line, so a NULL or empty input
@@ -427,6 +426,52 @@ mod json_string_tests {
         let data = PolarsEngineData::new(df);
         let out = extract_json_strings(&data).unwrap();
         assert_eq!(out, vec!["{\"a\":1}", "{}", "{}", "{}"]);
+    }
+
+    /// The JsonHandler contract fixes shape and type, not the column name —
+    /// kernel's own helpers build the single-column batch under the name
+    /// "a", and the reference engine reads column 0 positionally.
+    #[test]
+    fn any_single_column_name_is_accepted() {
+        let df = polars::df!("a" => [Some("{\"p\":1}")]).unwrap();
+        let out = extract_json_strings(&PolarsEngineData::new(df)).unwrap();
+        assert_eq!(out, vec!["{\"p\":1}"]);
+    }
+
+    /// One legal JSON document may span lines (pretty-printed stats from a
+    /// foreign writer); the reference engine parses it per-document, so the
+    /// NDJSON re-parse must not split it.
+    #[test]
+    fn pretty_printed_document_parses() {
+        let url = Url::parse("file:///").unwrap();
+        let rt = crate::engine::rt();
+        let storage =
+            Arc::new(ObjectStoreStorageHandler::new(&url, std::iter::empty(), rt).unwrap());
+        let handler = PolarsJsonHandler::new(storage);
+
+        let schema = Arc::new(
+            StructType::try_new([StructField::nullable(
+                "a",
+                KernelDataType::LONG,
+            )])
+            .unwrap(),
+        );
+        let df = polars::df!("json" => [Some("{\n  \"a\": 3\n}")]).unwrap();
+        let out = handler
+            .parse_json(Box::new(PolarsEngineData::new(df)), schema)
+            .unwrap();
+        let df = out
+            .any_ref()
+            .downcast_ref::<PolarsEngineData>()
+            .unwrap()
+            .dataframe()
+            .clone();
+        assert_eq!(df.height(), 1);
+        assert_eq!(
+            df.column("a").unwrap().i64().unwrap().get(0),
+            Some(3),
+            "pretty-printed document must parse as one row"
+        );
     }
 
     /// A reader holding no JSON value is an empty batch, not a type-inference
