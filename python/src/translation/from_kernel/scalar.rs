@@ -266,23 +266,28 @@ pub(crate) fn build_series(
                 let s = Series::new(name_pl, v);
                 s.cast(&PlDataType::Date).map_err(to_kernel_err)
             }
+            // Kept apart: the two carry the same i64 but read it against
+            // different clocks, so accepting either variant would republish a
+            // naive wall time as a UTC instant.
             Timestamp | TimestampNtz => {
+                let ntz = matches!(p, TimestampNtz);
                 let v: Vec<Option<i64>> = values
                     .iter()
-                    .map(|s| match s {
-                        Scalar::Timestamp(v) | Scalar::TimestampNtz(v) => Some(*v),
-                        Scalar::Null(_) => None,
-                        other => panic_mismatch(name, "Timestamp", other),
+                    .map(|s| match (s, ntz) {
+                        (Scalar::Timestamp(v), false) | (Scalar::TimestampNtz(v), true) => Some(*v),
+                        (Scalar::Null(_), _) => None,
+                        (other, _) => panic_mismatch(
+                            name,
+                            if ntz { "TimestampNtz" } else { "Timestamp" },
+                            other,
+                        ),
                     })
                     .collect();
                 let s = Series::new(name_pl, v);
-                let target = match p {
-                    Timestamp => PlDataType::Datetime(
-                        polars::prelude::TimeUnit::Microseconds,
-                        Some(polars::prelude::TimeZone::UTC),
-                    ),
-                    _ => PlDataType::Datetime(polars::prelude::TimeUnit::Microseconds, None),
-                };
+                let target = PlDataType::Datetime(
+                    polars::prelude::TimeUnit::Microseconds,
+                    (!ntz).then_some(polars::prelude::TimeZone::UTC),
+                );
                 s.cast(&target).map_err(to_kernel_err)
             }
             Decimal(decimal_type) => {
@@ -607,5 +612,47 @@ mod scalar_lit_width_tests {
             };
             assert_eq!(s.dtype(), &expected, "for {scalar:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_variant_tests {
+    use super::*;
+
+    const US: i64 = 1_700_000_000_000_000;
+
+    /// The two variants carry the same i64 against different clocks, so
+    /// accepting either for either field republishes a naive wall time as a
+    /// UTC instant. Every sibling arm panics on the wrong variant.
+    #[test]
+    #[should_panic(expected = "expected Timestamp scalars")]
+    fn naive_scalar_is_rejected_for_a_utc_field() {
+        let s = Scalar::TimestampNtz(US);
+        let _ = build_series("t", &KernelDataType::TIMESTAMP, &[&s]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected TimestampNtz scalars")]
+    fn utc_scalar_is_rejected_for_a_naive_field() {
+        let s = Scalar::Timestamp(US);
+        let _ = build_series("t", &KernelDataType::TIMESTAMP_NTZ, &[&s]);
+    }
+
+    #[test]
+    fn matching_variants_carry_their_time_zone() {
+        let utc = Scalar::Timestamp(US);
+        let naive = Scalar::TimestampNtz(US);
+        assert_eq!(
+            build_series("t", &KernelDataType::TIMESTAMP, &[&utc])
+                .unwrap()
+                .dtype(),
+            &PlDataType::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC))
+        );
+        assert_eq!(
+            build_series("t", &KernelDataType::TIMESTAMP_NTZ, &[&naive])
+                .unwrap()
+                .dtype(),
+            &PlDataType::Datetime(TimeUnit::Microseconds, None)
+        );
     }
 }
