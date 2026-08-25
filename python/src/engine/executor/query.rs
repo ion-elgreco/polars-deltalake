@@ -20,7 +20,8 @@ use delta_kernel::schema::{
 };
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
-    DataFrame, DataType, Expr, IntoLazy, JoinArgs, JoinType, LazyFrame, MaintainOrderJoin,
+    BooleanChunked, DataFrame, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType,
+    LazyFrame, MaintainOrderJoin, PolarsError, PolarsResult, Schema as PlSchema, Series,
     SortMultipleOptions, UnionArgs, col, concat,
 };
 use polars_plan::dsl::Engine as PolarsEngineMode;
@@ -264,7 +265,11 @@ impl PolarsPlanExecutor {
                 offset: 0,
             });
         }
-        let lf = dsl_parquet_scan(paths, read_schema, args)?;
+        let mut lf = dsl_parquet_scan(paths, read_schema, args)?;
+        let guards = non_nullable_guards(read_schema);
+        if !guards.is_empty() {
+            lf = lf.with_columns(guards);
+        }
         Ok(match &row_index {
             Some(name) => row_index_as_long(lf, name),
             None => lf,
@@ -352,6 +357,67 @@ impl PolarsPlanExecutor {
 /// is IDX_DTYPE (u32), so both scan arms cast it.
 fn row_index_as_long(lf: LazyFrame, name: &PlSmallStr) -> LazyFrame {
     lf.with_columns([col(name.clone()).cast(DataType::Int64)])
+}
+
+/// ScanParquet contract (kernel `plans/ir/nodes.rs`): a missing value for a
+/// non-nullable field is an error, not a null-fill — but polars' unified
+/// scan `Insert` policies null-fill silently. Each read column carrying a
+/// non-nullable constraint gets a guard riding the column itself (a bare
+/// validation expr would be projection-pruned): null under a present parent
+/// errors, mirroring the JSON arm's `align`. A present-but-null value in a
+/// corrupt file trips the same check.
+fn non_nullable_guards(read_schema: &StructType) -> Vec<Expr> {
+    fn has_constraint(f: &StructField) -> bool {
+        !f.nullable
+            || matches!(&f.data_type, KernelDataType::Struct(inner) if inner.fields().any(has_constraint))
+    }
+    fn check(
+        s: &Series,
+        field: &StructField,
+        parent_present: Option<&BooleanChunked>,
+        path: &str,
+    ) -> PolarsResult<()> {
+        if !field.nullable {
+            let nulls = s.is_null();
+            let violated = match parent_present {
+                Some(present) => (&nulls & present).any(),
+                None => nulls.any(),
+            };
+            if violated {
+                return Err(PolarsError::ComputeError(
+                    format!("scan: non-nullable field {path} is null for a present row").into(),
+                ));
+            }
+        }
+        if let KernelDataType::Struct(inner) = &field.data_type {
+            let present = s.is_not_null();
+            let sc = s.struct_()?;
+            for child in inner.fields() {
+                let child_s = sc.field_by_name(child.name.as_str())?;
+                check(&child_s, child, Some(&present), &format!("{path}.{}", child.name))?;
+            }
+        }
+        Ok(())
+    }
+    read_schema
+        .fields()
+        .filter(|f| has_constraint(f))
+        .map(|f| {
+            let field = f.clone();
+            col(f.name.as_str()).map(
+                move |column| {
+                    check(
+                        column.as_materialized_series(),
+                        &field,
+                        None,
+                        field.name.as_str(),
+                    )?;
+                    Ok(column)
+                },
+                |_: &PlSchema, field: &PlField| Ok(field.clone()),
+            )
+        })
+        .collect()
 }
 
 /// Splits a scan output schema into the fields read from files (everything
@@ -810,6 +876,75 @@ mod scan_entries_tests {
             .collect()
             .unwrap();
         assert_eq!(empty.column("ridx").unwrap().dtype(), &PlDataType::Int64);
+    }
+
+    /// ScanParquet contract: a non-nullable field with no match in the file
+    /// is an error, not a null-fill (the JSON arm enforces this via align).
+    #[test]
+    fn missing_non_nullable_parquet_column_errors() {
+        let dir = std::env::temp_dir().join(format!("pldl-nonnull-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pq = dir.join("f.parquet");
+        let mut df = polars::df!("id" => [1i64, 2, 3]).unwrap();
+        ParquetWriter::new(std::fs::File::create(&pq).unwrap())
+            .finish(&mut df)
+            .unwrap();
+
+        let read_schema = StructType::try_new([
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("req", DataType::LONG),
+        ])
+        .unwrap();
+        let output_schema = Arc::new(read_schema.clone());
+        let entries = vec![FileEntry {
+            location: Url::from_file_path(&pq).unwrap(),
+            literals: vec![],
+        }];
+        let out = executor()
+            .scan_entries(FileType::Parquet, entries, &read_schema, &output_schema, None)
+            .unwrap()
+            .collect();
+        let err = out.expect_err("missing non-nullable column must error");
+        assert!(err.to_string().contains("req"), "got: {err}");
+    }
+
+    /// The checkpoint shape: nullable action struct, non-nullable leaf. A
+    /// file whose struct lacks the leaf null-fills it for present parents.
+    #[test]
+    fn missing_non_nullable_struct_leaf_errors() {
+        use polars::prelude::{IntoLazy, as_struct, col};
+
+        let dir = std::env::temp_dir().join(format!("pldl-nonnull-leaf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pq = dir.join("f.parquet");
+        let mut df = polars::df!("other" => [1i64, 2])
+            .unwrap()
+            .lazy()
+            .select([as_struct(vec![col("other")]).alias("s")])
+            .collect()
+            .unwrap();
+        ParquetWriter::new(std::fs::File::create(&pq).unwrap())
+            .finish(&mut df)
+            .unwrap();
+
+        let read_schema = StructType::try_new([StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(
+                StructType::try_new([StructField::not_null("path", DataType::STRING)]).unwrap(),
+            )),
+        )])
+        .unwrap();
+        let output_schema = Arc::new(read_schema.clone());
+        let entries = vec![FileEntry {
+            location: Url::from_file_path(&pq).unwrap(),
+            literals: vec![],
+        }];
+        let out = executor()
+            .scan_entries(FileType::Parquet, entries, &read_schema, &output_schema, None)
+            .unwrap()
+            .collect();
+        let err = out.expect_err("null leaf under a present parent must error");
+        assert!(err.to_string().contains("s.path"), "got: {err}");
     }
 
     /// A projection whose exprs reference no input column (all literals)
