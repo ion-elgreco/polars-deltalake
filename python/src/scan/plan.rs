@@ -120,6 +120,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
     });
 
     let storage = engine.storage_handler();
+    let select_template = needs_select.then(|| data_expr_template(&sources, mode));
     let mut files: Vec<ScanFileMeta> = Vec::new();
     let mut path_index: HashMap<String, usize> = HashMap::new();
 
@@ -151,7 +152,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
                 })
                 .transpose()?;
 
-            let select = needs_select.then(|| build_select(&sources, literals, mode));
+            let select = select_template.as_ref().map(|t| fill_select(t, literals));
 
             let idx = files.len();
             path_index.insert(pl_path.as_str().to_string(), idx);
@@ -344,26 +345,41 @@ fn logical_names(expr: Expr, dtype: &KernelDataType, mode: ColumnMappingMode) ->
     Some(renamed)
 }
 
-/// Logical-order select list: partition literals in place, physical→logical
-/// renames for data columns.
-fn build_select(
+/// Data-column exprs are file-invariant (only partition literals differ per
+/// file), so the recursive `logical_names` rebuild runs once per scan; the
+/// per-file select clones the template and splices literals into the `None`
+/// slots. Expr children are `Arc`ed, so the clone is shallow.
+fn data_expr_template(
     sources: &[(&StructField, FieldSource)],
-    literals: Vec<Expr>,
     mode: ColumnMappingMode,
-) -> Vec<Expr> {
-    let mut literal_iter = literals.into_iter();
+) -> Vec<Option<Expr>> {
     sources
         .iter()
         .map(|(field, source)| match source {
-            FieldSource::Partition { .. } => literal_iter
-                .next()
-                .expect("one literal per partition field by construction"),
+            FieldSource::Partition { .. } => None,
             FieldSource::Data { physical } => {
                 let read = col(PlSmallStr::from_str(physical.as_str()));
-                logical_names(read.clone(), &field.data_type, mode)
-                    .unwrap_or(read)
-                    .alias(PlSmallStr::from_str(field.name.as_str()))
+                Some(
+                    logical_names(read.clone(), &field.data_type, mode)
+                        .unwrap_or(read)
+                        .alias(PlSmallStr::from_str(field.name.as_str())),
+                )
             }
+        })
+        .collect()
+}
+
+/// Logical-order select list: partition literals in place, template clones
+/// for data columns.
+fn fill_select(template: &[Option<Expr>], literals: Vec<Expr>) -> Vec<Expr> {
+    let mut literal_iter = literals.into_iter();
+    template
+        .iter()
+        .map(|slot| match slot {
+            Some(expr) => expr.clone(),
+            None => literal_iter
+                .next()
+                .expect("one literal per partition field by construction"),
         })
         .collect()
 }
