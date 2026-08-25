@@ -33,9 +33,6 @@ impl SimpleSelect {
     /// `None` when any expr is not a plain rename or a column-free literal.
     pub(crate) fn parse(exprs: &[Expr]) -> Option<Self> {
         let mut ops = Vec::with_capacity(exprs.len());
-        let mut literal_exprs: Vec<Expr> = Vec::new();
-        // Positions in `ops` waiting on the one-shot eval below.
-        let mut deferred: Vec<usize> = Vec::new();
         for expr in exprs {
             match expr {
                 Expr::Column(name) => ops.push(SimpleOp::Rename {
@@ -54,38 +51,29 @@ impl SimpleSelect {
                         name: to.clone(),
                         value: value.clone(),
                     }),
+                    // Column-free but not already a scalar (a cast, a Series
+                    // literal): evaluate once. A multi-value literal has no
+                    // broadcast form; let the lazy path evaluate it rather
+                    // than silently keeping element 0.
                     _ if polars_plan::utils::expr_to_leaf_column_names(inner).is_empty() => {
-                        deferred.push(ops.len());
-                        literal_exprs.push(expr.clone());
+                        let evaluated = DataFrame::empty()
+                            .lazy()
+                            .select([expr.clone()])
+                            .collect()
+                            .ok()?;
+                        let col = evaluated.columns().first()?;
+                        if col.len() != 1 {
+                            return None;
+                        }
+                        let av = col.get(0).ok()?.into_static();
                         ops.push(SimpleOp::Broadcast {
                             name: to.clone(),
-                            // Placeholder; filled from the one-shot eval below.
-                            value: Scalar::null(polars::prelude::DataType::Null),
+                            value: Scalar::new(col.dtype().clone(), av),
                         });
                     }
                     _ => return None,
                 },
                 _ => return None,
-            }
-        }
-        if !literal_exprs.is_empty() {
-            // Column-free but not already a scalar (a cast, a Series
-            // literal): one evaluation for all of them, then pure broadcast.
-            let evaluated = DataFrame::empty()
-                .lazy()
-                .select(literal_exprs)
-                .collect()
-                .ok()?;
-            for (idx, col) in deferred.into_iter().zip(evaluated.columns()) {
-                // A multi-value literal has no broadcast form; let the lazy
-                // path evaluate it rather than silently keeping element 0.
-                if col.len() != 1 {
-                    return None;
-                }
-                let av = col.get(0).ok()?.into_static();
-                if let SimpleOp::Broadcast { value, .. } = &mut ops[idx] {
-                    *value = Scalar::new(col.dtype().clone(), av);
-                }
             }
         }
         Some(Self { ops })
