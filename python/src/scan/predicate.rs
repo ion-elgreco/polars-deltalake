@@ -11,7 +11,6 @@ use polars_utils::pl_str::PlSmallStr;
 use pyo3::prelude::*;
 
 use crate::scan::plan::ScanFileMeta;
-use crate::translation::schema::KernelDataTypeExt;
 
 /// A single conjunct of the user predicate, with its kernel-translatability
 /// cached so `build_iter` doesn't re-translate every scan.
@@ -158,29 +157,36 @@ pub(crate) fn file_skip_via_partition_eval(
     mode: ColumnMappingMode,
 ) -> anyhow::Result<HashSet<usize>> {
     const FILE_IDX_COL: &str = "__pldl_file_idx__";
-    let by_physical: HashMap<&str, &StructField> = logical_schema
+    let by_logical: HashMap<&str, &StructField> = logical_schema
         .fields()
-        .map(|f| (f.physical_name(mode), f))
+        .map(|f| (f.name.as_str(), f))
         .collect();
+    // Only the columns the conjuncts name: an unreferenced partition key —
+    // a stale one a foreign writer left behind, or one whose type polars
+    // cannot build — must not fail or slow down a skip that never reads it.
     // BTreeSet for one-pass dedup with sorted iteration order.
-    let partition_cols: BTreeSet<&str> = files
+    let referenced: BTreeSet<&str> = partition_conjuncts
         .iter()
-        .flat_map(|f| f.partition_values.keys().map(String::as_str))
+        .flat_map(polars_plan::utils::expr_to_leaf_column_names)
+        .filter_map(|n| by_logical.get_key_value(n.as_str()).map(|(k, _)| *k))
         .collect();
 
-    let mut columns: Vec<Column> = partition_cols
+    let mut columns: Vec<Column> = referenced
         .iter()
-        .map(|physical| -> anyhow::Result<Column> {
-            let field = by_physical.get(physical).ok_or_else(|| {
-                anyhow::anyhow!("partition column not in logical schema: {physical}")
-            })?;
+        .map(|logical| -> anyhow::Result<Column> {
+            let field = by_logical[logical];
+            let physical = field.physical_name(mode);
             let vals: Vec<Option<&str>> = files
                 .iter()
-                .map(|f| f.partition_values.get(*physical).map(String::as_str))
+                .map(|f| f.partition_values.get(physical).map(String::as_str))
                 .collect();
-            Column::new(PlSmallStr::from_str(field.name.as_str()), vals.as_slice())
-                .cast(&field.data_type.to_polars()?)
-                .map_err(|e| anyhow::anyhow!("cast partition col {}: {e:#}", field.name))
+            let raw = Column::new(PlSmallStr::from_str(field.name.as_str()), vals.as_slice());
+            // Kernel's `parse_scalar`, the same grammar the select list uses
+            // to materialize these values: a polars cast rejects spellings
+            // Delta mandates (`2024-01-15 10:30:00`) and would prune away
+            // every file it nulls.
+            crate::translation::parse_partition_column(&raw, &field.data_type)
+                .map_err(|e| anyhow::anyhow!("parse partition col {}: {e:#}", field.name))
         })
         .collect::<anyhow::Result<_>>()?;
     let idx_vals: Vec<u32> = (0..files.len() as u32).collect();
@@ -289,12 +295,10 @@ mod partition_prune_tests {
     /// emitted under logical names even though its keys arrive physical.
     #[test]
     fn column_mapped_keys_resolve_to_logical_names() {
-        let logical = StructType::try_new([StructField::nullable(
-            "region",
-            KernelDataType::STRING,
-        )
-        .with_metadata([("delta.columnMapping.physicalName", "col-3")])])
-        .unwrap();
+        let logical =
+            StructType::try_new([StructField::nullable("region", KernelDataType::STRING)
+                .with_metadata([("delta.columnMapping.physicalName", "col-3")])])
+            .unwrap();
         let files = [file("EU"), file("US")];
 
         let surviving = file_skip_via_partition_eval(

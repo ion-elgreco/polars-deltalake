@@ -267,3 +267,59 @@ class TestAcceptedSpellings:
             lambda old: "2021-03-04T10:30:00Z" if old.startswith("2021-03-04") else old,
         )
         assert _read_p(table) == [first, second]
+
+
+class TestPruningParsesLikeProjection:
+    """Partition pruning for predicates kernel cannot translate builds its own
+    frame from the raw `partitionValues` strings. It has to use the same
+    kernel grammar the select list does: a polars cast nulls spellings Delta
+    mandates, and a pruning frame of nulls drops every matching file."""
+
+    @pytest.mark.parametrize(
+        ("dtype", "value"),
+        [
+            (
+                pl.Datetime("us", "UTC"),
+                datetime.datetime(2021, 1, 2, 8, 45, tzinfo=UTC),
+            ),
+            (pl.Datetime("us"), datetime.datetime(2021, 1, 2, 8, 45)),
+            (pl.Date(), datetime.date(2021, 1, 2)),
+        ],
+        ids=["timestamp", "timestamp_ntz", "date"],
+    )
+    def test_untranslatable_conjunct_keeps_matching_files(self, tmp_path, dtype, value):
+        table = _write_partitioned(tmp_path / "t", [value], dtype)
+        # `.dt.year()` has no kernel translation, so this routes to the
+        # polars-side partition-pruning frame.
+        got = scan_delta(table).filter(pl.col("p").dt.year() == 2021).collect()
+        assert got["v"].to_list() == [0]
+
+    def test_unreferenced_partition_column_is_not_materialized(self, tmp_path):
+        """A boolean partition column polars cannot cast from string must not
+        abort a skip that never reads it."""
+        from deltalake import write_deltalake
+
+        table = str(tmp_path / "t")
+        df = pl.DataFrame(
+            {"g": ["a", "b"], "flag": [True, False], "v": [0, 1]},
+            schema_overrides={"flag": pl.Boolean()},
+        )
+        write_deltalake(table, df.to_arrow(), partition_by=["g", "flag"])
+        got = scan_delta(table).filter(pl.col("g").str.to_uppercase() == "A").collect()
+        assert got["v"].to_list() == [0]
+
+    def test_stale_partition_key_is_ignored(self, tmp_path):
+        """An extra key a foreign writer left in `partitionValues` names no
+        logical column; a skip that never references it must still run."""
+        table = _write_partitioned(tmp_path / "t", ["a", "b"], pl.String())
+        log = Path(table) / "_delta_log" / f"{0:020d}.json"
+        lines = []
+        for line in log.read_text().splitlines():
+            action = json.loads(line)
+            if "add" in action:
+                action["add"]["partitionValues"]["dropped_col"] = "x"
+            lines.append(json.dumps(action))
+        log.write_text("\n".join(lines) + "\n")
+
+        got = scan_delta(table).filter(pl.col("p").str.to_uppercase() == "A").collect()
+        assert got["v"].to_list() == [0]

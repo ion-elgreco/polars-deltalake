@@ -181,6 +181,10 @@ fn translate_map_to_struct(
     ))
 }
 
+fn to_pl_err(e: impl std::fmt::Display) -> polars::prelude::PolarsError {
+    polars::prelude::PolarsError::ComputeError(e.to_string().into())
+}
+
 /// Delta serialized-partition-value parse: `raw` is a nullable string expr.
 ///
 /// Defers to the kernel's own [`PrimitiveType::parse_scalar`], which the
@@ -206,11 +210,10 @@ fn parse_partition_string(raw: Expr, target: &KernelDataType) -> DeltaResult<Exp
         PrimitiveType::String => Ok(raw),
         PrimitiveType::Binary => Ok(raw.cast(polars_target)),
         _ => {
-            let prim = prim.clone();
             let kernel_target = target.clone();
             let output = polars_target;
             Ok(raw.map(
-                move |column| parse_partition_column(&column, &prim, &kernel_target),
+                move |column| parse_partition_column(&column, &kernel_target),
                 move |_: &Schema, field: &Field| {
                     Ok(Field::new(field.name().clone(), output.clone()))
                 },
@@ -220,12 +223,24 @@ fn parse_partition_string(raw: Expr, target: &KernelDataType) -> DeltaResult<Exp
 }
 
 /// One `parse_scalar` per value, so a value no kernel-accepted spelling
-/// matches fails the scan the way a broken table should.
-fn parse_partition_column(
+/// matches fails the scan the way a broken table should. Shared with the
+/// partition-pruning frame so skipping and projection read the same grammar.
+pub(crate) fn parse_partition_column(
     column: &Column,
-    prim: &PrimitiveType,
     target: &KernelDataType,
 ) -> polars::prelude::PolarsResult<Column> {
+    let KernelDataType::Primitive(prim) = target else {
+        return Err(polars::prelude::PolarsError::ComputeError(
+            format!("partition column of type {target:?} is not a primitive").into(),
+        ));
+    };
+    match prim {
+        // Identity under `parse_scalar`; the empty string stays itself here
+        // rather than becoming null.
+        PrimitiveType::String => return Ok(column.clone()),
+        PrimitiveType::Binary => return column.cast(&target.to_polars().map_err(to_pl_err)?),
+        _ => {}
+    }
     let scalars = column
         .str()?
         .iter()
