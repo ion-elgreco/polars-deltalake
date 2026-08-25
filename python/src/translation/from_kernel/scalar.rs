@@ -59,8 +59,12 @@ pub(crate) fn scalar_to_lit(scalar: &Scalar) -> Expr {
         Scalar::String(s) => lit(s.as_str()),
         Scalar::Long(v) => lit(*v),
         Scalar::Integer(v) => lit(*v),
-        Scalar::Short(v) => lit(*v as i32),
-        Scalar::Byte(v) => lit(*v as i32),
+        // Typed, not widened: `build_series` derives its list dtype from the
+        // declared element type, so an Int32 literal would disagree with a
+        // `Array<Short>` / `Array<Byte>` column's null rows.
+        Scalar::Short(_) | Scalar::Byte(_) => {
+            lit(try_to_polars_scalar(scalar).expect("integral scalars are always representable"))
+        }
         Scalar::Float(v) => lit(*v),
         Scalar::Double(v) => lit(*v),
         Scalar::Boolean(v) => lit(*v),
@@ -579,5 +583,29 @@ mod interval_tests {
         );
         let year_month = try_to_polars_scalar(&Scalar::IntervalYearMonth(7)).unwrap();
         assert_eq!(year_month.dtype(), &PlDataType::Int32);
+    }
+}
+
+#[cfg(test)]
+mod scalar_lit_width_tests {
+    use super::*;
+    use polars::prelude::LiteralValue;
+
+    /// `build_series` derives an Array's list dtype from the declared
+    /// element type, so a widened literal disagrees with the null rows it
+    /// has to vstack with — and silently retypes the column when there are
+    /// none.
+    #[test]
+    fn short_and_byte_literals_keep_their_width() {
+        for (scalar, expected) in [
+            (Scalar::Short(1), PlDataType::Int16),
+            (Scalar::Byte(1), PlDataType::Int8),
+        ] {
+            let expr = scalar_to_lit(&scalar);
+            let Expr::Literal(LiteralValue::Scalar(s)) = &expr else {
+                panic!("expected a scalar literal, got {expr:?}");
+            };
+            assert_eq!(s.dtype(), &expected, "for {scalar:?}");
+        }
     }
 }
