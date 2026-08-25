@@ -13,7 +13,10 @@ use delta_kernel::transform_output_type;
 use delta_kernel::transforms::SchemaTransform;
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::as_struct as polars_as_struct;
-use polars::prelude::{Column, Expr, Field, LiteralValue, Schema, coalesce, col, lit, when};
+use polars::prelude::{
+    Column, DataType as PlDataType, Expr, Field, LiteralValue, NamedFrom, Schema, Series,
+    StringChunked, Utf8JsonPathImpl, coalesce, col, lit, when,
+};
 use polars_utils::pl_str::PlSmallStr;
 use std::borrow::Cow;
 
@@ -78,30 +81,60 @@ pub(crate) fn translate_expr(
             // strings, so decode them as String first and let the struct-wide
             // cast lift each temporal field.
             let raw = translate_expr(&p.json_expr, None, input_schema)?;
-            // The contract names the empty string as unparseable input that
-            // must decode to NULL; polars would fail the whole batch on it.
-            let inner = null_gated(raw.clone().str().len_bytes().gt(lit(0u32)), raw);
-            let decoded = match StringifyTemporal.transform_struct(&p.output_schema) {
-                Cow::Borrowed(_) => {
-                    let dt = KernelDataType::Struct(Box::new((*p.output_schema).clone()))
-                        .to_polars()
-                        .map_err(to_kernel_err)?;
-                    inner.str().json_decode(dt)
-                }
+            let final_dt = KernelDataType::Struct(Box::new((*p.output_schema).clone()))
+                .to_polars()
+                .map_err(to_kernel_err)?;
+            Ok(match StringifyTemporal.transform_struct(&p.output_schema) {
+                Cow::Borrowed(_) => json_decode_lenient(raw, final_dt),
                 Cow::Owned(decode_schema) => {
-                    let final_dt = KernelDataType::Struct(Box::new((*p.output_schema).clone()))
-                        .to_polars()
-                        .map_err(to_kernel_err)?;
                     let decode_dt = KernelDataType::Struct(Box::new(decode_schema))
                         .to_polars()
                         .map_err(to_kernel_err)?;
-                    inner.str().json_decode(decode_dt).cast(final_dt)
+                    json_decode_lenient(raw, decode_dt).cast(final_dt)
                 }
-            };
-            Ok(decoded)
+            })
         }
         Expression::MapToStruct(m) => translate_map_to_struct(m, output_type, input_schema),
     }
+}
+
+/// The `ParseJson` contract makes unparsable input decode to NULL rather
+/// than fail the query, and polars' `json_decode` does neither: it is an
+/// NDJSON deserializer, so a blank value is not a row at all and the *row*
+/// disappears — silently dropping the add action and every file it names —
+/// while one malformed value fails the whole batch.
+///
+/// Blanks are nulled up front (cheap, and null decodes to a null value), and
+/// a batch that still fails is retried per value so only the offenders go
+/// NULL.
+fn json_decode_lenient(raw: Expr, dtype: PlDataType) -> Expr {
+    let output = dtype.clone();
+    raw.map(
+        move |column| {
+            let blanked: StringChunked = column
+                .str()?
+                .iter()
+                .map(|v| v.filter(|s| !s.trim().is_empty()))
+                .collect();
+            let decoded = match blanked.json_decode(Some(dtype.clone()), None) {
+                Ok(series) => series,
+                Err(_) => {
+                    let mut out = Series::new_empty(PlSmallStr::EMPTY, &dtype);
+                    for value in blanked.iter() {
+                        let one = Series::new(PlSmallStr::EMPTY, [value]);
+                        let decoded = one
+                            .str()
+                            .and_then(|ca| ca.json_decode(Some(dtype.clone()), None))
+                            .unwrap_or_else(|_| Series::full_null(PlSmallStr::EMPTY, 1, &dtype));
+                        out.append(&decoded)?;
+                    }
+                    out
+                }
+            };
+            Ok(Column::from(decoded.with_name(column.name().clone())))
+        },
+        move |_: &Schema, field: &Field| Ok(Field::new(field.name().clone(), output.clone())),
+    )
 }
 
 /// Schema rewrite that turns `Date` / `Timestamp` / `TimestampNtz` primitives
