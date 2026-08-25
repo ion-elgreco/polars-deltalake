@@ -244,12 +244,9 @@ fn require_present(value: Expr, gate: Option<Expr>, path: String) -> Expr {
         move |cols: &mut [Column]| {
             let nulls = cols[0].is_null();
             let present = cols[1].bool()?;
-            // Either input may be a length-1 broadcast literal.
-            let violated = match (nulls.len(), present.len()) {
-                (1, _) => nulls.get(0).unwrap_or(false) && present.any(),
-                (_, 1) => present.get(0).unwrap_or(false) && nulls.any(),
-                _ => (&nulls & present).any(),
-            };
+            // Either input may be a length-1 broadcast literal; `&` handles
+            // that, and `.any()` ignores nulls.
+            let violated = (&nulls & present).any();
             if violated {
                 Err(PolarsError::ComputeError(
                     format!("json align: non-nullable field {path} is null for a present row")
