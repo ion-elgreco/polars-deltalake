@@ -8,4 +8,6 @@ pub(crate) mod from_kernel;
 pub(crate) mod schema;
 pub(crate) mod to_kernel;
 
-pub(crate) use from_kernel::{PolarsEvaluationHandler, build_series, parse_partition_column};
+pub(crate) use from_kernel::{
+    PolarsEvaluationHandler, build_series, ensure_scalar_types, parse_partition_column,
+};

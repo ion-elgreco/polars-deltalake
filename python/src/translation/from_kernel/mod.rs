@@ -32,7 +32,9 @@ mod transform;
 
 pub(crate) use expr::{column_path_to_expr, null_gated, parse_partition_column, translate_expr};
 pub(crate) use predicate::translate_predicate;
-pub(crate) use scalar::{build_series, empty_typed_list_expr, per_row_literals, scalar_to_lit};
+pub(crate) use scalar::{
+    build_series, empty_typed_list_expr, ensure_scalar_types, per_row_literals, scalar_to_lit,
+};
 
 use predicate::PolarsPredicateEvaluator;
 use scalar::try_to_polars_scalar;
@@ -128,6 +130,8 @@ impl EvaluationHandler for PolarsEvaluationHandler {
             .enumerate()
             .map(|(col_idx, field)| {
                 let column_scalars: Vec<&Scalar> = rows.iter().map(|row| &row[col_idx]).collect();
+                // Untrusted boundary — `build_series` panics on a mismatch.
+                ensure_scalar_types(column_scalars.iter().copied(), field, "create_many")?;
                 build_series(&field.name, &field.data_type, &column_scalars)
             })
             .collect::<DeltaResult<Vec<_>>>()?;
@@ -355,7 +359,23 @@ pub(super) fn downcast_engine_data(batch: &dyn EngineData) -> DeltaResult<&Polar
 
 #[cfg(test)]
 mod evaluator_height_tests {
+    use delta_kernel::schema::{StructField, StructType};
+
     use super::*;
+
+    /// Foreign plans arrive via the proto round-trip, so scalar/schema
+    /// agreement is not guaranteed; a mismatch must be an error, not a
+    /// `build_series` panic unwinding through PyO3.
+    #[test]
+    fn create_many_rejects_scalar_type_mismatch() {
+        let handler = PolarsEvaluationHandler::new();
+        let schema = Arc::new(
+            StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap(),
+        );
+        let rows: &[&[Scalar]] = &[&[Scalar::String("x".to_string())]];
+        let result = handler.create_many(schema, rows);
+        assert!(result.is_err(), "type mismatch must error, not panic");
+    }
 
     /// Kernel contract: one value per input row. A `Computed` op that
     /// references no column (a struct/array/binary literal falls through

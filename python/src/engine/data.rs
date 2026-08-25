@@ -152,6 +152,12 @@ impl EngineData for PolarsEngineData {
                         height
                     )));
                 }
+                // Untrusted boundary — `build_series` panics on a mismatch.
+                crate::translation::ensure_scalar_types(
+                    scalars.iter().copied(),
+                    field,
+                    "append_columns",
+                )?;
                 let series = crate::translation::build_series(
                     field.name.as_str(),
                     &field.data_type,

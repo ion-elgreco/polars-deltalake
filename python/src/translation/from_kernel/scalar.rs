@@ -496,10 +496,30 @@ fn materialise_per_row_list_series(
         .clone())
 }
 
+/// `build_series` panics on a scalar/field type mismatch by contract;
+/// callers at untrusted boundaries run [`ensure_scalar_types`] first.
 fn panic_mismatch(name: &str, expected: &str, got: &Scalar) -> ! {
-    panic!(
-        "PolarsEvaluationHandler::create_many: column {name} expected {expected} scalars, got {got:?}",
-    );
+    panic!("build_series: column {name} expected {expected} scalars, got {got:?}");
+}
+
+/// Boundary guard for [`build_series`]'s panic contract: every non-null
+/// scalar must carry exactly the field's declared type.
+pub(crate) fn ensure_scalar_types<'a>(
+    scalars: impl IntoIterator<Item = &'a Scalar>,
+    field: &delta_kernel::schema::StructField,
+    context: &str,
+) -> delta_kernel::DeltaResult<()> {
+    for scalar in scalars {
+        if !matches!(scalar, Scalar::Null(_)) && scalar.data_type() != field.data_type {
+            return Err(delta_kernel::Error::Generic(format!(
+                "{context}: scalar for {} is {}, schema declares {}",
+                field.name,
+                scalar.data_type(),
+                field.data_type
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
