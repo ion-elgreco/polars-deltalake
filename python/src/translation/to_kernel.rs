@@ -387,11 +387,12 @@ fn polars_expr_to_kernel_expression(expr: &Expr, schema: &StructType) -> Option<
 }
 
 /// `IsIn` set literal → kernel `Scalar`s. `None` for any null element
-/// (no null-safe equality to OR with) or unsupported element type.
+/// (no null-safe equality to OR with), unsupported element type, or a cast
+/// around the set — its pre-cast elements are not the compared values.
 /// Empty list yields `Some(vec![])`; caller short-circuits to `lit(false)`.
 fn extract_set_elements(expr: &Expr) -> Option<Vec<Scalar>> {
     match expr {
-        Expr::Cast { expr: inner, .. } | Expr::Alias(inner, _) => extract_set_elements(inner),
+        Expr::Alias(inner, _) => extract_set_elements(inner),
         Expr::Literal(LiteralValue::Series(s)) => series_to_scalars(s),
         Expr::Literal(LiteralValue::Scalar(s)) => match s.as_any_value() {
             AnyValue::List(series) => series_to_scalars(&series),

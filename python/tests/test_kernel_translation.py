@@ -136,6 +136,12 @@ class TestIsIn:
         # Above the expansion cap polars-io handles the predicate row-wise.
         assert _kernel_count(rich_table, pl.col("id").is_in(list(range(513)))) == 0
 
+    def test_cast_around_set_declines(self, rich_table):
+        """A cast on the set literal changes its elements; unwrapping it
+        would push the pre-cast values as the OR-chain."""
+        expr = pl.col("f").is_in(pl.lit(pl.Series([2.5, 2.9])).cast(pl.Int64))
+        assert _kernel_count(rich_table, expr) == 0
+
 
 class TestIsBetween:
     """Every `closed=` variant decomposes into a strict-or-inclusive pair."""
@@ -302,6 +308,26 @@ class TestCastPruningSoundness:
             frames.append(df)
         got = sorted(pl.concat(frames)["id"].to_list()) if frames else []
         assert got == [1, 2]
+
+    def test_set_cast_via_raw_configure(self, tmp_path: Path):
+        """The evaluated set is {2} (2.5 and 2.9 truncate); pushing the
+        pre-cast elements as ``f == 2.5 OR f == 2.9`` prunes the file whose
+        stats [1.0, 2.0] falsify both, losing the matching row."""
+        table = str(tmp_path / "casts3")
+        write_deltalake(table, pl.DataFrame({"id": [1, 2], "f": [1.0, 2.0]}).to_arrow())
+        write_deltalake(
+            table,
+            pl.DataFrame({"id": [3], "f": [50.0]}).to_arrow(),
+            mode="append",
+        )
+        scan = TableScan(TableState(table))
+        expr = pl.col("f").is_in(pl.lit(pl.Series([2.5, 2.9])).cast(pl.Int64))
+        scan.configure(None, None, expr)
+        frames = []
+        while (df := scan.next()) is not None:
+            frames.append(df)
+        got = sorted(pl.concat(frames)["id"].to_list()) if frames else []
+        assert got == [2]
 
 
 class TestUntranslatable:
