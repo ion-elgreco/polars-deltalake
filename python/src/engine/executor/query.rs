@@ -33,7 +33,7 @@ use crate::engine::handlers::{
     align_lazy, dsl_parquet_scan, ensure_no_field_id_matching, parse_ndjson_inferred,
     path_for_polars_io, unified_scan_args,
 };
-use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData};
+use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{
     column_path_to_expr, projection_exprs, scalar_to_lit, series_value_lit, translate_expr,
@@ -514,7 +514,7 @@ fn eval_project(project: Project, input: &NodeState) -> DeltaResult<NodeState> {
         }
     };
     Ok(NodeState {
-        lf: input.lf.clone().select(exprs),
+        lf: select_anchored(input.lf.clone(), &exprs),
         schema,
     })
 }
@@ -810,5 +810,23 @@ mod scan_entries_tests {
             .collect()
             .unwrap();
         assert_eq!(empty.column("ridx").unwrap().dtype(), &PlDataType::Int64);
+    }
+
+    /// A projection whose exprs reference no input column (all literals)
+    /// must still emit one row per input row; polars sizes a bare select
+    /// from its expressions.
+    #[test]
+    fn all_literal_project_keeps_input_height() {
+        let input = NodeState {
+            lf: polars::df!("k" => [1i64, 2, 3]).unwrap().lazy(),
+            schema: Arc::new(StructType::try_new([long_field("k")]).unwrap()),
+        };
+        let project = Project {
+            expr: Arc::new(Expression::struct_from([Expression::literal(7i64)])),
+            schema: Arc::new(StructType::try_new([long_field("v")]).unwrap()),
+        };
+        let df = eval_project(project, &input).unwrap().lf.collect().unwrap();
+        assert_eq!(df.height(), 3, "literal-only projection must keep height");
+        assert_eq!(df.get_column_names(), ["v"]);
     }
 }
