@@ -102,8 +102,14 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
     let table_root = scan.table_root().clone();
     // Protocol-aware effective mode: matches how kernel resolved the physical
     // schema, including stale `physicalName` annotations under mode `none`.
-    let mode = scan.snapshot().table_configuration().column_mapping_mode();
-    let sources = field_sources(scan.logical_schema(), scan.physical_schema(), mode);
+    let config = scan.snapshot().table_configuration();
+    let mode = config.column_mapping_mode();
+    let sources = field_sources(
+        scan.logical_schema(),
+        scan.physical_schema(),
+        config.logical_partition_columns(),
+        mode,
+    )?;
     // Identity frames need no per-file select at all. Nested renames count:
     // a top-level name can survive column mapping while a child does not.
     let needs_select = sources.iter().any(|(f, s)| match s {
@@ -161,33 +167,83 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
 }
 
 /// Pair each projected logical field with its physical source. Partition
-/// columns are exactly the logical fields whose physical name is absent
-/// from the physical (file) schema.
-///
-/// This name-diff re-derives the partition/rename subset of kernel's
-/// five-variant `FieldTransformSpec`, which (with `Scan::state_info`) is
-/// private at the pinned rev. A future logical-only field that is not a
-/// partition column — row tracking, CDF metadata — would be misclassified
-/// as one here and fail downstream with a partition-shaped error.
+/// membership comes from the snapshot's authoritative list (compared by
+/// LOGICAL name, kernel's own semantics); the Partition arm keeps the
+/// PHYSICAL name because `partition_literals` looks it up in
+/// `add.partitionValues_parsed`. A field that is neither in the physical
+/// schema nor a partition column — a future rev's row-tracking or CDF
+/// metadata — errors loudly instead of failing later with a misleading
+/// partition-shaped message.
 fn field_sources<'a>(
     logical: &'a StructType,
     physical: &StructType,
+    partition_cols: &[String],
     mode: ColumnMappingMode,
-) -> Vec<(&'a StructField, FieldSource)> {
+) -> anyhow::Result<Vec<(&'a StructField, FieldSource)>> {
     let physical_names: std::collections::HashSet<&str> =
         physical.fields().map(|f| f.name.as_str()).collect();
     logical
         .fields()
         .map(|f| {
             let phys = f.physical_name(mode).to_string();
-            let source = if physical_names.contains(phys.as_str()) {
+            let source = if partition_cols.iter().any(|p| p == f.name.as_str()) {
+                FieldSource::Partition { physical: phys }
+            } else if physical_names.contains(phys.as_str()) {
                 FieldSource::Data { physical: phys }
             } else {
-                FieldSource::Partition { physical: phys }
+                anyhow::bail!(
+                    "logical field '{}' is neither in the physical schema nor a partition column",
+                    f.name
+                );
             };
-            (f, source)
+            Ok((f, source))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod field_source_tests {
+    use delta_kernel::schema::DataType;
+
+    use super::*;
+
+    /// A logical-only field outside the authoritative partition list must
+    /// error loudly, not classify as a partition column and fail later
+    /// with a partition-shaped message.
+    #[test]
+    fn logical_only_non_partition_field_errors() {
+        let logical = StructType::try_new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("ghost", DataType::LONG),
+        ])
+        .unwrap();
+        let physical = StructType::try_new([StructField::nullable("id", DataType::LONG)]).unwrap();
+        let partition_cols = ["part".to_string()];
+
+        let err = match field_sources(&logical, &physical, &partition_cols, ColumnMappingMode::None)
+        {
+            Ok(_) => panic!("ghost is neither physical nor a partition column"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("ghost"), "got: {err}");
+    }
+
+    /// Partition membership is by logical name; the Partition arm keeps the
+    /// physical name for the partitionValues_parsed lookup.
+    #[test]
+    fn partition_membership_is_by_logical_name() {
+        let logical =
+            StructType::try_new([StructField::nullable("part", DataType::STRING)]).unwrap();
+        let physical = StructType::try_new(Vec::<StructField>::new()).unwrap();
+        let partition_cols = ["part".to_string()];
+
+        let sources =
+            field_sources(&logical, &physical, &partition_cols, ColumnMappingMode::None).unwrap();
+        assert!(matches!(
+            &sources[0].1,
+            FieldSource::Partition { physical } if physical == "part"
+        ));
+    }
 }
 
 /// Per-row typed partition literals, one `Vec<Expr>` per add row, aligned
