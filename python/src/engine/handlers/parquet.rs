@@ -102,13 +102,17 @@ impl ParquetHandler for PolarsParquetHandler {
         // all-partition projections): read `num_rows` from each footer and
         // skip the data scan entirely
         if physical_schema.fields().next().is_none() {
-            let total: usize = files
+            // One batch per file: the contract forbids merging engine data
+            // across file boundaries, and a caller splitting a selection
+            // vector per file cannot attribute rows in a summed batch.
+            let heights = files
                 .iter()
                 .map(|f| fetch_parquet_metadata(self.storage.as_ref(), f).map(|m| m.num_rows))
-                .sum::<DeltaResult<usize>>()?;
-            let df = DataFrame::empty_with_height(total);
-            let result: DeltaResult<Box<dyn EngineData>> = Ok(Box::new(PolarsEngineData::new(df)));
-            return Ok(Box::new(std::iter::once(result)));
+                .collect::<DeltaResult<Vec<_>>>()?;
+            return Ok(Box::new(heights.into_iter().map(|rows| {
+                let df = DataFrame::empty_with_height(rows);
+                Ok(Box::new(PolarsEngineData::new(df)) as Box<dyn EngineData>)
+            })));
         }
 
         // Translation failure is non-fatal: kernel already pruned files via
