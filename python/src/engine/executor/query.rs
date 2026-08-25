@@ -370,7 +370,8 @@ fn non_nullable_guards(read_schema: &StructType) -> Vec<Expr> {
         parent_present: Option<&BooleanChunked>,
         path: &str,
     ) -> PolarsResult<()> {
-        if !field.nullable {
+        // `null_count` is O(1); the bitmaps below are not.
+        if !field.nullable && s.null_count() > 0 {
             let nulls = s.is_null();
             let violated = match parent_present {
                 Some(present) => (&nulls & present).any(),
@@ -391,9 +392,16 @@ fn non_nullable_guards(read_schema: &StructType) -> Vec<Expr> {
                 None => s.is_not_null(),
             };
             let sc = s.struct_()?;
-            for child in inner.fields() {
+            // Only the constrained children need visiting, and only they
+            // need their dotted path built.
+            for child in inner.fields().filter(|c| has_constraint(c)) {
                 let child_s = sc.field_by_name(child.name.as_str())?;
-                check(&child_s, child, Some(&present), &format!("{path}.{}", child.name))?;
+                check(
+                    &child_s,
+                    child,
+                    Some(&present),
+                    &format!("{path}.{}", child.name),
+                )?;
             }
         }
         Ok(())
@@ -905,6 +913,52 @@ mod scan_entries_tests {
 
     /// The checkpoint shape: nullable action struct, non-nullable leaf. A
     /// file whose struct lacks the leaf null-fills it for present parents.
+    /// The guard walks only constrained children and short-circuits on
+    /// `null_count`. Pin what that must not change: an unconstrained leaf
+    /// missing from the file still null-fills instead of erroring.
+    #[test]
+    fn missing_nullable_struct_leaf_null_fills() {
+        use polars::prelude::{IntoLazy, as_struct, col};
+
+        let dir = std::env::temp_dir().join(format!("pldl-nullable-leaf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pq = dir.join("n.parquet");
+        let mut df = polars::df!("other" => [1i64, 2])
+            .unwrap()
+            .lazy()
+            .select([as_struct(vec![col("other")]).alias("s")])
+            .collect()
+            .unwrap();
+        ParquetWriter::new(std::fs::File::create(&pq).unwrap())
+            .finish(&mut df)
+            .unwrap();
+
+        let read_schema = StructType::try_new([StructField::nullable(
+            "s",
+            DataType::Struct(Box::new(
+                StructType::try_new([StructField::nullable("q", DataType::LONG)]).unwrap(),
+            )),
+        )])
+        .unwrap();
+        let output_schema = Arc::new(read_schema.clone());
+        let entries = vec![FileEntry {
+            location: Url::from_file_path(&pq).unwrap(),
+            literals: vec![],
+        }];
+        let out = executor()
+            .scan_entries(
+                FileType::Parquet,
+                entries,
+                &read_schema,
+                &output_schema,
+                None,
+            )
+            .unwrap()
+            .collect()
+            .expect("a nullable leaf must null-fill, not error");
+        assert_eq!(out.height(), 2);
+    }
+
     #[test]
     fn missing_non_nullable_struct_leaf_errors() {
         use polars::prelude::{IntoLazy, as_struct, col};
