@@ -144,10 +144,9 @@ impl PolarsPlanExecutor {
         schema: SchemaRef,
     ) -> DeltaResult<NodeState> {
         let (read_schema, row_index) = split_scan_schema(&schema, constant_cols)?;
-        let const_fields = constant_fields(&schema, constant_cols)?;
-        let const_dts: Vec<DataType> = const_fields
-            .iter()
-            .map(|f| f.data_type.to_polars().map_err(to_kernel_err))
+        let const_cols: Vec<(&StructField, DataType)> = constant_fields(&schema, constant_cols)?
+            .into_iter()
+            .map(|f| Ok((f, f.data_type.to_polars().map_err(to_kernel_err)?)))
             .collect::<DeltaResult<_>>()?;
 
         let entries = files
@@ -160,8 +159,7 @@ impl PolarsPlanExecutor {
                         constant_cols.len()
                     )));
                 }
-                let literals =
-                    kernel_constant_literals(&f.file_constants, &const_fields, &const_dts)?;
+                let literals = kernel_constant_literals(&f.file_constants, &const_cols)?;
                 Ok(FileEntry {
                     location: f.meta.location,
                     literals,
@@ -468,15 +466,13 @@ fn constant_fields<'a>(
         .collect()
 }
 
-/// `dts` is index-aligned with `fields`, pre-converted once per scan node.
 fn kernel_constant_literals(
     constants: &[Scalar],
-    fields: &[&StructField],
-    dts: &[DataType],
+    cols: &[(&StructField, DataType)],
 ) -> DeltaResult<Vec<Expr>> {
     constants
         .iter()
-        .zip(fields.iter().zip(dts.iter()))
+        .zip(cols)
         .map(|(scalar, (field, dt))| -> DeltaResult<Expr> {
             Ok(scalar_to_lit(scalar)
                 .cast(dt.clone())
