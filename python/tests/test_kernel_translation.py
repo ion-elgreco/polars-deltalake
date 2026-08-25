@@ -330,6 +330,73 @@ class TestCastPruningSoundness:
         assert got == [2]
 
 
+class TestFloat32Pushdown:
+    """polars type-coercion wraps a Float32 column in ``cast(Float64)`` and
+    compares against Float64 literals. Pushdown must unwrap the widening cast
+    and narrow the literal exactly to the column type — kernel compares stats
+    strictly same-type, so an unnarrowed Double literal never skips."""
+
+    @pytest.fixture
+    def f32_table(self, tmp_path: Path) -> str:
+        path = str(tmp_path / "f32")
+        write_deltalake(
+            path,
+            pl.DataFrame(
+                {
+                    "id": pl.Series([1, 2], dtype=pl.Int64),
+                    "g": pl.Series([0.5, 1.5], dtype=pl.Float32),
+                }
+            ).to_arrow(),
+        )
+        write_deltalake(
+            path,
+            pl.DataFrame(
+                {
+                    "id": pl.Series([3, 4], dtype=pl.Int64),
+                    "g": pl.Series([100.0, 200.0], dtype=pl.Float32),
+                }
+            ).to_arrow(),
+            mode="append",
+        )
+        return path
+
+    def test_widening_float_cast_translates(self, f32_table):
+        expr = pl.col("g").cast(pl.Float64) > pl.lit(60.0, dtype=pl.Float64)
+        assert _kernel_count(f32_table, expr) == 1
+
+    def test_widening_cast_around_is_in_translates(self, f32_table):
+        expr = pl.col("g").cast(pl.Float64).is_in([0.5, 1.5])
+        assert _kernel_count(f32_table, expr) == 1
+
+    def test_float32_predicate_skips_a_whole_file(self, f32_table):
+        """Delete the low file: the query only succeeds if kernel skipped it."""
+        adds = [
+            json.loads(line)["add"]
+            for log in sorted(Path(f32_table, "_delta_log").glob("*.json"))
+            for line in log.read_text().splitlines()
+            if "add" in json.loads(line)
+        ]
+        low = next(
+            a["path"]
+            for a in adds
+            if json.loads(a["stats"])["maxValues"]["g"] < 50
+        )
+        Path(f32_table, low).unlink()
+
+        # A typed Float64 literal is kept by polars (a dyn one would shrink
+        # to Float32), so the plugin delivers cast(g, Float64) > Double.
+        out = scan_delta(f32_table).filter(pl.col("g") > pl.lit(60.0, dtype=pl.Float64))
+        assert out.collect().sort("id")["id"].to_list() == [3, 4]
+
+    def test_inexact_literal_declines(self, f32_table):
+        """2.9 has no exact Float32 form; narrowing it would push a
+        satisfiable predicate for a comparison that is false on every row."""
+        expr = pl.col("g").cast(pl.Float64) == pl.lit(2.9, dtype=pl.Float64)
+        assert _kernel_count(f32_table, expr) == 0
+        got = scan_delta(f32_table).filter(pl.col("g") == 2.9).collect()
+        assert got.height == 0
+
+
 class TestUntranslatable:
     """Negative coverage — shapes that must stay out of the kernel bucket."""
 

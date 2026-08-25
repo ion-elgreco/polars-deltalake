@@ -100,10 +100,138 @@ fn cast_is_droppable(inner: &Expr, dtype: &DataTypeExpr, schema: &StructType) ->
             (&from_pl, target),
             (
                 PlDataType::Int8,
-                PlDataType::Int16 | PlDataType::Int32 | PlDataType::Int64
-            ) | (PlDataType::Int16, PlDataType::Int32 | PlDataType::Int64)
-                | (PlDataType::Int32, PlDataType::Int64)
+                PlDataType::Int16
+                    | PlDataType::Int32
+                    | PlDataType::Int64
+                    | PlDataType::Float32
+                    | PlDataType::Float64
+            ) | (
+                PlDataType::Int16,
+                PlDataType::Int32
+                    | PlDataType::Int64
+                    | PlDataType::Float32
+                    | PlDataType::Float64
+            ) | (
+                PlDataType::Int32,
+                PlDataType::Int64 | PlDataType::Float64
+            ) | (PlDataType::Float32, PlDataType::Float64)
         )
+}
+
+/// Primitive leaf type a translated kernel column reference resolves to.
+fn column_leaf_prim(name: &ColumnName, schema: &StructType) -> Option<PrimitiveType> {
+    let path: Vec<PlSmallStr> = name.iter().map(|s| PlSmallStr::from_str(s)).collect();
+    column_leaf_type(&path, schema).cloned()
+}
+
+fn scalar_numeric_prim(s: &Scalar) -> Option<PrimitiveType> {
+    Some(match s {
+        Scalar::Byte(_) => PrimitiveType::Byte,
+        Scalar::Short(_) => PrimitiveType::Short,
+        Scalar::Integer(_) => PrimitiveType::Integer,
+        Scalar::Long(_) => PrimitiveType::Long,
+        Scalar::Float(_) => PrimitiveType::Float,
+        Scalar::Double(_) => PrimitiveType::Double,
+        _ => return None,
+    })
+}
+
+fn numeric_prim(t: &PrimitiveType) -> bool {
+    matches!(
+        t,
+        PrimitiveType::Byte
+            | PrimitiveType::Short
+            | PrimitiveType::Integer
+            | PrimitiveType::Long
+            | PrimitiveType::Float
+            | PrimitiveType::Double
+    )
+}
+
+/// Convert a numeric scalar to `target` only when the value survives the
+/// round trip exactly. Kernel compares stats strictly same-type, so a
+/// literal left wider than its column never skips; an inexact conversion
+/// must decline — `f32_col == 2.9f64` is false on every row, while the
+/// narrowed `f32_col == 2.9f32` is satisfiable.
+fn narrow_scalar_exact(s: &Scalar, target: &PrimitiveType) -> Option<Scalar> {
+    let int_val = |s: &Scalar| -> Option<i64> {
+        Some(match s {
+            Scalar::Byte(v) => i64::from(*v),
+            Scalar::Short(v) => i64::from(*v),
+            Scalar::Integer(v) => i64::from(*v),
+            Scalar::Long(v) => *v,
+            _ => return None,
+        })
+    };
+    Some(match target {
+        PrimitiveType::Byte => Scalar::Byte(i8::try_from(int_val(s)?).ok()?),
+        PrimitiveType::Short => Scalar::Short(i16::try_from(int_val(s)?).ok()?),
+        PrimitiveType::Integer => Scalar::Integer(i32::try_from(int_val(s)?).ok()?),
+        PrimitiveType::Long => Scalar::Long(int_val(s)?),
+        PrimitiveType::Float => match s {
+            Scalar::Double(v) => {
+                let f = *v as f32;
+                if f64::from(f) == *v {
+                    Scalar::Float(f)
+                } else {
+                    return None;
+                }
+            }
+            _ => {
+                let i = int_val(s)?;
+                let f = i as f32;
+                if f as i64 == i {
+                    Scalar::Float(f)
+                } else {
+                    return None;
+                }
+            }
+        },
+        PrimitiveType::Double => match s {
+            Scalar::Float(v) => Scalar::Double(f64::from(*v)),
+            _ => {
+                let i = int_val(s)?;
+                let f = i as f64;
+                if f as i64 == i {
+                    Scalar::Double(f)
+                } else {
+                    return None;
+                }
+            }
+        },
+        _ => return None,
+    })
+}
+
+/// Align a numeric literal operand to its column's exact type. Non-numeric
+/// pairings pass through untouched; an inexact numeric conversion declines
+/// the conjunct.
+fn align_numeric_literal(
+    l: Expression,
+    r: Expression,
+    schema: &StructType,
+) -> Option<(Expression, Expression)> {
+    let align = |name: &ColumnName, s: Scalar| -> Option<Scalar> {
+        let Some(target) = column_leaf_prim(name, schema).filter(numeric_prim) else {
+            return Some(s);
+        };
+        match scalar_numeric_prim(&s) {
+            Some(sp) if sp == target => Some(s),
+            Some(_) => narrow_scalar_exact(&s, &target),
+            None => Some(s),
+        }
+    };
+    Some(match (l, r) {
+        (Expression::Column(name), Expression::Literal(s)) => {
+            let s = align(&name, s)?;
+            (Expression::Column(name), Expression::Literal(s))
+        }
+        (Expression::Literal(s), Expression::Column(name)) => {
+            let s = align(&name, s)?;
+            (Expression::Literal(s), Expression::Column(name))
+        }
+        other => other,
+    })
 }
 
 /// `SelectFields` is excluded: its selector expands to names later, so it is
@@ -197,6 +325,7 @@ fn translate_binary(
 
     let l = polars_expr_to_kernel_expression(left, schema)?;
     let r = polars_expr_to_kernel_expression(right, schema)?;
+    let (l, r) = align_numeric_literal(l, r, schema)?;
     Some(match op {
         Operator::Eq => Predicate::eq(l, r),
         Operator::NotEq => Predicate::ne(l, r),
@@ -228,10 +357,6 @@ fn translate_function(
             let lhs = input.first()?;
             let rhs = input.get(1)?;
             let elements = extract_set_elements(rhs)?;
-            // `x IN []` is vacuously false.
-            if elements.is_empty() {
-                return Some(Predicate::literal(false));
-            }
             if elements.len() > MAX_IN_LIST_KERNEL_EXPANSION {
                 tracing::debug!(
                     target: "polars_deltalake::pushdown",
@@ -242,12 +367,35 @@ fn translate_function(
                 );
                 return None;
             }
+            let lhs_kernel = polars_expr_to_kernel_expression(lhs, schema)?;
+            // Numeric elements narrow to the column's exact type; an inexact
+            // element can equal no column value, so its disjunct drops.
+            let elements: Vec<Scalar> = match &lhs_kernel {
+                Expression::Column(name) => {
+                    match column_leaf_prim(name, schema).filter(numeric_prim) {
+                        Some(target) => elements
+                            .into_iter()
+                            .filter_map(|s| match scalar_numeric_prim(&s) {
+                                Some(sp) if sp == target => Some(s),
+                                Some(_) => narrow_scalar_exact(&s, &target),
+                                None => Some(s),
+                            })
+                            .collect(),
+                        None => elements,
+                    }
+                }
+                _ => elements,
+            };
+            // `x IN []` — including a set with no representable element —
+            // is vacuously false.
+            if elements.is_empty() {
+                return Some(Predicate::literal(false));
+            }
             // Flatten to `lhs == v1 OR ...` rather than `BinaryPredicateOp::In`:
             // kernel's `eval_pred_in` (kernel_predicates/mod.rs) is a `None //
             //
             // TODO: revert to `BinaryPredicateOp::In` once kernel's pruning
             // evaluators implement `eval_pred_in`.
-            let lhs_kernel = polars_expr_to_kernel_expression(lhs, schema)?;
             Some(Predicate::or_from(elements.into_iter().map(|s| {
                 Predicate::eq(lhs_kernel.clone(), Expression::Literal(s))
             })))
@@ -258,6 +406,8 @@ fn translate_function(
             let value = polars_expr_to_kernel_expression(input.first()?, schema)?;
             let low = polars_expr_to_kernel_expression(input.get(1)?, schema)?;
             let high = polars_expr_to_kernel_expression(input.get(2)?, schema)?;
+            let (value, low) = align_numeric_literal(value, low, schema)?;
+            let (value, high) = align_numeric_literal(value, high, schema)?;
             let (lo, hi) = match closed {
                 ClosedInterval::Both => (
                     Predicate::ge(value.clone(), low),
@@ -410,6 +560,51 @@ fn series_to_scalars(series: &Series) -> Option<Vec<Scalar>> {
             other => any_value_to_scalar(&other),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod narrow_scalar_tests {
+    use super::*;
+
+    #[test]
+    fn exact_double_narrows_to_float() {
+        assert_eq!(
+            narrow_scalar_exact(&Scalar::Double(1.5), &PrimitiveType::Float),
+            Some(Scalar::Float(1.5))
+        );
+    }
+
+    #[test]
+    fn inexact_double_declines_float() {
+        assert_eq!(
+            narrow_scalar_exact(&Scalar::Double(2.9), &PrimitiveType::Float),
+            None
+        );
+    }
+
+    #[test]
+    fn long_narrows_within_range_only() {
+        assert_eq!(
+            narrow_scalar_exact(&Scalar::Long(1), &PrimitiveType::Integer),
+            Some(Scalar::Integer(1))
+        );
+        assert_eq!(
+            narrow_scalar_exact(&Scalar::Long(i64::from(i32::MAX) + 1), &PrimitiveType::Integer),
+            None
+        );
+    }
+
+    #[test]
+    fn long_to_double_requires_exactness() {
+        assert_eq!(
+            narrow_scalar_exact(&Scalar::Long(1 << 53), &PrimitiveType::Double),
+            Some(Scalar::Double(9_007_199_254_740_992.0))
+        );
+        assert_eq!(
+            narrow_scalar_exact(&Scalar::Long((1 << 53) + 1), &PrimitiveType::Double),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
