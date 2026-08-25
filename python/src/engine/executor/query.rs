@@ -483,6 +483,14 @@ fn kernel_constant_literals(
         .iter()
         .zip(cols)
         .map(|(scalar, (field, dt))| -> DeltaResult<Expr> {
+            // Same untrusted proto boundary as `Values`: a mistyped constant
+            // would otherwise surface as an opaque cast failure mid-collect,
+            // or cast cleanly and broadcast a silently wrong NULL.
+            crate::translation::ensure_scalar_types(
+                std::iter::once(scalar),
+                field,
+                "scan file constant",
+            )?;
             Ok(scalar_to_lit(scalar)
                 .cast(dt.clone())
                 .alias(PlSmallStr::from_str(field.name.as_str())))
@@ -512,20 +520,6 @@ fn eval_values(values: Values) -> DeltaResult<NodeState> {
             fields.len()
         )));
     }
-    // Foreign plans arrive via the proto round-trip, so scalar/schema
-    // agreement is not guaranteed here — and `build_series` panics on it.
-    for row in &rows {
-        for (scalar, field) in row.iter().zip(&fields) {
-            if !matches!(scalar, Scalar::Null(_)) && scalar.data_type() != field.data_type {
-                return Err(Error::Generic(format!(
-                    "Values scalar for {} is {}, schema declares {}",
-                    field.name,
-                    scalar.data_type(),
-                    field.data_type
-                )));
-            }
-        }
-    }
     if rows.is_empty() {
         return Ok(NodeState {
             lf: concat_frames(Vec::new(), &schema)?,
@@ -539,6 +533,10 @@ fn eval_values(values: Values) -> DeltaResult<NodeState> {
             .enumerate()
             .map(|(i, f)| {
                 let scalars: Vec<&Scalar> = rows.iter().map(|r| &r[i]).collect();
+                // Foreign plans arrive via the proto round-trip, so
+                // scalar/schema agreement is not guaranteed here — and
+                // `build_series` panics on it.
+                crate::translation::ensure_scalar_types(scalars.iter().copied(), f, "Values")?;
                 crate::translation::build_series(f.name.as_str(), &f.data_type, &scalars)
                     .map(polars::prelude::IntoColumn::into_column)
             })
@@ -1011,5 +1009,33 @@ mod dynamic_scan_size_tests {
         executor
             .eval_dynamic_scan(ds, &input)
             .expect("a zero-byte file must not abort the scan");
+    }
+}
+
+#[cfg(test)]
+mod scalar_type_guard_tests {
+    use delta_kernel::schema::DataType as KernelType;
+
+    use super::*;
+
+    /// File constants arrive over the same proto round trip as `Values`, so
+    /// a mistyped one must be named here rather than surfacing as an opaque
+    /// cast failure mid-collect — or casting cleanly to a wrong NULL.
+    #[test]
+    fn mistyped_file_constant_is_rejected() {
+        let field = StructField::nullable("d", KernelType::DATE);
+        let cols = [(&field, DataType::Date)];
+        let err = kernel_constant_literals(&[Scalar::String("2024-01-01".into())], &cols)
+            .expect_err("a String constant for a DATE column must error");
+        assert!(err.to_string().contains("scan file constant"), "got: {err}");
+    }
+
+    /// A NULL constant is typed by its own field, so it stays accepted.
+    #[test]
+    fn null_and_matching_constants_pass() {
+        let field = StructField::nullable("d", KernelType::DATE);
+        let cols = [(&field, DataType::Date)];
+        kernel_constant_literals(&[Scalar::Null(KernelType::DATE)], &cols).unwrap();
+        kernel_constant_literals(&[Scalar::Date(19_000)], &cols).unwrap();
     }
 }
