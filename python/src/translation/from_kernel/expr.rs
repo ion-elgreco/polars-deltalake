@@ -248,23 +248,17 @@ fn parse_partition_string(raw: Expr, target: &KernelDataType) -> DeltaResult<Exp
             "MapToStruct: partition column of type {target:?} is not a primitive"
         )));
     };
-    let polars_target = target.to_polars().map_err(to_kernel_err)?;
-    match prim {
-        // Identity under `parse_scalar`, so skip the per-row round trip that
-        // partition columns of these two types would spend rebuilding.
-        PrimitiveType::String => Ok(raw),
-        PrimitiveType::Binary => Ok(raw.cast(polars_target)),
-        _ => {
-            let kernel_target = target.clone();
-            let output = polars_target;
-            Ok(raw.map(
-                move |column| parse_partition_column(&column, &kernel_target),
-                move |_: &Schema, field: &Field| {
-                    Ok(Field::new(field.name().clone(), output.clone()))
-                },
-            ))
-        }
+    // Identity under `parse_scalar`, so skip the per-row round trip a string
+    // partition column would spend rebuilding itself.
+    if matches!(prim, PrimitiveType::String) {
+        return Ok(raw);
     }
+    let output = target.to_polars().map_err(to_kernel_err)?;
+    let kernel_target = target.clone();
+    Ok(raw.map(
+        move |column| parse_partition_column(&column, &kernel_target),
+        move |_: &Schema, field: &Field| Ok(Field::new(field.name().clone(), output.clone())),
+    ))
 }
 
 /// One `parse_scalar` per value, so a value no kernel-accepted spelling
@@ -275,9 +269,9 @@ pub(crate) fn parse_partition_column(
     target: &KernelDataType,
 ) -> polars::prelude::PolarsResult<Column> {
     let KernelDataType::Primitive(prim) = target else {
-        return Err(polars::prelude::PolarsError::ComputeError(
-            format!("partition column of type {target:?} is not a primitive").into(),
-        ));
+        return Err(to_pl_err(format!(
+            "partition column of type {target:?} is not a primitive"
+        )));
     };
     match prim {
         // Identity under `parse_scalar`; the empty string stays itself here
@@ -294,9 +288,7 @@ pub(crate) fn parse_partition_column(
             // The empty string has no representation in the types that
             // reach here; string and binary keep it via the arms above.
             Some("") => Ok(Scalar::Null(target.clone())),
-            Some(value) => prim
-                .parse_scalar(value)
-                .map_err(|e| polars::prelude::PolarsError::ComputeError(e.to_string().into())),
+            Some(value) => prim.parse_scalar(value).map_err(to_pl_err),
         })
         .collect::<polars::prelude::PolarsResult<Vec<Scalar>>>()?;
     let series = build_series(
@@ -304,7 +296,7 @@ pub(crate) fn parse_partition_column(
         target,
         &scalars.iter().collect::<Vec<_>>(),
     )
-    .map_err(|e| polars::prelude::PolarsError::ComputeError(e.to_string().into()))?;
+    .map_err(to_pl_err)?;
     Ok(Column::from(series))
 }
 
@@ -740,5 +732,47 @@ mod column_dtype_tests {
             Some(&KernelDataType::LONG)
         );
         assert!(resolve_column_dtype(&ColumnName::new(["a", "b"]), Some(&schema)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod partition_parse_agreement_tests {
+    use super::*;
+
+    /// The Expr-level parser delegates to the Column-level one so projection
+    /// and partition pruning cannot disagree about the same file. Pin that
+    /// on the types whose handling used to be spelled out in both.
+    #[test]
+    fn expr_and_column_parsers_agree() {
+        use polars::prelude::{DataFrame, IntoLazy, NamedFrom, col};
+
+        for target in [
+            KernelDataType::STRING,
+            KernelDataType::BINARY,
+            KernelDataType::LONG,
+            KernelDataType::DATE,
+        ] {
+            let raw: Vec<Option<&str>> = match target {
+                KernelDataType::LONG => vec![Some("7"), Some(""), None],
+                KernelDataType::DATE => vec![Some("2024-01-01"), Some(""), None],
+                _ => vec![Some("x"), Some(""), None],
+            };
+            let column = Column::new("p".into(), Series::new("p".into(), raw.clone()));
+            let direct = parse_partition_column(&column, &target).unwrap();
+
+            let via_expr = DataFrame::new(3, vec![column])
+                .unwrap()
+                .lazy()
+                .select([parse_partition_string(col("p"), &target).unwrap().alias("p")])
+                .collect()
+                .unwrap();
+            let via_expr = via_expr.column("p").unwrap();
+
+            assert_eq!(via_expr.dtype(), direct.dtype(), "dtype for {target:?}");
+            assert!(
+                via_expr.equals_missing(&direct),
+                "values disagree for {target:?}"
+            );
+        }
     }
 }
