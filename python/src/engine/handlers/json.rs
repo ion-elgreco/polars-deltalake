@@ -154,13 +154,14 @@ pub(crate) fn align_lazy(
         })
         .collect::<DeltaResult<_>>()?;
 
-    // Every column is a literal when the file names none of the requested
-    // fields, and polars collapses an all-literal select to one row. A row
-    // index keeps the select anchored to the input height.
-    let no_field_present = !kernel_schema
-        .fields()
-        .any(|f| polars_schema.contains(f.name.as_str()));
-    if no_field_present {
+    // Polars sizes a select from its expressions, so a list that names no
+    // column collapses the frame to one row — the file names none of the
+    // requested fields, or every one it does name aligns to a literal (an
+    // empty inferred struct for a Map). A row index anchors the height.
+    let references_column = select_exprs
+        .iter()
+        .any(|e| !polars_plan::utils::expr_to_leaf_column_names(e).is_empty());
+    if !references_column {
         const ANCHOR: &str = "__pldl_rows__";
         let anchor = PlSmallStr::from_static(ANCHOR);
         select_exprs.push(col(anchor.clone()));
