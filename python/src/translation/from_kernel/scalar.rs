@@ -517,14 +517,21 @@ fn panic_mismatch(name: &str, expected: &str, got: &Scalar) -> ! {
 }
 
 /// Boundary guard for [`build_series`]'s panic contract: every non-null
-/// scalar must carry exactly the field's declared type.
+/// scalar must carry the field's declared type.
+///
+/// Nullability is not part of that contract — `build_series` drives the build
+/// off the *declared* type and only matches each scalar's shape — so a
+/// container whose `contains_null` / field nullability disagrees is accepted.
+/// Comparing the raw `DataType` would reject it with an error naming two
+/// identical-looking types.
 pub(crate) fn ensure_scalar_types<'a>(
     scalars: impl IntoIterator<Item = &'a Scalar>,
     field: &delta_kernel::schema::StructField,
     context: &str,
 ) -> delta_kernel::DeltaResult<()> {
     for scalar in scalars {
-        if !matches!(scalar, Scalar::Null(_)) && scalar.data_type() != field.data_type {
+        if !matches!(scalar, Scalar::Null(_)) && !same_shape(&scalar.data_type(), &field.data_type)
+        {
             return Err(delta_kernel::Error::Generic(format!(
                 "{context}: scalar for {} is {}, schema declares {}",
                 field.name,
@@ -534,6 +541,26 @@ pub(crate) fn ensure_scalar_types<'a>(
         }
     }
     Ok(())
+}
+
+/// Structural type equality with every nullability flag erased.
+fn same_shape(a: &KernelDataType, b: &KernelDataType) -> bool {
+    match (a, b) {
+        (KernelDataType::Primitive(x), KernelDataType::Primitive(y)) => x == y,
+        (KernelDataType::Array(x), KernelDataType::Array(y)) => {
+            same_shape(x.element_type(), y.element_type())
+        }
+        (KernelDataType::Map(x), KernelDataType::Map(y)) => {
+            same_shape(x.key_type(), y.key_type()) && same_shape(x.value_type(), y.value_type())
+        }
+        (KernelDataType::Struct(x), KernelDataType::Struct(y)) => {
+            x.num_fields() == y.num_fields()
+                && x.fields()
+                    .zip(y.fields())
+                    .all(|(fx, fy)| fx.name == fy.name && same_shape(&fx.data_type, &fy.data_type))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
