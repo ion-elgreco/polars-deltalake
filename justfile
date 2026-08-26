@@ -69,7 +69,9 @@ test-rust:
         echo "just test-rust: could not resolve the venv interpreter — run 'just develop' first" >&2
         exit 1
     }
-    case "$py" in
+    # Windows `sys.executable` is backslash-separated, so match on a
+    # forward-slash copy rather than the raw path.
+    case "${py//\\//}" in
         */.venv/*) ;;
         *)
             echo "just test-rust: '$py' is not the project venv — run 'just develop' first" >&2
