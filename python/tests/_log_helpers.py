@@ -20,8 +20,8 @@ def rewrite_log_actions(
     """Apply `mutate` (in place) to every action of commit `version`."""
     log = Path(table_path) / "_delta_log" / f"{version:020d}.json"
     lines = []
-    for line in log.read_text().splitlines():
+    for line in log.read_text(encoding="utf-8").splitlines():
         action = json.loads(line)
         mutate(action)
         lines.append(json.dumps(action))
-    log.write_text("\n".join(lines) + "\n")
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
