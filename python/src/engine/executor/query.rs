@@ -187,6 +187,17 @@ impl PolarsPlanExecutor {
             return concat_frames(Vec::new(), output_schema);
         };
 
+        // Polars sizes a frame from the columns it reads, so a scan with no
+        // read columns collapses to height 0 and the constants below broadcast
+        // to one synthetic row per file. `ParquetHandler` takes `num_rows` from
+        // the footer for this shape; `FileEntry` carries no file size to do the
+        // same, so refuse rather than under-report every file's row count.
+        if read_schema.fields().next().is_none() {
+            return Err(Error::Unsupported(
+                "plan scan: a node whose output is entirely file constants is not supported".into(),
+            ));
+        }
+
         // Equal per-file literals (checkpoint parts, V2 sidecars) collapse into
         // one multi-file scan, keeping polars-io's cross-file parallelism.
         let uniform_constants = entries[1..].iter().all(|e| e.literals == first.literals);
@@ -728,6 +739,48 @@ mod scan_entries_tests {
     fn differing_literals_scan_per_file() {
         let literals = |n| vec![lit(n).alias("v")];
         assert_eq!(plan_scan_count([literals(1i64), literals(2i64)]), 2);
+    }
+
+    /// A read schema with no fields would report one synthetic row per file
+    /// instead of the file's row count.
+    #[test]
+    fn a_scan_with_no_read_columns_is_refused() {
+        let read_schema = StructType::try_new(Vec::<StructField>::new()).unwrap();
+        let output_schema = Arc::new(StructType::try_new([long_field("v")]).unwrap());
+        let entries = vec![FileEntry {
+            location: Url::parse("file:///t/0.parquet").unwrap(),
+            literals: vec![lit(7i64).alias("v")],
+        }];
+        let err = executor()
+            .scan_entries(
+                FileType::Parquet,
+                entries,
+                &read_schema,
+                &output_schema,
+                None,
+            )
+            .err()
+            .expect("a constants-only scan must not report one row per file");
+        assert!(err.to_string().contains("file constants"), "got: {err}");
+    }
+
+    /// The polars behaviour that refusal guards against.
+    #[test]
+    fn a_frame_with_no_columns_loses_its_height() {
+        let df = polars::df!("x" => [1i64, 2, 3]).unwrap();
+        let empty = df
+            .lazy()
+            .drop(polars::prelude::cols(["x"]))
+            .collect()
+            .unwrap();
+        assert_eq!(empty.height(), 0, "height comes from the columns read");
+        let broadcast = empty
+            .lazy()
+            .with_columns([lit(7i64).alias("v")])
+            .select([col("v")])
+            .collect()
+            .unwrap();
+        assert_eq!(broadcast.height(), 1, "constants broadcast to one row");
     }
 
     /// Kernel's reference executor row-encodes join keys, so NULL keys
