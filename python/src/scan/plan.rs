@@ -263,6 +263,63 @@ mod field_source_tests {
     }
 }
 
+#[cfg(test)]
+mod logical_names_tests {
+    use delta_kernel::schema::ColumnMetadataKey;
+    use polars::prelude::{IntoColumn, IntoLazy, IntoSeries, NamedFrom, Series, StructChunked};
+    use polars_arrow::bitmap::Bitmap;
+
+    use super::*;
+
+    /// A rename is a pure relabeling, so it must not manufacture validity:
+    /// a NULL map entry stays NULL through the {key,value} rebuild — the
+    /// same rule the Struct arm enforces with its own gate.
+    #[test]
+    fn map_rebuild_keeps_entry_validity() {
+        let value_struct = StructType::try_new([StructField::nullable(
+            "a",
+            KernelDataType::LONG,
+        )
+        .with_metadata([(
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+            "phys_a",
+        )])])
+        .unwrap();
+        let map_dt = KernelDataType::Map(Box::new(MapType::new(
+            KernelDataType::STRING,
+            KernelDataType::Struct(Box::new(value_struct)),
+            true,
+        )));
+
+        // One row holding two entries, the second one NULL.
+        let key = Series::new("key".into(), ["k1", "k2"]);
+        let phys = Series::new("phys_a".into(), [1i64, 2]);
+        let value = StructChunked::from_series("value".into(), 2, [phys].iter())
+            .unwrap()
+            .into_series();
+        let entries = StructChunked::from_series("entry".into(), 2, [key, value].iter())
+            .unwrap()
+            .with_outer_validity(Some(Bitmap::from([true, false])))
+            .into_series();
+        let m = entries.implode().unwrap().into_series();
+        let df = DataFrame::new(1, vec![m.with_name("m".into()).into_column()]).unwrap();
+
+        let expr = logical_names(col("m"), &map_dt, ColumnMappingMode::Name)
+            .expect("a renamed nested field forces the rebuild");
+        let out = df.lazy().select([expr.alias("m")]).collect().unwrap();
+        let row = out
+            .column("m")
+            .unwrap()
+            .as_materialized_series()
+            .list()
+            .unwrap()
+            .get_as_series(0)
+            .unwrap();
+        assert_eq!(row.len(), 2);
+        assert_eq!(row.null_count(), 1, "the NULL entry must stay NULL");
+    }
+}
+
 /// Per-row typed partition literals, one `Vec<Expr>` per add row, aligned
 /// with `sources` (empty per-row vec when the table is unpartitioned). The
 /// values come from `add.partitionValues_parsed`, which the metadata plan
@@ -345,10 +402,16 @@ fn logical_names(expr: Expr, dtype: &KernelDataType, mode: ColumnMappingMode) ->
                     .unwrap_or(field)
                     .alias(PlSmallStr::from_static(name))
             };
-            expr.list().eval(polars_as_struct(vec![
-                entry(MAP_KEY_FIELD, map.key_type()),
-                entry(MAP_VALUE_FIELD, map.value_type()),
-            ]))
+            // `as_struct` alone would revalidate a NULL entry as a struct
+            // of nulls; gate on the entry's own validity, like the Struct
+            // arm above.
+            expr.list().eval(null_gated(
+                Expr::Element.is_not_null(),
+                polars_as_struct(vec![
+                    entry(MAP_KEY_FIELD, map.key_type()),
+                    entry(MAP_VALUE_FIELD, map.value_type()),
+                ]),
+            ))
         }
         _ => return None,
     };
