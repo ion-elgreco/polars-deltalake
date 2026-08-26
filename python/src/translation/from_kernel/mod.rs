@@ -194,6 +194,24 @@ impl PolarsExpressionEvaluator {
             input_width,
         }
     }
+
+    /// `Passthrough` addresses the batch by ordinal, so a same-width batch in
+    /// another order would return the wrong column under the right output
+    /// name. Confirm each index still carries its declared name.
+    fn positions_match(&self, df: &DataFrame) -> bool {
+        if df.width() != self.input_width {
+            return false;
+        }
+        let cols = df.columns();
+        self.ops.iter().all(|op| match op {
+            ColumnOp::Passthrough {
+                input_idx,
+                input_name,
+                ..
+            } => cols.get(*input_idx).is_some_and(|c| c.name() == input_name),
+            _ => true,
+        })
+    }
 }
 
 impl ExpressionEvaluator for PolarsExpressionEvaluator {
@@ -201,7 +219,7 @@ impl ExpressionEvaluator for PolarsExpressionEvaluator {
         let df = downcast_engine_data(batch)?.dataframe();
         let height = df.height();
 
-        if self.all_simple && df.width() == self.input_width {
+        if self.all_simple && self.positions_match(df) {
             let input_cols = df.columns();
             let columns: Vec<Column> = self
                 .ops
@@ -423,6 +441,38 @@ mod evaluator_height_tests {
         assert!(
             out.is_err(),
             "a batch narrower than the declared schema must error"
+        );
+    }
+
+    /// Same width, different order: position alone cannot tell the two apart,
+    /// so the positional path would hand back `a` under the name `b`.
+    #[test]
+    fn reordered_batch_resolves_passthrough_by_name() {
+        let handler = PolarsEvaluationHandler::new();
+        let input_schema = Arc::new(
+            StructType::try_new([
+                StructField::nullable("a", KernelDataType::LONG),
+                StructField::nullable("b", KernelDataType::LONG),
+            ])
+            .unwrap(),
+        );
+        let evaluator = handler
+            .new_expression_evaluator(
+                input_schema,
+                Arc::new(Expression::column(["b"])),
+                KernelDataType::LONG,
+            )
+            .unwrap();
+        let df = polars::df!("b" => [7i64], "a" => [1i64]).unwrap();
+        let out = evaluator
+            .evaluate(&PolarsEngineData::new(df))
+            .expect("a reordered batch still resolves by name");
+        let got = downcast_engine_data(out.as_ref()).unwrap().dataframe();
+        let col = got.columns().first().expect("one output column");
+        assert_eq!(
+            col.i64().unwrap().get(0),
+            Some(7),
+            "must read 'b', not the column that sits at b's declared index"
         );
     }
 
