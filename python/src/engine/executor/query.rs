@@ -510,31 +510,33 @@ fn eval_project(project: Project, input: &NodeState) -> DeltaResult<NodeState> {
     let Project { expr, schema } = project;
     let input_struct = input.schema.as_ref();
     let out_dt = KernelDataType::Struct(Box::new(schema.as_ref().clone()));
-    let exprs: Vec<Expr> = match expr.as_ref() {
+    let lf = match expr.as_ref() {
         // Struct-shaped exprs classify into per-column ops (no nested
         // struct build in the plan).
         Expression::Struct(..) | Expression::StructPatch(..) => {
-            projection_exprs(input_struct, expr.as_ref(), &out_dt)?
+            let exprs = projection_exprs(input_struct, expr.as_ref(), &out_dt)?;
+            select_anchored(input.lf.clone(), &exprs)
         }
-        // Whole-row expression: evaluate once, unnest per output field.
+        // Whole-row expression: evaluate once under a temp name, then
+        // unnest per output field — a per-field clone would re-run an
+        // opaque UDF (ParseJson, MapToStruct) once per field.
         other => {
-            let struct_expr = translate_expr(other, Some(&out_dt), Some(input_struct))?;
-            schema
+            const ROW_EXPR: &str = "__pldl_row_expr__";
+            let struct_expr = translate_expr(other, Some(&out_dt), Some(input_struct))?
+                .alias(PlSmallStr::from_static(ROW_EXPR));
+            let unnest: Vec<Expr> = schema
                 .fields()
                 .map(|f| {
-                    struct_expr
-                        .clone()
+                    col(PlSmallStr::from_static(ROW_EXPR))
                         .struct_()
                         .field_by_name(f.name.as_str())
                         .alias(PlSmallStr::from_str(f.name.as_str()))
                 })
-                .collect()
+                .collect();
+            select_anchored(input.lf.clone(), std::slice::from_ref(&struct_expr)).select(unnest)
         }
     };
-    Ok(NodeState {
-        lf: select_anchored(input.lf.clone(), &exprs),
-        schema,
-    })
+    Ok(NodeState { lf, schema })
 }
 
 fn eval_semi_join(join: SemiJoin, probe: &NodeState, build: &NodeState) -> DeltaResult<NodeState> {
