@@ -228,7 +228,8 @@ impl ParquetHandler for PolarsParquetHandler {
             crate::translation::from_kernel::translate_predicate(p.as_ref(), None).ok()
         });
 
-        let select_exprs = crate::scan::select_exprs_for_schema(physical_schema.as_ref());
+        let select_exprs =
+            crate::translation::schema::select_exprs_for_schema(physical_schema.as_ref());
 
         let paths: Vec<(PlRefPath, String)> = files
             .iter()

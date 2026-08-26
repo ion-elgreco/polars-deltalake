@@ -240,3 +240,13 @@ fn arrow_to_kernel_dtype(dt: &ArrowDataType) -> anyhow::Result<KernelDataType> {
         other => anyhow::bail!("arrow dtype {other:?} has no kernel equivalent yet"),
     })
 }
+
+
+/// `col(...)` per kernel schema field, in schema order. Used by the scan
+/// driver and the engine's read paths to shape frames to a kernel schema.
+pub(crate) fn select_exprs_for_schema(schema: &StructType) -> Vec<polars::prelude::Expr> {
+    schema
+        .fields()
+        .map(|f| polars::prelude::col(PlSmallStr::from_str(f.name.as_str())))
+        .collect()
+}

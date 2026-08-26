@@ -45,11 +45,3 @@ pub(crate) fn build_lazy_scan(
     Ok(plan.select(final_select))
 }
 
-/// `col(...)` per kernel physical-schema field. Caller appends file-id /
-/// other metadata columns before handing to `build_lazy_scan`.
-pub(crate) fn select_exprs_for_schema(physical_schema: &StructType) -> Vec<Expr> {
-    physical_schema
-        .fields()
-        .map(|f| polars::prelude::col(PlSmallStr::from_str(f.name.as_str())))
-        .collect()
-}

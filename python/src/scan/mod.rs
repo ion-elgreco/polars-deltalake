@@ -25,7 +25,7 @@ mod predicate;
 mod read;
 
 pub(crate) use cdf::{CdfTableScan, CdfTableState};
-pub(crate) use read::{build_lazy_scan, select_exprs_for_schema};
+pub(crate) use read::build_lazy_scan;
 
 use ffi::{MorselState, SendExport, morsel_to_py, next_morsel};
 use logical::LogicalScanIter;
@@ -259,7 +259,7 @@ impl TableScan {
         } = resolved;
 
         let physical_schema = scan.physical_schema().clone();
-        let select_exprs = select_exprs_for_schema(&physical_schema);
+        let select_exprs = crate::translation::schema::select_exprs_for_schema(&physical_schema);
 
         let mode = self.snapshot.table_configuration().column_mapping_mode();
         let table_logical_schema = self.snapshot.schema();

@@ -173,7 +173,7 @@ impl PolarsPlanExecutor {
         output_schema: &SchemaRef,
         meta_cols: MetadataColumns,
     ) -> DeltaResult<LazyFrame> {
-        let select = crate::scan::select_exprs_for_schema(output_schema);
+        let select = crate::translation::schema::select_exprs_for_schema(output_schema);
         let row_index = meta_cols.row_index().cloned();
         let file_path = meta_cols.file_path().cloned();
         let shape = |lf: LazyFrame, literals: Vec<Expr>| {
