@@ -27,7 +27,7 @@ pub(crate) fn build_lazy_scan(
         cloud_opts,
         include_file_id.then(|| PlSmallStr::from_static(FILE_ID_COL)),
     );
-    let lazy = crate::engine::dsl_parquet_scan(paths, physical_schema, unified_scan_args)
+    let lazy = crate::engine::dsl_parquet_scan(paths, physical_schema, unified_scan_args, None)
         .map_err(|e| anyhow::anyhow!("scan_parquet plan failed: {e:#}"))?;
 
     let mut final_select: Vec<Expr> = Vec::with_capacity(select_exprs.len() + 1);

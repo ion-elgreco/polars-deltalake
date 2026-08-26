@@ -342,19 +342,31 @@ pub(crate) fn parquet_options(physical_schema: &StructType) -> DeltaResult<Parqu
 }
 
 /// The one shared `DslBuilder::scan_parquet` construction: schema-typed
-/// options over `paths`. Callers customize `args` first (row index,
-/// file-id column).
+/// options over `paths`, with the synthetic row index requested and typed
+/// in one place — kernel's plan contract types metadata columns LONG,
+/// polars' native row index is IDX_DTYPE (u32). Callers customize the
+/// remaining `args` first (file-id column).
 pub(crate) fn dsl_parquet_scan(
     paths: Vec<PlRefPath>,
     physical_schema: &StructType,
-    args: UnifiedScanArgs,
+    mut args: UnifiedScanArgs,
+    row_index: Option<&PlSmallStr>,
 ) -> DeltaResult<LazyFrame> {
+    if let Some(name) = row_index {
+        args.row_index = Some(polars::prelude::RowIndex {
+            name: name.clone(),
+            offset: 0,
+        });
+    }
     let options = parquet_options(physical_schema)?;
     let lazy: LazyFrame = DslBuilder::scan_parquet(ScanSources::Paths(paths.into()), options, args)
         .map_err(to_kernel_err)?
         .build()
         .into();
-    Ok(lazy)
+    Ok(match row_index {
+        Some(name) => lazy.with_columns([col(name.clone()).cast(PlDataType::Int64)]),
+        None => lazy,
+    })
 }
 
 /// The ScanParquet plan contract resolves a field carrying
@@ -446,27 +458,16 @@ fn read_batch(
 }
 
 fn file_batches(path: PlRefPath, location: &str, args: &FileScanArgs) -> DeltaResult<BatchIter> {
-    let mut scan_args = unified_scan_args(args.cloud_opts.as_ref(), None);
-    if let Some(name) = &args.row_index {
-        scan_args.row_index = Some(polars::prelude::RowIndex {
-            name: name.clone(),
-            offset: 0,
-        });
-    }
-    let lazy = dsl_parquet_scan(vec![path], &args.read_schema, scan_args)?;
-    let mut synthesized: Vec<Expr> = Vec::new();
-    if let Some(name) = &args.row_index {
-        // The plan contract types metadata columns LONG; polars' row index
-        // is IDX_DTYPE (u32).
-        synthesized.push(col(name.clone()).cast(PlDataType::Int64));
-    }
-    if let Some(name) = &args.file_path {
-        synthesized.push(lit(location).alias(name.clone()));
-    }
-    let lazy = if synthesized.is_empty() {
-        lazy
-    } else {
-        lazy.with_columns(synthesized)
+    let scan_args = unified_scan_args(args.cloud_opts.as_ref(), None);
+    let lazy = dsl_parquet_scan(
+        vec![path],
+        &args.read_schema,
+        scan_args,
+        args.row_index.as_ref(),
+    )?;
+    let lazy = match &args.file_path {
+        Some(name) => lazy.with_columns([lit(location).alias(name.clone())]),
+        None => lazy,
     };
     let mut plan = lazy.select(args.select_exprs.clone());
     if let Some(pred) = &args.predicate {

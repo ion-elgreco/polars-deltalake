@@ -267,22 +267,13 @@ impl PolarsPlanExecutor {
         // Plan contract: a field carrying `parquet.field.id` matches by ID,
         // which polars cannot express — refuse rather than null-fill.
         ensure_no_field_id_matching(read_schema)?;
-        let mut args = unified_scan_args(self.cloud_opts.as_ref(), None);
-        if let Some(name) = &row_index {
-            args.row_index = Some(polars::prelude::RowIndex {
-                name: name.clone(),
-                offset: 0,
-            });
-        }
-        let mut lf = dsl_parquet_scan(paths, read_schema, args)?;
+        let args = unified_scan_args(self.cloud_opts.as_ref(), None);
+        let mut lf = dsl_parquet_scan(paths, read_schema, args, row_index.as_ref())?;
         let guards = non_nullable_guards(read_schema);
         if !guards.is_empty() {
             lf = lf.with_columns(guards);
         }
-        Ok(match &row_index {
-            Some(name) => row_index_as_long(lf, name),
-            None => lf,
-        })
+        Ok(lf)
     }
 
     /// Reads files named by `input` rows. Deletion vectors are not applied
@@ -354,7 +345,8 @@ impl PolarsPlanExecutor {
 }
 
 /// Kernel's plan contract types metadata columns LONG; polars' row index
-/// is IDX_DTYPE (u32), so both scan arms cast it.
+/// is IDX_DTYPE (u32). The parquet arms cast inside `dsl_parquet_scan`;
+/// this casts the JSON arm's `with_row_index` column.
 fn row_index_as_long(lf: LazyFrame, name: &PlSmallStr) -> LazyFrame {
     lf.with_columns([col(name.clone()).cast(DataType::Int64)])
 }
