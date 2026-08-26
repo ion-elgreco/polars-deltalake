@@ -183,6 +183,20 @@ pub(crate) fn file_skip_via_partition_eval(
         .map(|logical| -> anyhow::Result<Column> {
             let field = by_logical[logical];
             let physical = field.physical_name(mode);
+            // A column no add action carries is not a partition column, so
+            // every value would be NULL and the filter would prune the whole
+            // table. Refuse instead of returning silently empty.
+            if !files.is_empty()
+                && !files
+                    .iter()
+                    .any(|f| f.partition_values.contains_key(physical))
+            {
+                anyhow::bail!(
+                    "partition pruning was asked for '{}', which no add action \
+                     lists as a partition column",
+                    field.name
+                );
+            }
             let vals: Vec<Option<&str>> = files
                 .iter()
                 .map(|f| f.partition_values.get(physical).map(String::as_str))
