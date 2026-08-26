@@ -246,13 +246,9 @@ impl LogicalScanIter {
         if let Some(pred) = &self.orphan_predicate {
             lazy = lazy.filter(pred.clone());
         }
-        collect_lazy(lazy)
+        crate::engine::collect_streaming_single(lazy)
+            .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))
     }
-}
-
-fn collect_lazy(lazy: polars::prelude::LazyFrame) -> Result<DataFrame, delta_kernel::Error> {
-    crate::engine::collect_streaming_single(lazy)
-        .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))
 }
 
 /// First index in `start..end` where `file_str.get(i) != value`, or `end`
