@@ -28,7 +28,9 @@ pub(crate) fn collect_streaming_single(lf: LazyFrame) -> polars::prelude::Polars
 }
 
 /// The same collect, streamed as ordered `COLLECT_CHUNK_ROWS`-sized morsels.
-/// The positional flags are `maintain_order` and `check_types`; every batch
+/// The positional flags are `maintain_order` and `lazy`; `lazy: false`
+/// starts the query inside this call — `read_batch`'s file-after-file
+/// deferral comes from its `flat_map`, not from this flag. Every batch
 /// consumer wants the same pair, so they are decided here.
 pub(crate) fn collect_streaming_batches(
     lf: LazyFrame,
