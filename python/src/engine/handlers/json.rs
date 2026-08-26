@@ -260,12 +260,16 @@ fn require_present(value: Expr, gate: Option<Expr>, path: String) -> Expr {
 
 fn map_from_struct_expr(value_expr: Expr, fields: &[polars::prelude::Field]) -> DeltaResult<Expr> {
     if fields.is_empty() {
+        // polars infers `Struct{}` when every occurrence of the key is `{}`.
         // Kernel's `get_map` reads null as "data missing" for non-nullable
-        // Map fields, so empty (`partitionValues: {}`) must stay typed.
-        return empty_typed_list_expr(polars_as_struct(vec![
+        // Map fields, so an empty map must stay typed and non-null — but a
+        // row where the key is absent has to stay NULL, so this needs the
+        // same outer gate as the branch below.
+        let empty = empty_typed_list_expr(polars_as_struct(vec![
             lit("").alias(PlSmallStr::from_static(MAP_KEY_FIELD)),
             lit("").alias(PlSmallStr::from_static(MAP_VALUE_FIELD)),
-        ]));
+        ]))?;
+        return Ok(null_gated(value_expr.is_not_null(), empty));
     }
     let entries: Vec<Expr> = fields
         .iter()
@@ -414,6 +418,28 @@ mod align_nullability_tests {
         .unwrap();
         let err = aligned("{\"pv\":{\"p\":\"x\"}}\n{\"z\":1}", &schema)
             .expect_err("a missing non-nullable map must error, not null-fill");
+        assert!(err.to_string().contains("pv"), "got: {err}");
+    }
+
+    /// polars infers `Struct{}` when every occurrence of the key is `{}`,
+    /// which takes the empty-map branch. That branch names no column, so
+    /// without the same outer gate its non-null empty list is broadcast over
+    /// the rows where the map is absent and the presence check never fires.
+    #[test]
+    fn absent_non_nullable_map_errors_when_every_present_map_is_empty() {
+        use delta_kernel::schema::MapType;
+
+        let schema = StructType::try_new([StructField::not_null(
+            "pv",
+            KernelDataType::Map(Box::new(MapType::new(
+                KernelDataType::STRING,
+                KernelDataType::STRING,
+                true,
+            ))),
+        )])
+        .unwrap();
+        let err = aligned("{\"pv\":{}}\n{\"z\":1}", &schema)
+            .expect_err("a missing non-nullable map must error, not read as empty");
         assert!(err.to_string().contains("pv"), "got: {err}");
     }
 
