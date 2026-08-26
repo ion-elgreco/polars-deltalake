@@ -30,7 +30,13 @@ source python/.venv/bin/activate
 just test              # full suite (local + integration; integration auto-skips if Docker is missing)
 just test-local        # filters out anything marked `integration`
 just test-integration  # only the Docker-backed S3 / Azure / GCS suites
+just test-rust         # cargo unit tests on the cdylib crate
 ```
+
+Always go through `just test-rust` for the Rust side. `pyo3/extension-module`
+sits behind a default cargo feature, so a plain `cargo test` builds a test
+binary that never links libpython and fails on undefined pyo3 symbols; the
+recipe drops the feature and points `PYO3_PYTHON` at the venv interpreter.
 
 The integration suites spin up containers via [`testcontainers`](https://github.com/testcontainers/testcontainers-python):
 
@@ -48,7 +54,7 @@ just pre-commit-check  # the read-only CI variant, plus a typo scan
 just check             # `cargo check` on the cdylib
 ```
 
-CI (`.github/workflows/python_build.yaml`) runs `just pre-commit-check` and both test recipes on every PR against `main`.
+CI (`.github/workflows/python_build.yaml`) runs `just pre-commit-check` and all three test recipes on every PR against `main`.
 
 ## Code layout
 
