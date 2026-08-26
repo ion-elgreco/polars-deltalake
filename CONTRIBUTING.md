@@ -28,10 +28,15 @@ source python/.venv/bin/activate
 
 ```bash
 just test              # full suite (local + integration; integration auto-skips if Docker is missing)
-just test-local        # filters out anything marked `integration`
+just test-local        # filters out anything marked `integration` or `spark`
 just test-integration  # only the Docker-backed S3 / Azure / GCS suites
+just test-spark        # only the delta-spark fixtures; needs JDK 17 or 21
 just test-rust         # cargo unit tests on the cdylib crate
 ```
+
+`just test-spark` is not part of CI — delta-spark is the only writer that
+produces column-mapped and complex-CDF tables, so those fixtures are built
+locally.
 
 Always go through `just test-rust` for the Rust side. `pyo3/extension-module`
 sits behind a default cargo feature, so a plain `cargo test` builds a test
@@ -63,13 +68,14 @@ python/
 ├── polars_deltalake/        # Python entry points: scan_delta / read_delta
 ├── src/
 │   ├── lib.rs               # pyo3 module wiring
-│   ├── scan/                # DeltaSource pyclass, the io-plugin source
+│   ├── scan/                # TableState / TableScan pyclasses, the io-plugin source
 │   ├── engine/              # custom delta_kernel::Engine (no default-engine)
 │   │   ├── executor/        # PlanExecutor: kernel query plans → LazyFrame
 │   │   └── handlers/        # ParquetHandler / JsonHandler / StorageHandler
 │   │                        # built on polars-io + object_store
 │   └── translation/         # polars-Expr ↔ kernel-Predicate + schema bridge
-└── tests/                   # pytest suite (test_scan + test_cloud + test_dat)
+└── tests/                   # pytest suite; `_*.py` are shared helpers,
+                             # `*_spark.py` are the delta-spark fixtures
 ```
 
 The Rust side never depends on `default-engine` — every handler is implemented in-tree against polars-io so there's no second parquet/JSON stack in the wheel. Predicate pushdown is opportunistic: if a polars expression doesn't map to a kernel `Predicate` variant, the scan still produces correct output, just without kernel-side data skipping.
@@ -78,7 +84,7 @@ The Rust side never depends on `default-engine` — every handler is implemented
 
 - Keep PRs focused. One change per PR is much easier to review than several bundled together.
 - Run `just pre-commit` and `just test` before pushing — both gate CI.
-- Tests are expected for any user-visible behaviour change. For predicate-pushdown tweaks, add a case to `tests/test_scan.py` under the relevant section.
+- Tests are expected for any user-visible behaviour change. Predicate-pushdown tweaks belong in `tests/test_kernel_translation.py` (which conjunct reaches kernel) and `tests/test_scan.py` (which rows come back).
 - Commit messages should explain the *why* — the diff already shows the *what*.
 
 ## Reporting issues
