@@ -179,12 +179,18 @@ impl LogicalScanIter {
         while start < n {
             let cur = file_str.get(start);
             let end = find_run_end(file_str, start, n, cur);
-            if let Some(file_id) = cur {
-                let file_id = file_id.to_owned();
-                let sub = df.slice(start as i64, end - start);
-                let out = self.apply_rewrite(&file_id, sub);
-                self.pending.push_back(out);
-            }
+            let Some(file_id) = cur else {
+                // polars-io always populates the column; skipping the run
+                // would drop those rows from the scan without a trace.
+                return Err(delta_kernel::Error::Generic(format!(
+                    "polars-io scan produced {} row(s) with a null {FILE_ID_COL}",
+                    end - start
+                )));
+            };
+            let file_id = file_id.to_owned();
+            let sub = df.slice(start as i64, end - start);
+            let out = self.apply_rewrite(&file_id, sub);
+            self.pending.push_back(out);
             start = end;
         }
         Ok(())
