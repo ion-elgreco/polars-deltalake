@@ -273,14 +273,10 @@ impl PolarsPlanExecutor {
         let df =
             crate::engine::collect_streaming_single(input.lf.clone()).map_err(to_kernel_err)?;
 
+        // A non-null descriptor means a deletion vector whatever an ancestor's
+        // validity says, so ANDing ancestors in could only hide one.
         let dv = resolve_path(&df, &ds.dv_column).map_err(to_kernel_err)?;
-        let mut dv_present = dv.is_not_null();
-        for len in 1..ds.dv_column.len() {
-            let prefix = delta_kernel::expressions::ColumnName::new(ds.dv_column.iter().take(len));
-            let ancestor = resolve_path(&df, &prefix).map_err(to_kernel_err)?;
-            dv_present = &dv_present & &ancestor.is_not_null();
-        }
-        if dv_present.any() {
+        if dv.null_count() != dv.len() {
             return Err(Error::Unsupported(
                 "DynamicScan with deletion vectors is not implemented".into(),
             ));
