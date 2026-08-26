@@ -320,6 +320,59 @@ mod logical_names_tests {
     }
 }
 
+#[cfg(test)]
+mod visit_add_rows_tests {
+    use polars::prelude::{
+        DataType as PlDataType, Field as PlField, IntoColumn, IntoSeries, NamedFrom, Series,
+        StructChunked,
+    };
+    use polars_arrow::bitmap::Bitmap;
+
+    use super::*;
+
+    /// The protocol requires `add.partitionValues` (possibly empty, never
+    /// absent), and a defaulted empty map silently mis-prunes in partition
+    /// eval — so the visitor must error like it does for every sibling
+    /// field, not fall back to `{}`. The JSON/parquet non-nullable guards
+    /// catch this upstream today; this pins the last line of defense.
+    #[test]
+    fn null_partition_values_errors() {
+        let path = Series::new("path".into(), ["part-0.parquet"]);
+        let entry_dt = PlDataType::Struct(vec![
+            PlField::new("key".into(), PlDataType::String),
+            PlField::new("value".into(), PlDataType::String),
+        ]);
+        let pv = Series::full_null(
+            "partitionValues".into(),
+            1,
+            &PlDataType::List(Box::new(entry_dt)),
+        );
+        let st = Series::full_null("storageType".into(), 1, &PlDataType::String);
+        let pod = Series::full_null("pathOrInlineDv".into(), 1, &PlDataType::String);
+        let off = Series::full_null("offset".into(), 1, &PlDataType::Int32);
+        let sib = Series::full_null("sizeInBytes".into(), 1, &PlDataType::Int32);
+        let card = Series::full_null("cardinality".into(), 1, &PlDataType::Int64);
+        let dv = StructChunked::from_series(
+            "deletionVector".into(),
+            1,
+            [st, pod, off, sib, card].iter(),
+        )
+        .unwrap()
+        .with_outer_validity(Some(Bitmap::from([false])))
+        .into_series();
+        let add = StructChunked::from_series("add".into(), 1, [path, pv, dv].iter())
+            .unwrap()
+            .into_series();
+        let df = DataFrame::new(1, vec![add.into_column()]).unwrap();
+
+        let err = match visit_add_rows(&PolarsEngineData::new(df)) {
+            Ok(_) => panic!("a null partitionValues must error, not default to {{}}"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("partitionValues"), "got: {err}");
+    }
+}
+
 /// Per-row typed partition literals, one `Vec<Expr>` per add row, aligned
 /// with `sources` (empty per-row vec when the table is unpartitioned). The
 /// values come from `add.partitionValues_parsed`, which the metadata plan
@@ -511,10 +564,16 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
                         "metadata plan emitted a null add.path".into(),
                     ));
                 };
+                // Required by the protocol (possibly empty, never absent);
+                // a defaulted `{}` would silently mis-prune in partition eval.
                 let partition_values = getters[1]
                     .get_map(i, "add.partitionValues")?
-                    .map(|m| m.materialize())
-                    .unwrap_or_default();
+                    .ok_or_else(|| {
+                        delta_kernel::Error::Generic(
+                            "metadata plan emitted a null add.partitionValues".into(),
+                        )
+                    })?
+                    .materialize();
 
                 let storage_type: Option<&str> = getters[2].get_str(i, "storageType")?;
                 let dv = match storage_type {
