@@ -408,9 +408,17 @@ fn translate_variadic_expr(
 fn is_statically_list(e: &Expression, schema: Option<&StructType>) -> bool {
     match e {
         Expression::Literal(Scalar::Array(_)) => true,
+        Expression::Literal(Scalar::Null(dt)) => matches!(dt, KernelDataType::Array(_)),
         Expression::Column(name) => resolve_column_dtype(name, schema)
             .is_some_and(|dt| matches!(dt, KernelDataType::Array(_))),
         Expression::Cast(c) => matches!(c.target, KernelDataType::Array(_)),
+        // ARRAY builds a list, and COALESCE is list-typed when its arms are —
+        // a catch-all here would let `ARRAY(ARRAY(1,2), ARRAY(3,4))` splice
+        // into `[1,2,3,4]` instead of erroring.
+        Expression::Variadic(v) => match v.op {
+            VariadicExpressionOp::Array => true,
+            VariadicExpressionOp::Coalesce => v.exprs.iter().any(|e| is_statically_list(e, schema)),
+        },
         _ => false,
     }
 }
@@ -774,6 +782,44 @@ mod partition_parse_agreement_tests {
             assert!(
                 via_expr.equals_missing(&direct),
                 "values disagree for {target:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod array_shape_tests {
+    use delta_kernel::expressions::{VariadicExpression, VariadicExpressionOp};
+
+    use super::*;
+
+    /// `concat_list` splices a list-typed input entry-wise, so an ARRAY over
+    /// list-typed children would build `[1,2,3,4]` where kernel means
+    /// `[[1,2],[3,4]]`. Every statically list-typed shape must decline.
+    #[test]
+    fn array_over_list_typed_children_declines() {
+        let inner = || {
+            Expression::Variadic(VariadicExpression {
+                op: VariadicExpressionOp::Array,
+                exprs: vec![Expression::literal(1i64), Expression::literal(2i64)],
+            })
+        };
+        for exprs in [
+            vec![inner(), inner()],
+            vec![
+                Expression::literal(Scalar::Null(KernelDataType::Array(Box::new(
+                    delta_kernel::schema::ArrayType::new(KernelDataType::LONG, true),
+                )))),
+                Expression::literal(1i64),
+            ],
+        ] {
+            let nested = VariadicExpression {
+                op: VariadicExpressionOp::Array,
+                exprs,
+            };
+            assert!(
+                translate_variadic_expr(&nested, None).is_err(),
+                "a list-typed ARRAY input must decline, not splice",
             );
         }
     }
