@@ -7,11 +7,11 @@
 use delta_kernel::expressions::{ColumnName, Expression, ExpressionRef, ExpressionStructPatch};
 use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 use delta_kernel::{DeltaResult, Error};
-use polars::prelude::as_struct as polars_as_struct;
+
 use polars::prelude::{Expr, col};
 use polars_utils::pl_str::PlSmallStr;
 
-use super::expr::{column_path_to_expr, null_gated, translate_expr};
+use super::expr::{as_struct_checked, column_path_to_expr, null_gated, translate_expr};
 
 /// Per-output-slot intent produced by [`walk_transform_slots`]. Shared by
 /// the lazy [`translate_transform`] walker and the eager `build_transform_ops`
@@ -151,7 +151,7 @@ pub(super) fn translate_transform(
             Ok(raw.alias(PlSmallStr::from_str(output.name.as_str())))
         })
         .collect::<DeltaResult<Vec<_>>>()?;
-    let rebuilt = polars_as_struct(entries);
+    let rebuilt = as_struct_checked(entries, "StructPatch")?;
     // A nested patch rewrites a struct-typed column; `as_struct` alone would
     // make every row valid, and plan filters (`add IS NOT NULL`) select rows
     // by exactly that outer validity.

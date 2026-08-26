@@ -222,7 +222,7 @@ fn translate_map_to_struct(
     // map row is a NULL struct row, not a valid struct of nulls.
     Ok(null_gated(
         map_expr.is_not_null(),
-        polars_as_struct(children),
+        as_struct_checked(children, "MapToStruct")?,
     ))
 }
 
@@ -344,11 +344,22 @@ fn translate_struct(
             })
         })
         .collect::<DeltaResult<_>>()?;
-    let built = polars_as_struct(child_exprs);
+    let built = as_struct_checked(child_exprs, "translate_struct")?;
     match nullability {
         Some(pred) => Ok(null_gated(translate_expr(pred, None, input_schema)?, built)),
         None => Ok(built),
     }
+}
+
+/// Kernel permits a zero-field struct; polars' `as_struct` `assert!`s on an
+/// empty expression list, and a panic here unwinds into pyo3.
+pub(super) fn as_struct_checked(children: Vec<Expr>, context: &str) -> DeltaResult<Expr> {
+    if children.is_empty() {
+        return Err(Error::Unsupported(format!(
+            "{context}: a struct with no fields has no polars representation"
+        )));
+    }
+    Ok(polars_as_struct(children))
 }
 
 fn translate_unary_expr(
