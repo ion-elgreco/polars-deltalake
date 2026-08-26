@@ -11,7 +11,7 @@ use delta_kernel::schema::{
     ArrayType, DataType as KernelDataType, MapType, PrimitiveType, StructField, StructType,
 };
 use polars::prelude::{
-    ArrowDataType, DataType as PlDataType, Field as PlField, Schema as PlSchema,
+    ArrowDataType, DataFrame, DataType as PlDataType, Field as PlField, Schema as PlSchema,
 };
 use polars_arrow::datatypes::{ArrowSchema, Field as ArrowField};
 use polars_utils::pl_str::PlSmallStr;
@@ -45,6 +45,12 @@ where
 
 pub(crate) trait KernelSchemaExt {
     fn to_polars(&self) -> anyhow::Result<Arc<PlSchema>>;
+
+    /// Zero rows, typed to this schema — the shape every "nothing to read"
+    /// arm hands back so downstream concat / vstack still line up.
+    fn empty_frame(&self) -> anyhow::Result<DataFrame> {
+        Ok(DataFrame::empty_with_schema(self.to_polars()?.as_ref()))
+    }
 }
 
 impl KernelSchemaExt for StructType {

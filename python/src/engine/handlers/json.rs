@@ -157,8 +157,7 @@ pub(crate) fn align_lazy(
     // missing non-nullable column as a violated row that does not exist, and
     // the select would trip a shape error. Nothing to align over.
     if df.height() == 0 {
-        let schema = kernel_schema.to_polars().map_err(to_kernel_err)?;
-        return Ok(DataFrame::empty_with_schema(schema.as_ref()).lazy());
+        return Ok(kernel_schema.empty_frame().map_err(to_kernel_err)?.lazy());
     }
     let polars_schema = df.schema().clone();
     let select_exprs: Vec<Expr> = kernel_schema

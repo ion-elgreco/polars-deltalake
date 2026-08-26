@@ -134,8 +134,7 @@ pub(crate) fn scalar_rows_to_frame(
         )));
     }
     if rows.is_empty() {
-        let polars_schema = schema.to_polars().map_err(to_kernel_err)?;
-        return Ok(DataFrame::empty_with_schema(polars_schema.as_ref()));
+        return schema.empty_frame().map_err(to_kernel_err);
     }
     let columns = fields
         .iter()

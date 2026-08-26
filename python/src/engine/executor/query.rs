@@ -16,9 +16,9 @@ use delta_kernel::plans::ir::plan::{Plan, PlanNode};
 use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
-    BooleanChunked, DataFrame, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType,
-    LazyFrame, MaintainOrderJoin, PolarsError, PolarsResult, Schema as PlSchema, Series,
-    SortMultipleOptions, UnionArgs, col, concat, lit,
+    BooleanChunked, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType, LazyFrame,
+    MaintainOrderJoin, PolarsError, PolarsResult, Schema as PlSchema, Series, SortMultipleOptions,
+    UnionArgs, col, concat, lit,
 };
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
@@ -483,11 +483,7 @@ fn kernel_constant_literals(
 
 fn concat_frames(frames: Vec<LazyFrame>, schema: &SchemaRef) -> DeltaResult<LazyFrame> {
     match frames.len() {
-        0 => {
-            let empty =
-                DataFrame::empty_with_schema(schema.to_polars().map_err(to_kernel_err)?.as_ref());
-            Ok(empty.lazy())
-        }
+        0 => Ok(schema.empty_frame().map_err(to_kernel_err)?.lazy()),
         1 => Ok(frames.into_iter().next().expect("len checked")),
         _ => concat(frames, UnionArgs::default()).map_err(to_kernel_err),
     }
