@@ -26,7 +26,7 @@ use url::Url;
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
-use crate::translation::from_kernel::{empty_typed_list_expr, null_gated};
+use crate::translation::from_kernel::{as_struct_checked, empty_typed_list_expr, null_gated};
 use crate::translation::schema::{KernelDataTypeExt, KernelSchemaExt};
 
 use super::storage::ObjectStoreStorageHandler;
@@ -227,7 +227,7 @@ fn align(
                     .map(|e| e.alias(PlSmallStr::from_str(child.name.as_str())))
                 })
                 .collect::<DeltaResult<_>>()?;
-            null_gated(presence, polars_as_struct(children))
+            null_gated(presence, as_struct_checked(children, "json align")?)
         }
         // Primitives, Arrays, and any shape mismatch — let polars cast the
         // inferred column to the kernel-declared type.

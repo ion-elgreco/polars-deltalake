@@ -30,7 +30,9 @@ mod predicate;
 mod scalar;
 mod transform;
 
-pub(crate) use expr::{column_path_to_expr, null_gated, parse_partition_column, translate_expr};
+pub(crate) use expr::{
+    as_struct_checked, column_path_to_expr, null_gated, parse_partition_column, translate_expr,
+};
 pub(crate) use predicate::translate_predicate;
 pub(crate) use scalar::{
     build_series, empty_typed_list_expr, ensure_scalar_types, per_row_literals, scalar_to_lit,

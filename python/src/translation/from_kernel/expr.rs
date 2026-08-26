@@ -366,7 +366,7 @@ fn translate_struct(
 
 /// Kernel permits a zero-field struct; polars' `as_struct` `assert!`s on an
 /// empty expression list, and a panic here unwinds into pyo3.
-pub(super) fn as_struct_checked(children: Vec<Expr>, context: &str) -> DeltaResult<Expr> {
+pub(crate) fn as_struct_checked(children: Vec<Expr>, context: &str) -> DeltaResult<Expr> {
     if children.is_empty() {
         return Err(Error::Unsupported(format!(
             "{context}: a struct with no fields has no polars representation"
