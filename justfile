@@ -78,7 +78,9 @@ test-rust:
             exit 1
             ;;
     esac
-    PYO3_PYTHON="$py" cargo test --lib --no-default-features
+    # Same profile as `just develop`, so CI reuses that build's dependency
+    # artifacts instead of recompiling polars and delta-kernel from scratch.
+    PYO3_PYTHON="$py" cargo test --lib --no-default-features --profile '{{ profile }}'
 
 # Wipe build artifacts.
 clean:
