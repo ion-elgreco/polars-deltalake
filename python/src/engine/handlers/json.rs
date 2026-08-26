@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::PredicateRef;
-use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField};
+use delta_kernel::schema::{DataType as KernelDataType, MapType, SchemaRef, StructField};
 use delta_kernel::{
     DeltaResult, Error, FileDataReadResultIterator, FileMeta, JsonHandler, StorageHandler,
 };
@@ -196,7 +196,7 @@ fn align(
         (_, None) => null_expr_for_kernel(&field.data_type)?,
         // JSON encodes Map as a JSON object → polars infers `Struct{k1,…}`;
         // reshape into our `List<Struct<{key,value}>>` representation.
-        (KernelDataType::Map(_), Some(PlDataType::Struct(fs))) => map_from_struct_expr(source, fs)?,
+        (KernelDataType::Map(m), Some(PlDataType::Struct(fs))) => map_from_struct_expr(source, fs, m)?,
         // A Struct may contain a Map at any depth, so recurse and rebuild.
         // The rebuild must keep the source's outer validity: `as_struct`
         // alone yields a valid struct of null children for a null row, and
@@ -266,7 +266,16 @@ fn require_present(value: Expr, gate: Option<Expr>, path: String) -> Expr {
     )
 }
 
-fn map_from_struct_expr(value_expr: Expr, fields: &[polars::prelude::Field]) -> DeltaResult<Expr> {
+fn map_from_struct_expr(
+    value_expr: Expr,
+    fields: &[polars::prelude::Field],
+    map_type: &MapType,
+) -> DeltaResult<Expr> {
+    // The declared entry types, not String/String: `to_polars` promises
+    // `List<Struct<key,value>>` in exactly these types, and a Map whose
+    // value type is not String must not read back stringified.
+    let key_dt = map_type.key_type().to_polars().map_err(to_kernel_err)?;
+    let value_dt = map_type.value_type().to_polars().map_err(to_kernel_err)?;
     if fields.is_empty() {
         // polars infers `Struct{}` when every occurrence of the key is `{}`.
         // Kernel's `get_map` reads null as "data missing" for non-nullable
@@ -274,8 +283,12 @@ fn map_from_struct_expr(value_expr: Expr, fields: &[polars::prelude::Field]) -> 
         // row where the key is absent has to stay NULL, so this needs the
         // same outer gate as the branch below.
         let empty = empty_typed_list_expr(polars_as_struct(vec![
-            lit("").alias(PlSmallStr::from_static(MAP_KEY_FIELD)),
-            lit("").alias(PlSmallStr::from_static(MAP_VALUE_FIELD)),
+            lit(polars::prelude::LiteralValue::untyped_null())
+                .cast(key_dt)
+                .alias(PlSmallStr::from_static(MAP_KEY_FIELD)),
+            lit(polars::prelude::LiteralValue::untyped_null())
+                .cast(value_dt)
+                .alias(PlSmallStr::from_static(MAP_VALUE_FIELD)),
         ]))?;
         return Ok(null_gated(value_expr.is_not_null(), empty));
     }
@@ -283,12 +296,14 @@ fn map_from_struct_expr(value_expr: Expr, fields: &[polars::prelude::Field]) -> 
         .iter()
         .map(|f| {
             polars_as_struct(vec![
-                lit(f.name.as_str()).alias(PlSmallStr::from_static(MAP_KEY_FIELD)),
+                lit(f.name.as_str())
+                    .cast(key_dt.clone())
+                    .alias(PlSmallStr::from_static(MAP_KEY_FIELD)),
                 value_expr
                     .clone()
                     .struct_()
                     .field_by_name(f.name.as_str())
-                    .cast(PlDataType::String)
+                    .cast(value_dt.clone())
                     .alias(PlSmallStr::from_static(MAP_VALUE_FIELD)),
             ])
         })
@@ -449,6 +464,45 @@ mod align_nullability_tests {
         let err = aligned("{\"pv\":{}}\n{\"z\":1}", &schema)
             .expect_err("a missing non-nullable map must error, not read as empty");
         assert!(err.to_string().contains("pv"), "got: {err}");
+    }
+
+    /// The declared Map entry types must survive alignment: this arm
+    /// previously seeded and cast every entry to String whatever the
+    /// schema said, so a `Map<String, Long>` read back String-valued.
+    #[test]
+    fn map_alignment_keeps_the_declared_entry_types() {
+        use delta_kernel::schema::MapType;
+
+        let map_dt = || {
+            KernelDataType::Map(Box::new(MapType::new(
+                KernelDataType::STRING,
+                KernelDataType::LONG,
+                true,
+            )))
+        };
+        let schema = StructType::try_new([StructField::nullable("m", map_dt())]).unwrap();
+        let expected = map_dt().to_polars().unwrap();
+
+        // Non-empty objects: the per-key rebuild casts values to the
+        // declared type.
+        let out = aligned("{\"m\":{\"a\":1,\"b\":2}}", &schema).unwrap();
+        let col = out.column("m").unwrap().as_materialized_series().clone();
+        assert_eq!(col.dtype(), &expected);
+        let entries = col.list().unwrap().get_as_series(0).unwrap();
+        let values = entries
+            .struct_()
+            .unwrap()
+            .field_by_name(MAP_VALUE_FIELD)
+            .unwrap();
+        assert_eq!(values.i64().unwrap().get(0), Some(1));
+
+        // All-empty objects infer `Struct{}`; the empty branch must seed
+        // the declared types too, not String/String.
+        let out = aligned("{\"m\":{}}", &schema).unwrap();
+        assert_eq!(
+            out.column("m").unwrap().as_materialized_series().dtype(),
+            &expected
+        );
     }
 
     /// A zero-byte commit parses to a 0-row frame, where every align expr is
