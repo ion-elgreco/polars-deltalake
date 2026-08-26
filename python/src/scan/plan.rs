@@ -288,14 +288,11 @@ mod logical_names_tests {
     /// same rule the Struct arm enforces with its own gate.
     #[test]
     fn map_rebuild_keeps_entry_validity() {
-        let value_struct = StructType::try_new([StructField::nullable(
-            "a",
-            KernelDataType::LONG,
-        )
-        .with_metadata([(
-            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-            "phys_a",
-        )])])
+        let value_struct = StructType::try_new([StructField::nullable("a", KernelDataType::LONG)
+            .with_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                "phys_a",
+            )])])
         .unwrap();
         let map_dt = KernelDataType::Map(Box::new(MapType::new(
             KernelDataType::STRING,

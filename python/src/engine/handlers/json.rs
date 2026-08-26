@@ -196,7 +196,9 @@ fn align(
         (_, None) => null_expr_for_kernel(&field.data_type)?,
         // JSON encodes Map as a JSON object → polars infers `Struct{k1,…}`;
         // reshape into our `List<Struct<{key,value}>>` representation.
-        (KernelDataType::Map(m), Some(PlDataType::Struct(fs))) => map_from_struct_expr(source, fs, m)?,
+        (KernelDataType::Map(m), Some(PlDataType::Struct(fs))) => {
+            map_from_struct_expr(source, fs, m)?
+        }
         // A Struct may contain a Map at any depth, so recurse and rebuild.
         // The rebuild must keep the source's outer validity: `as_struct`
         // alone yields a valid struct of null children for a null row, and

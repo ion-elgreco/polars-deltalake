@@ -179,8 +179,7 @@ impl ParquetHandler for PolarsParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let (read_schema, meta) =
-            split_metadata_columns(&physical_schema, "read_parquet_files")?;
+        let (read_schema, meta) = split_metadata_columns(&physical_schema, "read_parquet_files")?;
         let row_index = meta.row_index().cloned();
         let file_path = meta.file_path().cloned();
         let meta_cols = meta.cols;
@@ -547,7 +546,9 @@ mod per_file_batch_tests {
         let files = vec![FileMeta {
             location: location.clone(),
             last_modified: 0,
-            size: std::fs::metadata(dir.path().join("f.parquet")).unwrap().len(),
+            size: std::fs::metadata(dir.path().join("f.parquet"))
+                .unwrap()
+                .len(),
         }];
         let batches: Vec<_> = handler
             .read_parquet_files(&files, schema, None)
@@ -727,7 +728,9 @@ mod per_file_batch_tests {
         let files = vec![FileMeta {
             location: base.join("a.parquet").unwrap(),
             last_modified: 0,
-            size: std::fs::metadata(dir.path().join("a.parquet")).unwrap().len(),
+            size: std::fs::metadata(dir.path().join("a.parquet"))
+                .unwrap()
+                .len(),
         }];
         let result = handler
             .read_parquet_files(&files, schema, None)

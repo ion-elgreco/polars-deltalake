@@ -241,7 +241,6 @@ fn arrow_to_kernel_dtype(dt: &ArrowDataType) -> anyhow::Result<KernelDataType> {
     })
 }
 
-
 /// `col(...)` per kernel schema field, in schema order. Used by the scan
 /// driver and the engine's read paths to shape frames to a kernel schema.
 pub(crate) fn select_exprs_for_schema(schema: &StructType) -> Vec<polars::prelude::Expr> {

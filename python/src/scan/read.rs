@@ -44,4 +44,3 @@ pub(crate) fn build_lazy_scan(
     }
     Ok(plan.select(final_select))
 }
-

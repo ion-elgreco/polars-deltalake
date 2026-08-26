@@ -13,9 +13,7 @@ use delta_kernel::plans::ir::nodes::{
     ScanParquet, SemiJoin, Values,
 };
 use delta_kernel::plans::ir::plan::{Plan, PlanNode};
-use delta_kernel::schema::{
-    DataType as KernelDataType, SchemaRef, StructField, StructType,
-};
+use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
     BooleanChunked, DataFrame, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType,
@@ -218,7 +216,8 @@ impl PolarsPlanExecutor {
                 .into_iter()
                 .map(|e| {
                     let path = path_for_polars_io(&e.location)?;
-                    let mut lf = self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
+                    let mut lf =
+                        self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
                     if let Some(name) = &file_path {
                         lf = lf.with_columns([lit(e.location.as_str()).alias(name.clone())]);
                     }
