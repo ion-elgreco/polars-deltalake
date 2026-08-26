@@ -348,12 +348,24 @@ impl TableScan {
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
             )
         } else {
-            // Release builds compile `debug_assert!` out, and dropping these
-            // conjuncts silently returns unfiltered rows.
+            // No layer below can evaluate these, and dropping them would
+            // silently return unfiltered rows. Reached when a predicate names
+            // a column outside the projection: it is not read, so nothing
+            // materializes it. Polars always projects the columns its own
+            // pushdown references, so this is a direct `TableScan` caller.
             if !routing.post_transform.is_empty() {
+                let mut cols: Vec<String> = routing
+                    .post_transform
+                    .iter()
+                    .flat_map(polars_plan::utils::expr_to_leaf_column_names)
+                    .map(|n| n.to_string())
+                    .collect();
+                cols.sort_unstable();
+                cols.dedup();
                 return Err(anyhow::anyhow!(
-                    "internal: {} predicate conjunct(s) need the logical rewrite, but no file requested one",
-                    routing.post_transform.len()
+                    "predicate references {} which the scan does not read; \
+                     add them to the projection or drop the predicate",
+                    cols.join(", ")
                 ));
             }
             source
