@@ -153,7 +153,16 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
             let select = select_template.as_ref().map(|t| fill_select(t, literals));
 
             let idx = files.len();
-            path_index.insert(pl_path.as_str().to_string(), idx);
+            // `LogicalScanIter` maps a scanned row back to its file through
+            // this index, so two live adds for one path would share the last
+            // one's DV cursor and select list — deleted rows resurface, live
+            // ones vanish. The log has no valid shape that produces it.
+            if path_index
+                .insert(pl_path.as_str().to_string(), idx)
+                .is_some()
+            {
+                anyhow::bail!("log replay produced two live add actions for {pl_path}");
+            }
             files.push(ScanFileMeta {
                 path: pl_path,
                 rewrite: LogicalRewrite { select, dv },
