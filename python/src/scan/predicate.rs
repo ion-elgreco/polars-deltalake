@@ -47,6 +47,7 @@ pub(crate) fn classify_conjuncts(
     mode: ColumnMappingMode,
     logical_schema: &StructType,
     physical_schema: &StructType,
+    partition_cols: &[String],
 ) -> ConjunctClassification {
     let column_mapped = mode != ColumnMappingMode::None;
     let mut out = ConjunctClassification::default();
@@ -54,7 +55,7 @@ pub(crate) fn classify_conjuncts(
         if c.kernel_translatable {
             out.kernel.push(c.expr.clone());
         }
-        let partition_only = touches_partition_only(&c.expr, logical_schema, physical_schema, mode);
+        let partition_only = touches_partition_only(&c.expr, partition_cols);
         let for_parquet = if column_mapped {
             rewrite_predicate_to_physical(&c.expr, logical_schema, physical_schema, mode)
         } else {
@@ -183,20 +184,11 @@ pub(crate) fn file_skip_via_partition_eval(
         .map(|logical| -> anyhow::Result<Column> {
             let field = by_logical[logical];
             let physical = field.physical_name(mode);
-            // A column no add action carries is not a partition column, so
-            // every value would be NULL and the filter would prune the whole
-            // table. Refuse instead of returning silently empty.
-            if !files.is_empty()
-                && !files
-                    .iter()
-                    .any(|f| f.partition_values.contains_key(physical))
-            {
-                anyhow::bail!(
-                    "partition pruning was asked for '{}', which no add action \
-                     lists as a partition column",
-                    field.name
-                );
-            }
+            // An absent key is a NULL partition value, not a missing column:
+            // kernel's `MapItem::materialize` drops null-valued entries, so a
+            // partition whose value is NULL in every add action carries no key
+            // at all. The caller already gated on the snapshot's partition
+            // list, so `None` here means NULL.
             let vals: Vec<Option<&str>> = files
                 .iter()
                 .map(|f| f.partition_values.get(physical).map(String::as_str))
@@ -232,25 +224,21 @@ pub(crate) fn file_skip_via_partition_eval(
     Ok(chunked.iter().flatten().map(|x| x as usize).collect())
 }
 
-/// Returns true iff `expr` references any column that is in `logical_schema`
-/// but not in `physical_schema` (i.e. a partition column). Used to gate
-/// untranslatable conjuncts for [`file_skip_via_partition_eval`].
-pub(crate) fn touches_partition_only(
-    expr: &Expr,
-    logical_schema: &StructType,
-    physical_schema: &StructType,
-    mode: ColumnMappingMode,
-) -> bool {
-    let phys_names: HashSet<&str> = physical_schema.fields().map(|f| f.name.as_str()).collect();
+/// Returns true iff every column `expr` references is a partition column.
+/// Used to gate conjuncts for [`file_skip_via_partition_eval`].
+///
+/// `partition_cols` is the snapshot's own list (kernel's
+/// `logical_partition_columns`), the same authority `resolve_scan` uses.
+/// Deriving partitionhood as "logical minus physical" instead would
+/// misread any other logical-only name — a projected-away data column, a
+/// future rev's row-tracking field — as a partition column and route it to
+/// a layer that cannot evaluate it.
+pub(crate) fn touches_partition_only(expr: &Expr, partition_cols: &[String]) -> bool {
     let referenced = polars_plan::utils::expr_to_leaf_column_names(expr);
-    // Physical names: under column mapping no logical name is in the file
-    // schema, so every column would look like a partition column.
     !referenced.is_empty()
-        && referenced.iter().all(|n| {
-            logical_schema
-                .field(n.as_str())
-                .is_some_and(|f| !phys_names.contains(f.physical_name(mode)))
-        })
+        && referenced
+            .iter()
+            .all(|n| partition_cols.iter().any(|p| p == n.as_str()))
 }
 
 /// Only meaningful when column mapping is active (`mode` is `Id` or `Name`).
@@ -330,5 +318,61 @@ mod partition_prune_tests {
         )
         .unwrap();
         assert_eq!(surviving, HashSet::from([0usize]));
+    }
+
+    /// Kernel's `MapItem::materialize` drops null-valued entries, so a
+    /// partition that is NULL in every add action carries no key at all.
+    /// That is a legal log, not a missing column: prune on NULL, don't fail.
+    #[test]
+    fn absent_partition_key_reads_as_null() {
+        let logical =
+            StructType::try_new([StructField::nullable("region", KernelDataType::STRING)]).unwrap();
+        let files = [no_partition_values(), no_partition_values()];
+
+        let surviving = file_skip_via_partition_eval(
+            &[col("region").is_null()],
+            &files,
+            &logical,
+            ColumnMappingMode::None,
+        )
+        .unwrap();
+        assert_eq!(surviving, HashSet::from([0usize, 1usize]));
+
+        let none_match = file_skip_via_partition_eval(
+            &[col("region").eq(lit("EU"))],
+            &files,
+            &logical,
+            ColumnMappingMode::None,
+        )
+        .unwrap();
+        assert!(none_match.is_empty());
+    }
+
+    fn no_partition_values() -> ScanFileMeta {
+        ScanFileMeta {
+            partition_values: HashMap::new(),
+            ..file("EU")
+        }
+    }
+
+    /// A projected-away data column is logical-only too, so inferring
+    /// partitionhood from "logical minus physical" would route it to the
+    /// partition pruner, which cannot evaluate it.
+    #[test]
+    fn projected_away_data_column_is_not_partition_only() {
+        let partition_cols = ["region".to_string()];
+        assert!(touches_partition_only(
+            &col("region").eq(lit("EU")),
+            &partition_cols
+        ));
+        assert!(!touches_partition_only(
+            &col("b").gt(lit(15)),
+            &partition_cols
+        ));
+        // Mixed atomic: one partition column is not enough.
+        assert!(!touches_partition_only(
+            &col("region").eq(lit("EU")).and(col("b").gt(lit(15))),
+            &partition_cols
+        ));
     }
 }

@@ -81,11 +81,13 @@ impl TableState {
             .build()
             .map_err(|e| py_err(anyhow::anyhow!("failed to build scan: {e:#}")))?;
         let logical_schema = self.snapshot.schema();
+        let config = self.snapshot.table_configuration();
         let routing = classify_conjuncts(
             &conjuncts,
-            self.snapshot.table_configuration().column_mapping_mode(),
+            config.column_mapping_mode(),
             &logical_schema,
             scan.physical_schema(),
+            config.logical_partition_columns(),
         );
         Ok(HashMap::from([
             ("kernel".to_string(), routing.kernel.len()),
@@ -261,7 +263,8 @@ impl TableScan {
         let physical_schema = scan.physical_schema().clone();
         let select_exprs = crate::translation::schema::select_exprs_for_schema(&physical_schema);
 
-        let mode = self.snapshot.table_configuration().column_mapping_mode();
+        let config = self.snapshot.table_configuration();
+        let mode = config.column_mapping_mode();
         let table_logical_schema = self.snapshot.schema();
 
         let routing = classify_conjuncts(
@@ -269,6 +272,7 @@ impl TableScan {
             mode,
             &table_logical_schema,
             &physical_schema,
+            config.logical_partition_columns(),
         );
 
         if !routing.partition_prune.is_empty() {
