@@ -200,12 +200,14 @@ impl ParquetHandler for PolarsParquetHandler {
 
         read_batch(
             paths,
-            self.cloud_opts.as_ref(),
-            &select_exprs,
-            polars_predicate.as_ref(),
-            &read_schema,
-            row_index,
-            file_path,
+            FileScanArgs {
+                cloud_opts: self.cloud_opts.clone(),
+                select_exprs,
+                predicate: polars_predicate,
+                read_schema,
+                row_index,
+                file_path,
+            },
         )
     }
 
@@ -377,35 +379,28 @@ pub(crate) fn unified_scan_args(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn read_batch(
-    paths: Vec<(PlRefPath, String)>,
-    cloud_opts: Option<&CloudOptions>,
-    select_exprs: &[Expr],
-    predicate: Option<&Expr>,
-    read_schema: &StructType,
+/// Everything a per-file scan needs that does not vary between files.
+struct FileScanArgs {
+    cloud_opts: Option<CloudOptions>,
+    select_exprs: Vec<Expr>,
+    predicate: Option<Expr>,
+    read_schema: StructType,
     row_index: Option<PlSmallStr>,
     file_path: Option<PlSmallStr>,
+}
+
+type BatchIter = Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+
+fn read_batch(
+    paths: Vec<(PlRefPath, String)>,
+    args: FileScanArgs,
 ) -> DeltaResult<FileDataReadResultIterator> {
     // Contract: engines must not merge engine data across file boundaries,
     // so each file gets its own scan. Construction is deferred inside the
     // flat_map so file N+1's streaming query starts only once file N drains;
     // polars still parallelises row groups within a file.
-    let cloud_opts = cloud_opts.cloned();
-    let select_exprs = select_exprs.to_vec();
-    let predicate = predicate.cloned();
-    let read_schema = read_schema.clone();
     let iter = paths.into_iter().flat_map(move |(path, location)| {
-        match file_batches(
-            path,
-            &location,
-            cloud_opts.as_ref(),
-            &select_exprs,
-            predicate.as_ref(),
-            &read_schema,
-            row_index.as_ref(),
-            file_path.as_ref(),
-        ) {
+        match file_batches(path, &location, &args) {
             Ok(batches) => batches,
             Err(e) => Box::new(std::iter::once(Err(e))),
         }
@@ -413,34 +408,22 @@ fn read_batch(
     Ok(Box::new(iter))
 }
 
-type BatchIter = Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
-
-#[allow(clippy::too_many_arguments)]
-fn file_batches(
-    path: PlRefPath,
-    location: &str,
-    cloud_opts: Option<&CloudOptions>,
-    select_exprs: &[Expr],
-    predicate: Option<&Expr>,
-    read_schema: &StructType,
-    row_index: Option<&PlSmallStr>,
-    file_path: Option<&PlSmallStr>,
-) -> DeltaResult<BatchIter> {
-    let mut args = unified_scan_args(cloud_opts, None);
-    if let Some(name) = row_index {
-        args.row_index = Some(polars::prelude::RowIndex {
+fn file_batches(path: PlRefPath, location: &str, args: &FileScanArgs) -> DeltaResult<BatchIter> {
+    let mut scan_args = unified_scan_args(args.cloud_opts.as_ref(), None);
+    if let Some(name) = &args.row_index {
+        scan_args.row_index = Some(polars::prelude::RowIndex {
             name: name.clone(),
             offset: 0,
         });
     }
-    let lazy = dsl_parquet_scan(vec![path], read_schema, args)?;
+    let lazy = dsl_parquet_scan(vec![path], &args.read_schema, scan_args)?;
     let mut synthesized: Vec<Expr> = Vec::new();
-    if let Some(name) = row_index {
+    if let Some(name) = &args.row_index {
         // The plan contract types metadata columns LONG; polars' row index
         // is IDX_DTYPE (u32).
         synthesized.push(col(name.clone()).cast(PlDataType::Int64));
     }
-    if let Some(name) = file_path {
+    if let Some(name) = &args.file_path {
         synthesized.push(lit(location).alias(name.clone()));
     }
     let lazy = if synthesized.is_empty() {
@@ -448,8 +431,8 @@ fn file_batches(
     } else {
         lazy.with_columns(synthesized)
     };
-    let mut plan = lazy.select(select_exprs);
-    if let Some(pred) = predicate {
+    let mut plan = lazy.select(args.select_exprs.clone());
+    if let Some(pred) = &args.predicate {
         plan = plan.filter(pred.clone());
     }
     let batches = crate::engine::collect_streaming_batches(plan).map_err(to_kernel_err)?;
