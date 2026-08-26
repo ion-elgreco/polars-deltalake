@@ -32,9 +32,11 @@ pub(crate) struct ConjunctClassification {
     /// row-group skipping + row-level filter. Rewritten to physical names
     /// for column-mapped tables.
     pub(crate) parquet_filter: Vec<Expr>,
-    /// Option-2 file pruning via polars eval on partition values.
+    /// Exact file pruning via polars eval on partition values — the only
+    /// layer that evaluates a partition-only conjunct, since kernel's
+    /// stats-based skipping keeps every file it cannot decide.
     pub(crate) partition_prune: Vec<Expr>,
-    /// Applied inside `LogicalScanIter` after `transform_to_logical`
+    /// Applied inside `LogicalScanIter` after the physical→logical select
     /// materializes partition columns.
     pub(crate) post_transform: Vec<Expr>,
 }
@@ -60,15 +62,20 @@ pub(crate) fn classify_conjuncts(
         };
         if let Some(e) = for_parquet {
             out.parquet_filter.push(e);
-        } else if !c.kernel_translatable && partition_only {
+        } else if partition_only {
+            // Every partition-only conjunct, translatable or not. Kernel's
+            // file skipping is conservative — a NULL verdict (a NULL partition
+            // value) and an expression its evaluator has no rule for both
+            // *keep* the file — while polars deletes its own filter node once
+            // we accept the predicate, so an unevaluated conjunct returns rows
+            // it excludes.
             out.partition_prune.push(c.expr.clone());
-        } else if !partition_only {
+        } else {
             // Mixed atomic (touches partition + data) — kernel may best-effort
             // file-skip, but rows in surviving files still need row-level eval
             // once partition cols are materialized.
             out.post_transform.push(c.expr.clone());
         }
-        // Translatable + partition-only: kernel exact-skips, no further work.
     }
     out
 }

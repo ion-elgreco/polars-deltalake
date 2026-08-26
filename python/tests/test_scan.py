@@ -421,12 +421,14 @@ class TestPredicateRouting:
         }
 
     def test_translatable_partition(self, multi_file_partitioned):
-        """`g == 'b'` — kernel exact-skips files; nothing else needed."""
+        """`g == 'b'` — kernel file-skips, and `partition_prune` evaluates it
+        exactly. Kernel's pruning alone keeps every file it cannot decide, and
+        polars drops its own filter once we accept the predicate."""
         src = TableState(multi_file_partitioned)
         assert src._classify_predicate(pl.col("g") == "b") == {  # type: ignore
             "kernel": 1,
             "parquet_filter": 0,
-            "partition_prune": 0,
+            "partition_prune": 1,
             "post_transform": 0,
         }
 
@@ -483,7 +485,7 @@ class TestPredicateRouting:
         assert src._classify_predicate((pl.col("g") == "b") & (pl.col("id") >= 4)) == {  # type: ignore
             "kernel": 2,
             "parquet_filter": 1,
-            "partition_prune": 0,
+            "partition_prune": 1,
             "post_transform": 0,
         }
 
@@ -495,7 +497,7 @@ class TestPredicateRouting:
         ) == {
             "kernel": 2,  # g == 'b', id >= 3
             "parquet_filter": 2,  # id >= 3, id.abs() <= 5
-            "partition_prune": 0,
+            "partition_prune": 1,  # g == 'b'
             "post_transform": 0,
         }
 

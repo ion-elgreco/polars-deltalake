@@ -323,3 +323,25 @@ class TestPruningParsesLikeProjection:
 
         got = scan_delta(table).filter(pl.col("p").str.to_uppercase() == "A").collect()
         assert got["v"].to_list() == [0]
+
+
+class TestTranslatablePartitionPredicateIsExact:
+    """Accepting a predicate makes polars delete its own filter node, so every
+    conjunct we accept has to be evaluated somewhere. Kernel translating a
+    partition conjunct is not enough on its own: its pruning evaluator has no
+    rule for some shapes and then prunes nothing at all.
+    """
+
+    def test_column_to_column_comparison_does_not_leak_rows(self, tmp_path):
+        """`eval_pred_binary_columns` returns no verdict, so kernel keeps every
+        file and the conjunct has to be evaluated on the polars side."""
+        from deltalake import write_deltalake
+
+        table = str(tmp_path / "t")
+        df = pl.DataFrame(
+            {"a": [1, 1, 2], "b": [1, 2, 2], "v": [0, 1, 2]},
+            schema_overrides={"a": pl.Int32(), "b": pl.Int32()},
+        )
+        write_deltalake(table, df.to_arrow(), partition_by=["a", "b"])
+        got = scan_delta(table).filter(pl.col("a") == pl.col("b")).collect()
+        assert sorted(got["v"].to_list()) == [0, 2]
