@@ -189,6 +189,10 @@ rayon = "1"
 # JSON form is variant-name keyed and survives feature mismatches.
 serde_json = "1"
 
+[dev-dependencies]
+# RAII temp dirs for the unit tests — unique names, removed on drop.
+tempfile = "3"
+
 [features]
 default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]

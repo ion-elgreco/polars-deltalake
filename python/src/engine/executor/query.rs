@@ -832,11 +832,10 @@ mod scan_entries_tests {
     /// its own URL.
     #[test]
     fn plan_scan_synthesizes_file_path_per_file() {
-        let dir = std::env::temp_dir().join(format!("pldl-fpath-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         for (name, v) in [("a.parquet", 1i64), ("b.parquet", 2)] {
             let mut df = polars::df!("id" => [v]).unwrap();
-            ParquetWriter::new(std::fs::File::create(dir.join(name)).unwrap())
+            ParquetWriter::new(std::fs::File::create(dir.path().join(name)).unwrap())
                 .finish(&mut df)
                 .unwrap();
         }
@@ -851,7 +850,7 @@ mod scan_entries_tests {
             split_scan_schema(&schema, &[]).expect("the plan path supports FilePath");
         let entries = ["a.parquet", "b.parquet"]
             .map(|n| FileEntry {
-                location: Url::from_file_path(dir.join(n)).unwrap(),
+                location: Url::from_file_path(dir.path().join(n)).unwrap(),
                 literals: vec![],
             })
             .into_iter()
@@ -889,14 +888,13 @@ mod scan_entries_tests {
     /// must agree on Int64.
     #[test]
     fn row_index_is_long() {
-        let dir = std::env::temp_dir().join(format!("pldl-rowidx-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pq = dir.join("f.parquet");
+        let dir = tempfile::tempdir().unwrap();
+        let pq = dir.path().join("f.parquet");
         let mut df = polars::df!("id" => [1i64, 2, 3]).unwrap();
         ParquetWriter::new(std::fs::File::create(&pq).unwrap())
             .finish(&mut df)
             .unwrap();
-        let json = dir.join("f.json");
+        let json = dir.path().join("f.json");
         std::fs::write(&json, "{\"id\": 1}\n{\"id\": 2}\n{\"id\": 3}\n").unwrap();
 
         let read_schema = StructType::try_new([long_field("id")]).unwrap();
@@ -946,9 +944,8 @@ mod scan_entries_tests {
     /// is an error, not a null-fill (the JSON arm enforces this via align).
     #[test]
     fn missing_non_nullable_parquet_column_errors() {
-        let dir = std::env::temp_dir().join(format!("pldl-nonnull-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pq = dir.join("f.parquet");
+        let dir = tempfile::tempdir().unwrap();
+        let pq = dir.path().join("f.parquet");
         let mut df = polars::df!("id" => [1i64, 2, 3]).unwrap();
         ParquetWriter::new(std::fs::File::create(&pq).unwrap())
             .finish(&mut df)
@@ -987,9 +984,8 @@ mod scan_entries_tests {
     fn missing_nullable_struct_leaf_null_fills() {
         use polars::prelude::{IntoLazy, as_struct, col};
 
-        let dir = std::env::temp_dir().join(format!("pldl-nullable-leaf-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pq = dir.join("n.parquet");
+        let dir = tempfile::tempdir().unwrap();
+        let pq = dir.path().join("n.parquet");
         let mut df = polars::df!("other" => [1i64, 2])
             .unwrap()
             .lazy()
@@ -1030,9 +1026,8 @@ mod scan_entries_tests {
     fn missing_non_nullable_struct_leaf_errors() {
         use polars::prelude::{IntoLazy, as_struct, col};
 
-        let dir = std::env::temp_dir().join(format!("pldl-nonnull-leaf-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pq = dir.join("f.parquet");
+        let dir = tempfile::tempdir().unwrap();
+        let pq = dir.path().join("f.parquet");
         let mut df = polars::df!("other" => [1i64, 2])
             .unwrap()
             .lazy()

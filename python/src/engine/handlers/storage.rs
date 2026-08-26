@@ -319,9 +319,8 @@ mod delete_tests {
     fn delete_missing_path_is_ok() {
         use delta_kernel::StorageHandler;
 
-        let dir = std::env::temp_dir().join(format!("pldl-del-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let base = Url::from_directory_path(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let base = Url::from_directory_path(dir.path()).unwrap();
         let storage =
             ObjectStoreStorageHandler::new(&base, std::iter::empty(), crate::engine::rt()).unwrap();
         let missing = base.join("nope.json").unwrap();

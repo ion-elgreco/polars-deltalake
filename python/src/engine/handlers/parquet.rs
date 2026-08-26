@@ -523,14 +523,13 @@ mod per_file_batch_tests {
     fn footer_fast_path_synthesizes_each_metadata_column() {
         use delta_kernel::schema::MetadataColumnSpec;
 
-        let dir = std::env::temp_dir().join(format!("pldl-footer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let mut df = polars::df!("x" => [1i64, 2, 3]).unwrap();
-        ParquetWriter::new(std::fs::File::create(dir.join("f.parquet")).unwrap())
+        ParquetWriter::new(std::fs::File::create(dir.path().join("f.parquet")).unwrap())
             .finish(&mut df)
             .unwrap();
 
-        let base = Url::from_directory_path(&dir).unwrap();
+        let base = Url::from_directory_path(dir.path()).unwrap();
         let rt = crate::engine::rt();
         let storage =
             Arc::new(ObjectStoreStorageHandler::new(&base, std::iter::empty(), rt).unwrap());
@@ -548,7 +547,7 @@ mod per_file_batch_tests {
         let files = vec![FileMeta {
             location: location.clone(),
             last_modified: 0,
-            size: std::fs::metadata(dir.join("f.parquet")).unwrap().len(),
+            size: std::fs::metadata(dir.path().join("f.parquet")).unwrap().len(),
         }];
         let batches: Vec<_> = handler
             .read_parquet_files(&files, schema, None)
@@ -583,15 +582,14 @@ mod per_file_batch_tests {
     /// engines must not merge engine data across file boundaries.
     #[test]
     fn batches_do_not_span_files() {
-        let dir = std::env::temp_dir().join(format!("pldl-perfile-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         for (name, vals) in [("a.parquet", [1i64, 2, 3]), ("b.parquet", [4, 5, 6])] {
             let mut df = polars::df!("x" => vals).unwrap();
-            ParquetWriter::new(std::fs::File::create(dir.join(name)).unwrap())
+            ParquetWriter::new(std::fs::File::create(dir.path().join(name)).unwrap())
                 .finish(&mut df)
                 .unwrap();
         }
-        let base = Url::from_directory_path(&dir).unwrap();
+        let base = Url::from_directory_path(dir.path()).unwrap();
         let rt = crate::engine::rt();
         let storage =
             Arc::new(ObjectStoreStorageHandler::new(&base, std::iter::empty(), rt).unwrap());
@@ -604,7 +602,7 @@ mod per_file_batch_tests {
             .map(|n| FileMeta {
                 location: base.join(n).unwrap(),
                 last_modified: 0,
-                size: std::fs::metadata(dir.join(n)).unwrap().len(),
+                size: std::fs::metadata(dir.path().join(n)).unwrap().len(),
             })
             .collect();
         let batches: Vec<_> = handler
@@ -640,15 +638,14 @@ mod per_file_batch_tests {
     fn metadata_columns_are_synthesized() {
         use delta_kernel::schema::MetadataColumnSpec;
 
-        let dir = std::env::temp_dir().join(format!("pldl-metacol-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         for (name, vals) in [("a.parquet", vec![10i64, 20, 30]), ("b.parquet", vec![40])] {
             let mut df = polars::df!("x" => vals).unwrap();
-            ParquetWriter::new(std::fs::File::create(dir.join(name)).unwrap())
+            ParquetWriter::new(std::fs::File::create(dir.path().join(name)).unwrap())
                 .finish(&mut df)
                 .unwrap();
         }
-        let base = Url::from_directory_path(&dir).unwrap();
+        let base = Url::from_directory_path(dir.path()).unwrap();
         let rt = crate::engine::rt();
         let storage =
             Arc::new(ObjectStoreStorageHandler::new(&base, std::iter::empty(), rt).unwrap());
@@ -667,7 +664,7 @@ mod per_file_batch_tests {
             .map(|n| FileMeta {
                 location: base.join(n).unwrap(),
                 last_modified: 0,
-                size: std::fs::metadata(dir.join(n)).unwrap().len(),
+                size: std::fs::metadata(dir.path().join(n)).unwrap().len(),
             })
             .collect();
         let batches: Vec<_> = handler
@@ -709,13 +706,12 @@ mod per_file_batch_tests {
     fn unsupported_metadata_spec_errors() {
         use delta_kernel::schema::MetadataColumnSpec;
 
-        let dir = std::env::temp_dir().join(format!("pldl-metaerr-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let mut df = polars::df!("x" => [1i64]).unwrap();
-        ParquetWriter::new(std::fs::File::create(dir.join("a.parquet")).unwrap())
+        ParquetWriter::new(std::fs::File::create(dir.path().join("a.parquet")).unwrap())
             .finish(&mut df)
             .unwrap();
-        let base = Url::from_directory_path(&dir).unwrap();
+        let base = Url::from_directory_path(dir.path()).unwrap();
         let rt = crate::engine::rt();
         let storage =
             Arc::new(ObjectStoreStorageHandler::new(&base, std::iter::empty(), rt).unwrap());
@@ -731,7 +727,7 @@ mod per_file_batch_tests {
         let files = vec![FileMeta {
             location: base.join("a.parquet").unwrap(),
             last_modified: 0,
-            size: std::fs::metadata(dir.join("a.parquet")).unwrap().len(),
+            size: std::fs::metadata(dir.path().join("a.parquet")).unwrap().len(),
         }];
         let result = handler
             .read_parquet_files(&files, schema, None)
