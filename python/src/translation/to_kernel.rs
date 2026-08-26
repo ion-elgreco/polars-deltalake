@@ -437,10 +437,9 @@ fn translate_function(
                 return Some(Predicate::literal(false));
             }
             // Flatten to `lhs == v1 OR ...` rather than `BinaryPredicateOp::In`:
-            // kernel's `eval_pred_in` (kernel_predicates/mod.rs) is a `None //
-            //
-            // TODO: revert to `BinaryPredicateOp::In` once kernel's pruning
-            // evaluators implement `eval_pred_in`.
+            // kernel's pruning evaluators return `None` from `eval_pred_in`
+            // (kernel_predicates/mod.rs), so `In` never skips a file.
+            // TODO: revert to `BinaryPredicateOp::In` once they implement it.
             Some(Predicate::or_from(elements.into_iter().map(|s| {
                 Predicate::eq(lhs_kernel.clone(), Expression::Literal(s))
             })))
