@@ -56,9 +56,7 @@ impl DvState {
     /// keep-mask math (`partition_point` + cursor subtraction) requires
     /// ascending — enforce it here rather than trust the kernel rev.
     pub(crate) fn new(mut deleted: Vec<u64>) -> Self {
-        if !deleted.is_sorted() {
-            deleted.sort_unstable();
-        }
+        deleted.sort_unstable();
         Self { deleted, cursor: 0 }
     }
 }
