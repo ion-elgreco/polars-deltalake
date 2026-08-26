@@ -231,11 +231,16 @@ fn narrow_scalar(s: &Scalar, target: &PrimitiveType) -> Narrowing {
     }
 }
 
-/// [`narrow_scalar`] for callers that can only use an exact retyping.
-fn narrow_scalar_exact(s: &Scalar, target: &PrimitiveType) -> Option<Scalar> {
-    match narrow_scalar(s, target) {
-        Narrowing::Exact(s) => Some(s),
-        Narrowing::NoValueMatches | Narrowing::Undecidable => None,
+/// Retype `s` to the column's primitive when both sides are numeric; a
+/// non-numeric scalar passes through untouched as `Exact`. What
+/// `NoValueMatches` / `Undecidable` mean is the call site's decision:
+/// comparison position declines the conjunct, set position drops only
+/// the element's disjunct.
+fn narrow_to_column(s: Scalar, target: &PrimitiveType) -> Narrowing {
+    match scalar_numeric_prim(&s) {
+        Some(sp) if sp == *target => Narrowing::Exact(s),
+        Some(_) => narrow_scalar(&s, target),
+        None => Narrowing::Exact(s),
     }
 }
 
@@ -251,10 +256,10 @@ fn align_numeric_literal(
         let Some(target) = column_leaf_prim(name, schema).filter(numeric_prim) else {
             return Some(s);
         };
-        match scalar_numeric_prim(&s) {
-            Some(sp) if sp == target => Some(s),
-            Some(_) => narrow_scalar_exact(&s, &target),
-            None => Some(s),
+        match narrow_to_column(s, &target) {
+            Narrowing::Exact(s) => Some(s),
+            // Comparison position can only use an exact retyping.
+            Narrowing::NoValueMatches | Narrowing::Undecidable => None,
         }
     };
     Some(match (l, r) {
@@ -414,14 +419,10 @@ fn translate_function(
                         Some(target) => {
                             let mut kept = Vec::with_capacity(elements.len());
                             for s in elements {
-                                match scalar_numeric_prim(&s) {
-                                    Some(sp) if sp == target => kept.push(s),
-                                    Some(_) => match narrow_scalar(&s, &target) {
-                                        Narrowing::Exact(s) => kept.push(s),
-                                        Narrowing::NoValueMatches => {}
-                                        Narrowing::Undecidable => return None,
-                                    },
-                                    None => kept.push(s),
+                                match narrow_to_column(s, &target) {
+                                    Narrowing::Exact(s) => kept.push(s),
+                                    Narrowing::NoValueMatches => {}
+                                    Narrowing::Undecidable => return None,
                                 }
                             }
                             kept
@@ -611,6 +612,14 @@ fn series_to_scalars(series: &Series) -> Option<Vec<Scalar>> {
 #[cfg(test)]
 mod narrow_scalar_tests {
     use super::*;
+
+    /// The comparison-position collapse the `align` closure applies.
+    fn narrow_scalar_exact(s: &Scalar, target: &PrimitiveType) -> Option<Scalar> {
+        match narrow_scalar(s, target) {
+            Narrowing::Exact(s) => Some(s),
+            Narrowing::NoValueMatches | Narrowing::Undecidable => None,
+        }
+    }
 
     #[test]
     fn exact_double_narrows_to_float() {
