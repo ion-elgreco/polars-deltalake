@@ -364,3 +364,22 @@ mod simple_select_tests {
         assert_eq!(out.get_column_names(), ["part"]);
     }
 }
+
+#[cfg(test)]
+mod keep_mask_tests {
+    use super::*;
+
+    /// kernel's `row_indexes` inherits the DV bitmap's iteration order; the
+    /// mask math (`partition_point` + cursor subtraction) requires ascending.
+    /// Unsorted input must still mask exactly the deleted rows.
+    #[test]
+    fn keep_mask_is_exact_for_unsorted_dv_indices() {
+        let mut state = DvState::new(vec![5, 100, 3]);
+        let first = build_keep_mask(&mut state, 10);
+        let expected: Vec<bool> = (0..10u64).map(|i| i != 3 && i != 5).collect();
+        assert_eq!(first, expected, "batch 1 must drop rows 3 and 5");
+        let second = build_keep_mask(&mut state, 100);
+        let expected: Vec<bool> = (10..110u64).map(|i| i != 100).collect();
+        assert_eq!(second, expected, "batch 2 must drop file row 100");
+    }
+}

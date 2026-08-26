@@ -51,6 +51,18 @@ pub(crate) struct DvState {
     pub(crate) cursor: u64,
 }
 
+impl DvState {
+    /// `row_indexes` inherits whatever order the DV bitmap iterates, and the
+    /// keep-mask math (`partition_point` + cursor subtraction) requires
+    /// ascending — enforce it here rather than trust the kernel rev.
+    pub(crate) fn new(mut deleted: Vec<u64>) -> Self {
+        if !deleted.is_sorted() {
+            deleted.sort_unstable();
+        }
+        Self { deleted, cursor: 0 }
+    }
+}
+
 pub(crate) struct ScanFileMeta {
     pub(crate) path: PlRefPath,
     pub(crate) rewrite: LogicalRewrite,
@@ -146,7 +158,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
                     let deleted = descriptor
                         .row_indexes(storage.clone(), &table_root)
                         .map_err(|e| anyhow::anyhow!("deletion vector read failed: {e:#}"))?;
-                    Ok(DvState { deleted, cursor: 0 })
+                    Ok(DvState::new(deleted))
                 })
                 .transpose()?;
 
