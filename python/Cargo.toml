@@ -14,11 +14,10 @@ crate-type = ["cdylib"]
 [dependencies]
 # Kernel — protocol only; we provide our own Engine implementation backed by
 # polars-io, so the default-engine feature is intentionally NOT enabled.
-# Pinned to a main-branch rev for the declarative-plans execution path
-# (PlanExecutor + Scan::declarative_metadata_scan_plan), which is not in a
-# tagged release yet. `vendored-protoc` supplies the protoc binary the
-# declarative-plans proto codegen runs at build time.
-delta_kernel = { git = "https://github.com/delta-io/delta-kernel-rs", rev = "64fe8e992695a0ea5141642484ff45cbe24d06e4", default-features = false, features = [
+# `declarative-plans` is experimental and its IR churns per release, so expect
+# the PlanExecutor to need work on every bump. `vendored-protoc` supplies the
+# protoc binary the declarative-plans proto codegen runs at build time.
+delta_kernel = { version = "0.27.1", default-features = false, features = [
     "internal-api",
     "declarative-plans",
     "vendored-protoc",

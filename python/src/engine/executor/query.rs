@@ -9,16 +9,16 @@ use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::{Expression, Scalar};
 use delta_kernel::plans::PlanResult;
 use delta_kernel::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
-    ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, DynamicScan, FileType, Filter, NonNullByOperands, Operator, Project, ScanFile,
+    ScanJson, ScanParquet, SemiJoin, Values,
 };
 use delta_kernel::plans::ir::plan::{Plan, PlanNode};
 use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
     BooleanChunked, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType, LazyFrame,
-    MaintainOrderJoin, PolarsError, PolarsResult, Schema as PlSchema, Series, SortMultipleOptions,
-    UnionArgs, col, concat, lit,
+    MaintainOrderJoin, NULL, PolarsError, PolarsResult, Schema as PlSchema, Series,
+    SortMultipleOptions, UnionArgs, col, concat, len, lit, when,
 };
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
@@ -591,10 +591,23 @@ fn eval_aggregate(agg: Aggregate, input: &NodeState) -> DeltaResult<NodeState> {
         .zip(out_fields[group_by.len()..].iter())
         .map(|(a, f)| {
             let e = match a {
-                Agg::Min { value } => column_path_to_expr(value).min(),
-                Agg::Max { value } => column_path_to_expr(value).max(),
-                Agg::MinNonNullBy { value, key } => non_null_by(value, key, true),
-                Agg::MaxNonNullBy { value, key } => non_null_by(value, key, false),
+                Agg::Min(value) => column_path_to_expr(value).min(),
+                Agg::Max(value) => column_path_to_expr(value).max(),
+                // Kernel wants NULL for a group with no non-NULL value; polars
+                // `sum` returns 0 there.
+                Agg::Sum(value) => {
+                    let v = column_path_to_expr(value);
+                    when(v.clone().is_not_null().any(true))
+                        .then(v.sum())
+                        .otherwise(lit(NULL))
+                        .cast(DataType::Int64)
+                }
+                // polars `count` excludes NULLs, `len` includes them; both
+                // yield IdxSize, and kernel types these columns LONG.
+                Agg::Count(value) => column_path_to_expr(value).count().cast(DataType::Int64),
+                Agg::CountStar => len().cast(DataType::Int64),
+                Agg::MinNonNullBy(ops) => non_null_by(ops, true),
+                Agg::MaxNonNullBy(ops) => non_null_by(ops, false),
             };
             e.alias(PlSmallStr::from_str(f.name.as_str()))
         })
@@ -609,16 +622,22 @@ fn eval_aggregate(agg: Aggregate, input: &NodeState) -> DeltaResult<NodeState> {
 }
 
 /// `value` from the row with the least (`ascending`) / greatest `key`,
-/// considering only rows where both are non-null; NULL when no row
-/// qualifies. See kernel `Agg::max_non_null_by` for the exact contract.
-fn non_null_by(
-    value: &delta_kernel::expressions::ColumnName,
-    key: &delta_kernel::expressions::ColumnName,
-    ascending: bool,
-) -> Expr {
+/// considering only rows where `null_sentinel` and `key` are both non-null;
+/// NULL when no row qualifies. A winning `value` may itself be NULL and is
+/// retained: kernel's scan plan sentinels on the file-action key so a winning
+/// `remove` yields a NULL `add`, which is how a tombstone drops the file.
+/// See kernel `Agg::max_non_null_by` for the exact contract.
+fn non_null_by(ops: &NonNullByOperands, ascending: bool) -> Expr {
+    let NonNullByOperands {
+        value,
+        null_sentinel,
+        key,
+    } = ops;
     let v = column_path_to_expr(value);
     let k = column_path_to_expr(key);
-    let keep = v.clone().is_not_null().and(k.clone().is_not_null());
+    let keep = column_path_to_expr(null_sentinel)
+        .is_not_null()
+        .and(k.clone().is_not_null());
     // Stable: duplicate keys otherwise pick a different row per run, and the
     // metadata plan resolves the winning protocol/metaData through this.
     let sorted = v.filter(keep.clone()).sort_by(
@@ -1157,5 +1176,207 @@ mod scalar_type_guard_tests {
         let cols = [(&field, DataType::Date)];
         kernel_constant_literals(&[Scalar::Null(KernelType::DATE)], &cols).unwrap();
         kernel_constant_literals(&[Scalar::Date(19_000)], &cols).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod aggregate_tests {
+    use std::sync::Arc;
+
+    use delta_kernel::expressions::ColumnName;
+    use delta_kernel::schema::DataType as KernelType;
+    use polars::prelude::{AnyValue, DataFrame, IntoLazy};
+
+    use super::*;
+
+    fn state(df: polars::prelude::DataFrame, fields: &[(&str, KernelType)]) -> NodeState {
+        let schema: SchemaRef = Arc::new(
+            StructType::try_new(
+                fields
+                    .iter()
+                    .map(|(n, t)| StructField::nullable(*n, t.clone())),
+            )
+            .unwrap(),
+        );
+        NodeState {
+            lf: df.lazy(),
+            schema,
+        }
+    }
+
+    fn run(
+        input: &NodeState,
+        group_by: &[&str],
+        aggs: Vec<Agg>,
+        out: &[(&str, KernelType)],
+    ) -> DataFrame {
+        let schema: SchemaRef = Arc::new(
+            StructType::try_new(
+                out.iter()
+                    .map(|(n, t)| StructField::nullable(*n, t.clone())),
+            )
+            .unwrap(),
+        );
+        let agg = Aggregate {
+            group_by: group_by.iter().map(|k| ColumnName::new([*k])).collect(),
+            aggs,
+            schema,
+        };
+        eval_aggregate(agg, input).unwrap().lf.collect().unwrap()
+    }
+
+    /// Kernel's scan plan sentinels `max_non_null_by` on the file-action key,
+    /// so the newest action for a path wins even when it is a `remove` whose
+    /// `add` is NULL. Retaining that NULL is what drops a tombstoned file; the
+    /// pre-0.27 two-arg form skipped NULL values and resurrected the old add.
+    #[test]
+    fn winning_remove_retains_its_null_value() {
+        let df = polars::df!(
+            "key" => ["f1", "f1"],
+            "add" => [Some(10i64), None],
+            "version" => [1i64, 2],
+        )
+        .unwrap();
+        let input = state(
+            df,
+            &[
+                ("key", KernelType::STRING),
+                ("add", KernelType::LONG),
+                ("version", KernelType::LONG),
+            ],
+        );
+        let out = run(
+            &input,
+            &["key"],
+            vec![Agg::max_non_null_by(
+                ColumnName::new(["add"]),
+                ColumnName::new(["key"]),
+                ColumnName::new(["version"]),
+            )],
+            &[("key", KernelType::STRING), ("add", KernelType::LONG)],
+        );
+        assert_eq!(out.column("add").unwrap().get(0).unwrap(), AnyValue::Null);
+    }
+
+    /// A NULL sentinel disqualifies its row even when that row holds the
+    /// greatest key.
+    #[test]
+    fn null_sentinel_row_loses_despite_greatest_key() {
+        let df = polars::df!(
+            "val" => [Some(10i64), Some(99i64)],
+            "sentinel" => [Some("present"), None],
+            "version" => [1i64, 5],
+        )
+        .unwrap();
+        let input = state(
+            df,
+            &[
+                ("val", KernelType::LONG),
+                ("sentinel", KernelType::STRING),
+                ("version", KernelType::LONG),
+            ],
+        );
+        let out = run(
+            &input,
+            &[],
+            vec![Agg::max_non_null_by(
+                ColumnName::new(["val"]),
+                ColumnName::new(["sentinel"]),
+                ColumnName::new(["version"]),
+            )],
+            &[("val", KernelType::LONG)],
+        );
+        assert_eq!(
+            out.column("val").unwrap().get(0).unwrap(),
+            AnyValue::Int64(10)
+        );
+    }
+
+    /// polars `sum` returns 0 for a group with no non-NULL value; kernel's
+    /// contract is NULL there.
+    #[test]
+    fn sum_is_null_when_no_non_null_value() {
+        let df = polars::df!("v" => [None::<i64>, None]).unwrap();
+        let input = state(df, &[("v", KernelType::LONG)]);
+        let out = run(
+            &input,
+            &[],
+            vec![Agg::sum(ColumnName::new(["v"]))],
+            &[("v", KernelType::LONG)],
+        );
+        assert_eq!(out.column("v").unwrap().get(0).unwrap(), AnyValue::Null);
+        assert_eq!(out.column("v").unwrap().dtype(), &DataType::Int64);
+    }
+
+    #[test]
+    fn sum_adds_non_null_values() {
+        let df = polars::df!("v" => [Some(3i64), None, Some(5), Some(1)]).unwrap();
+        let input = state(df, &[("v", KernelType::LONG)]);
+        let out = run(
+            &input,
+            &[],
+            vec![Agg::sum(ColumnName::new(["v"]))],
+            &[("v", KernelType::LONG)],
+        );
+        assert_eq!(out.column("v").unwrap().get(0).unwrap(), AnyValue::Int64(9));
+    }
+
+    /// The `when/then/otherwise` that gives `Sum` its NULL-on-empty semantics
+    /// must still reduce to one scalar per group, not a list column.
+    #[test]
+    fn grouped_sum_and_count_stay_scalar_per_group() {
+        let df = polars::df!(
+            "g" => ["a", "a", "b"],
+            "v" => [Some(3i64), Some(5), None],
+        )
+        .unwrap();
+        let input = state(df, &[("g", KernelType::STRING), ("v", KernelType::LONG)]);
+        let out = run(
+            &input,
+            &["g"],
+            vec![
+                Agg::sum(ColumnName::new(["v"])),
+                Agg::count(ColumnName::new(["v"])),
+                Agg::count_star(),
+            ],
+            &[
+                ("g", KernelType::STRING),
+                ("total", KernelType::LONG),
+                ("n", KernelType::LONG),
+                ("rows", KernelType::LONG),
+            ],
+        );
+        assert_eq!(out.column("total").unwrap().dtype(), &DataType::Int64);
+        let total = out.column("total").unwrap();
+        let n = out.column("n").unwrap();
+        let rows = out.column("rows").unwrap();
+        // group "a" first: group_by_stable preserves first-seen order.
+        assert_eq!(total.get(0).unwrap(), AnyValue::Int64(8));
+        assert_eq!(n.get(0).unwrap(), AnyValue::Int64(2));
+        assert_eq!(rows.get(0).unwrap(), AnyValue::Int64(2));
+        // group "b" is all-NULL: sum is NULL, count 0, count_star 1.
+        assert_eq!(total.get(1).unwrap(), AnyValue::Null);
+        assert_eq!(n.get(1).unwrap(), AnyValue::Int64(0));
+        assert_eq!(rows.get(1).unwrap(), AnyValue::Int64(1));
+    }
+
+    /// `count` skips NULLs, `count_star` counts rows, and kernel types both
+    /// columns LONG.
+    #[test]
+    fn count_skips_nulls_and_count_star_does_not() {
+        let df = polars::df!("v" => [Some(3i64), None, Some(5), Some(1)]).unwrap();
+        let input = state(df, &[("v", KernelType::LONG)]);
+        let out = run(
+            &input,
+            &[],
+            vec![Agg::count(ColumnName::new(["v"])), Agg::count_star()],
+            &[("n", KernelType::LONG), ("total", KernelType::LONG)],
+        );
+        assert_eq!(out.column("n").unwrap().get(0).unwrap(), AnyValue::Int64(3));
+        assert_eq!(
+            out.column("total").unwrap().get(0).unwrap(),
+            AnyValue::Int64(4)
+        );
+        assert_eq!(out.column("n").unwrap().dtype(), &DataType::Int64);
     }
 }
