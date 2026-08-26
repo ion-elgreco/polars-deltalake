@@ -11,7 +11,7 @@ use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
     BinaryChunked, BooleanChunked, DataFrame, DataType as PlDataType, Expr, Float32Chunked,
     Float64Chunked, Int8Chunked, Int16Chunked, Int32Chunked, Int64Chunked, IntoColumn, LazyFrame,
-    ListChunked, NamedFrom, Series, StringChunked, col, cols,
+    ListChunked, NamedFrom, Series, StringChunked, TimeUnit, col, cols,
 };
 use polars_arrow::array::{Array as ArrowArray, Utf8ViewArray};
 
@@ -239,8 +239,16 @@ impl<'a> PolarsGetter<'a> {
             // (Delta wire format); store the physical chunk so `get_date` /
             // `get_timestamp` can read it through `Self::Int` / `Self::Long`.
             PlDataType::Date => Self::Int(series.date().map_err(to_kernel_err)?.physical()),
-            PlDataType::Datetime(_, _) => {
+            PlDataType::Datetime(TimeUnit::Microseconds, _) => {
                 Self::Long(series.datetime().map_err(to_kernel_err)?.physical())
+            }
+            // Any other unit is off by three orders of magnitude once
+            // `get_timestamp` reads the physical chunk as microseconds.
+            PlDataType::Datetime(unit, _) => {
+                return Err(Error::UnexpectedColumnType(format!(
+                    "column {} is Datetime({unit:?}); kernel reads timestamps as microseconds",
+                    series.name(),
+                )));
             }
             PlDataType::Decimal(_, _) => {
                 let chunked = series.decimal().map_err(to_kernel_err)?;
@@ -473,5 +481,28 @@ mod collect_tests {
             })
             .collect();
         assert_eq!(seen, expected);
+    }
+}
+
+#[cfg(test)]
+mod getter_dtype_tests {
+    use super::*;
+
+    /// `get_timestamp` reads the physical chunk as microseconds, so a column
+    /// in any other unit would be served 1000x off instead of refused.
+    #[test]
+    fn non_microsecond_datetime_is_rejected() {
+        let base = Series::new("t".into(), [1_700_000_000_000i64]);
+        for unit in [TimeUnit::Milliseconds, TimeUnit::Nanoseconds] {
+            let series = base.cast(&PlDataType::Datetime(unit, None)).unwrap();
+            let err = PolarsGetter::from_series(&series)
+                .err()
+                .unwrap_or_else(|| panic!("Datetime({unit:?}) must be rejected"));
+            assert!(err.to_string().contains("microseconds"), "got: {err}");
+        }
+        let micros = base
+            .cast(&PlDataType::Datetime(TimeUnit::Microseconds, None))
+            .unwrap();
+        assert!(PolarsGetter::from_series(&micros).is_ok());
     }
 }
