@@ -111,10 +111,9 @@ impl ParquetHandler for PolarsParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        // Metadata columns are synthesized per file, never read from the
-        // data pages: RowIndex is the 0-based position within each file,
-        // FilePath the file's URL. Anything else must error loudly — the
-        // Insert policy would otherwise null-fill it silently.
+        // RowIndex is the 0-based position within each file, FilePath its URL.
+        // Any other spec must error loudly — the Insert policy would otherwise
+        // null-fill it silently.
         let mut row_index: Option<PlSmallStr> = None;
         let mut file_path: Option<PlSmallStr> = None;
         // In schema order, carrying the accepted kind rather than the raw

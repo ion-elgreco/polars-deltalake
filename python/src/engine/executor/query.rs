@@ -174,8 +174,6 @@ impl PolarsPlanExecutor {
         row_index: Option<PlSmallStr>,
     ) -> DeltaResult<LazyFrame> {
         let select = crate::scan::select_exprs_for_schema(output_schema);
-        // Broadcast the file's constants, then shape to `schema` order so the
-        // union below sees identical schemas.
         let shape = |lf: LazyFrame, literals: Vec<Expr>| {
             let lf = if literals.is_empty() {
                 lf

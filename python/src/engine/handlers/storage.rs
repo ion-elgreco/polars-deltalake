@@ -206,7 +206,6 @@ impl StorageHandler for ObjectStoreStorageHandler {
         let store = self.store.clone();
         self.rt.block_on(async move {
             match store.delete(&p).await {
-                // The trait documents delete as idempotent.
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
                 Err(other) => Err(Error::Generic(format!(
                     "object_store delete failed: {other}"
