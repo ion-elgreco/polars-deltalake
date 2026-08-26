@@ -27,7 +27,7 @@ use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{empty_typed_list_expr, null_gated};
-use crate::translation::schema::KernelDataTypeExt;
+use crate::translation::schema::{KernelDataTypeExt, KernelSchemaExt};
 
 use super::storage::ObjectStoreStorageHandler;
 
@@ -152,6 +152,14 @@ pub(crate) fn align_lazy(
     df: DataFrame,
     kernel_schema: &delta_kernel::schema::StructType,
 ) -> DeltaResult<LazyFrame> {
+    // A zero-byte commit parses to a 0-row frame, where every `align` expr is
+    // a broadcast literal of length 1 — `require_present` would then read a
+    // missing non-nullable column as a violated row that does not exist, and
+    // the select would trip a shape error. Nothing to align over.
+    if df.height() == 0 {
+        let schema = kernel_schema.to_polars().map_err(to_kernel_err)?;
+        return Ok(DataFrame::empty_with_schema(schema.as_ref()).lazy());
+    }
     let polars_schema = df.schema().clone();
     let select_exprs: Vec<Expr> = kernel_schema
         .fields()
@@ -441,6 +449,18 @@ mod align_nullability_tests {
         let err = aligned("{\"pv\":{}}\n{\"z\":1}", &schema)
             .expect_err("a missing non-nullable map must error, not read as empty");
         assert!(err.to_string().contains("pv"), "got: {err}");
+    }
+
+    /// A zero-byte commit parses to a 0-row frame, where every align expr is
+    /// a length-1 broadcast literal — the presence check would read the
+    /// missing column as a violated row that does not exist.
+    #[test]
+    fn zero_row_input_aligns_without_a_presence_error() {
+        let schema =
+            StructType::try_new([StructField::not_null("p", KernelDataType::STRING)]).unwrap();
+        let out = aligned("", &schema).expect("an empty commit is an empty batch");
+        assert_eq!(out.height(), 0);
+        assert_eq!(out.get_column_names(), ["p"]);
     }
 
     /// ScanJson contract: a missing value for a non-nullable field under a
