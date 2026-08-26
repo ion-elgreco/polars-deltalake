@@ -14,13 +14,13 @@ use delta_kernel::plans::ir::nodes::{
 };
 use delta_kernel::plans::ir::plan::{Plan, PlanNode};
 use delta_kernel::schema::{
-    DataType as KernelDataType, MetadataColumnSpec, SchemaRef, StructField, StructType,
+    DataType as KernelDataType, SchemaRef, StructField, StructType,
 };
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
     BooleanChunked, DataFrame, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType,
     LazyFrame, MaintainOrderJoin, PolarsError, PolarsResult, Schema as PlSchema, Series,
-    SortMultipleOptions, UnionArgs, col, concat,
+    SortMultipleOptions, UnionArgs, col, concat, lit,
 };
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
@@ -28,8 +28,8 @@ use url::Url;
 
 use crate::engine::data::resolve_path;
 use crate::engine::handlers::{
-    align_lazy, dsl_parquet_scan, ensure_no_field_id_matching, parse_ndjson_inferred,
-    path_for_polars_io, unified_scan_args,
+    MetadataColumns, align_lazy, dsl_parquet_scan, ensure_no_field_id_matching,
+    parse_ndjson_inferred, path_for_polars_io, split_metadata_columns, unified_scan_args,
 };
 use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
@@ -137,7 +137,7 @@ impl PolarsPlanExecutor {
         constant_cols: &[String],
         schema: SchemaRef,
     ) -> DeltaResult<NodeState> {
-        let (read_schema, row_index) = split_scan_schema(&schema, constant_cols)?;
+        let (read_schema, meta_cols) = split_scan_schema(&schema, constant_cols)?;
         let const_cols: Vec<(&StructField, DataType)> = constant_fields(&schema, constant_cols)?
             .into_iter()
             .map(|f| Ok((f, f.data_type.to_polars().map_err(to_kernel_err)?)))
@@ -161,7 +161,7 @@ impl PolarsPlanExecutor {
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
-        let lf = self.scan_entries(file_type, entries, &read_schema, &schema, row_index)?;
+        let lf = self.scan_entries(file_type, entries, &read_schema, &schema, meta_cols)?;
         Ok(NodeState { lf, schema })
     }
 
@@ -171,9 +171,11 @@ impl PolarsPlanExecutor {
         entries: Vec<FileEntry>,
         read_schema: &StructType,
         output_schema: &SchemaRef,
-        row_index: Option<PlSmallStr>,
+        meta_cols: MetadataColumns,
     ) -> DeltaResult<LazyFrame> {
         let select = crate::scan::select_exprs_for_schema(output_schema);
+        let row_index = meta_cols.row_index().cloned();
+        let file_path = meta_cols.file_path().cloned();
         let shape = |lf: LazyFrame, literals: Vec<Expr>| {
             let lf = if literals.is_empty() {
                 lf
@@ -203,7 +205,7 @@ impl PolarsPlanExecutor {
         let uniform_constants = entries[1..].iter().all(|e| e.literals == first.literals);
 
         let frames: Vec<LazyFrame> = match file_type {
-            FileType::Parquet if uniform_constants && row_index.is_none() => {
+            FileType::Parquet if uniform_constants && meta_cols.is_empty() => {
                 let literals = first.literals.clone();
                 let paths: Vec<PlRefPath> = entries
                     .iter()
@@ -216,7 +218,10 @@ impl PolarsPlanExecutor {
                 .into_iter()
                 .map(|e| {
                     let path = path_for_polars_io(&e.location)?;
-                    let lf = self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
+                    let mut lf = self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
+                    if let Some(name) = &file_path {
+                        lf = lf.with_columns([lit(e.location.as_str()).alias(name.clone())]);
+                    }
                     Ok(shape(lf, e.literals))
                 })
                 .collect::<DeltaResult<_>>()?,
@@ -241,6 +246,9 @@ impl PolarsPlanExecutor {
                         let mut lf = align_lazy(df, read_schema)?;
                         if let Some(name) = &row_index {
                             lf = row_index_as_long(lf.with_row_index(name.clone(), None), name);
+                        }
+                        if let Some(name) = &file_path {
+                            lf = lf.with_columns([lit(e.location.as_str()).alias(name.clone())]);
                         }
                         Ok(shape(lf, e.literals))
                     })
@@ -338,9 +346,9 @@ impl PolarsPlanExecutor {
             entries.push(FileEntry { location, literals });
         }
 
-        let (read_schema, row_index) = split_scan_schema(&ds.schema, &ds.file_constant_columns)?;
+        let (read_schema, meta_cols) = split_scan_schema(&ds.schema, &ds.file_constant_columns)?;
         let schema = ds.schema.clone();
-        let lf = self.scan_entries(ds.file_type, entries, &read_schema, &schema, row_index)?;
+        let lf = self.scan_entries(ds.file_type, entries, &read_schema, &schema, meta_cols)?;
         Ok(NodeState { lf, schema })
     }
 }
@@ -428,42 +436,19 @@ fn non_nullable_guards(read_schema: &StructType) -> Vec<Expr> {
 
 /// Splits a scan output schema into the fields read from files (everything
 /// that is neither a constant nor a metadata column) and the requested
-/// row-index column, erroring on unsupported metadata specs.
+/// synthetic metadata columns, via the same classifier the classic
+/// `ParquetHandler` uses — the two read paths must not drift.
 fn split_scan_schema(
     schema: &SchemaRef,
     constant_cols: &[String],
-) -> DeltaResult<(StructType, Option<PlSmallStr>)> {
-    let mut row_index = None;
-    for f in schema.fields() {
-        match f.get_metadata_column_spec() {
-            None => {}
-            Some(MetadataColumnSpec::RowIndex) => {
-                // Only one is representable: the second would silently be
-                // read as a data column that no file has.
-                if row_index.is_some() {
-                    return Err(Error::Unsupported(
-                        "plan scan: more than one row-index metadata column".into(),
-                    ));
-                }
-                row_index = Some(PlSmallStr::from_str(f.name.as_str()));
-            }
-            Some(other) => {
-                return Err(Error::Unsupported(format!(
-                    "plan scan: metadata column {other:?} is not supported"
-                )));
-            }
-        }
-    }
-    let read_fields: Vec<StructField> = schema
+) -> DeltaResult<(StructType, MetadataColumns)> {
+    let (read_schema, meta) = split_metadata_columns(schema, "plan scan")?;
+    let read_fields: Vec<StructField> = read_schema
         .fields()
-        .filter(|f| {
-            f.get_metadata_column_spec().is_none()
-                && !constant_cols.iter().any(|c| c == f.name.as_str())
-        })
+        .filter(|f| !constant_cols.iter().any(|c| c == f.name.as_str()))
         .cloned()
         .collect();
-    let read_schema = StructType::try_new(read_fields)?;
-    Ok((read_schema, row_index))
+    Ok((StructType::try_new(read_fields)?, meta))
 }
 
 fn constant_fields<'a>(
@@ -657,6 +642,8 @@ fn non_null_by(
 
 #[cfg(test)]
 mod scan_entries_tests {
+    use delta_kernel::schema::MetadataColumnSpec;
+
     use std::sync::Arc;
 
     use delta_kernel::schema::DataType;
@@ -695,7 +682,7 @@ mod scan_entries_tests {
                 entries,
                 &read_schema,
                 &output_schema,
-                None,
+                MetadataColumns::default(),
             )
             .unwrap();
         format!("{:?}", lf.logical_plan).matches("Scan {").count()
@@ -730,7 +717,7 @@ mod scan_entries_tests {
                 entries,
                 &read_schema,
                 &output_schema,
-                None,
+                MetadataColumns::default(),
             )
             .err()
             .expect("a constants-only scan must not report one row per file");
@@ -829,12 +816,78 @@ mod scan_entries_tests {
             entries,
             &read_schema,
             &output_schema,
-            None,
+            MetadataColumns::default(),
         ) {
             Err(e) => e,
             Ok(_) => panic!("field-id read schema must be refused"),
         };
         assert!(err.to_string().contains("parquet.field.id"), "got: {err}");
+    }
+
+    fn ridx_meta() -> MetadataColumns {
+        let schema = StructType::try_new([StructField::create_metadata_column(
+            "ridx",
+            MetadataColumnSpec::RowIndex,
+        )])
+        .unwrap();
+        split_metadata_columns(&schema, "test").unwrap().1
+    }
+
+    /// The classic handler synthesizes FilePath; the plan path refused the
+    /// identical schema. One classifier serves both, and each entry carries
+    /// its own URL.
+    #[test]
+    fn plan_scan_synthesizes_file_path_per_file() {
+        let dir = std::env::temp_dir().join(format!("pldl-fpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, v) in [("a.parquet", 1i64), ("b.parquet", 2)] {
+            let mut df = polars::df!("id" => [v]).unwrap();
+            ParquetWriter::new(std::fs::File::create(dir.join(name)).unwrap())
+                .finish(&mut df)
+                .unwrap();
+        }
+        let schema = Arc::new(
+            StructType::try_new([
+                long_field("id"),
+                StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+            ])
+            .unwrap(),
+        );
+        let (read_schema, meta) =
+            split_scan_schema(&schema, &[]).expect("the plan path supports FilePath");
+        let entries = ["a.parquet", "b.parquet"]
+            .map(|n| FileEntry {
+                location: Url::from_file_path(dir.join(n)).unwrap(),
+                literals: vec![],
+            })
+            .into_iter()
+            .collect();
+        let df = executor()
+            .scan_entries(FileType::Parquet, entries, &read_schema, &schema, meta)
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(
+            df.column("id")
+                .unwrap()
+                .i64()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let files: Vec<String> = df
+            .column("_file")
+            .unwrap()
+            .str()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        assert!(files[0].ends_with("a.parquet"), "got: {files:?}");
+        assert!(files[1].ends_with("b.parquet"), "got: {files:?}");
     }
 
     /// Kernel's plan contract types metadata columns LONG; polars' native
@@ -868,7 +921,7 @@ mod scan_entries_tests {
                     entries,
                     &read_schema,
                     &output_schema,
-                    Some("ridx".into()),
+                    ridx_meta(),
                 )
                 .unwrap()
                 .collect()
@@ -887,7 +940,7 @@ mod scan_entries_tests {
                 vec![],
                 &read_schema,
                 &output_schema,
-                Some("ridx".into()),
+                ridx_meta(),
             )
             .unwrap()
             .collect()
@@ -923,7 +976,7 @@ mod scan_entries_tests {
                 entries,
                 &read_schema,
                 &output_schema,
-                None,
+                MetadataColumns::default(),
             )
             .unwrap()
             .collect();
@@ -971,7 +1024,7 @@ mod scan_entries_tests {
                 entries,
                 &read_schema,
                 &output_schema,
-                None,
+                MetadataColumns::default(),
             )
             .unwrap()
             .collect()
@@ -1014,7 +1067,7 @@ mod scan_entries_tests {
                 entries,
                 &read_schema,
                 &output_schema,
-                None,
+                MetadataColumns::default(),
             )
             .unwrap()
             .collect();

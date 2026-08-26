@@ -44,11 +44,79 @@ use crate::translation::schema::{ArrowSchemaExt, KernelSchemaExt};
 
 use super::storage::ObjectStoreStorageHandler;
 
-/// The metadata columns this handler synthesizes per file.
+/// The metadata columns this engine synthesizes per file.
 #[derive(Clone, Copy)]
-enum SyntheticColumn {
+pub(crate) enum SyntheticColumn {
     RowIndex,
     FilePath,
+}
+
+/// The synthetic metadata columns a read schema requests.
+#[derive(Default)]
+pub(crate) struct MetadataColumns {
+    /// In schema order, carrying the accepted kind rather than the raw
+    /// spec, so a synthesis match cannot fall through.
+    cols: Vec<(PlSmallStr, SyntheticColumn)>,
+}
+
+impl MetadataColumns {
+    pub(crate) fn row_index(&self) -> Option<&PlSmallStr> {
+        self.cols
+            .iter()
+            .find_map(|(name, kind)| matches!(kind, SyntheticColumn::RowIndex).then_some(name))
+    }
+
+    pub(crate) fn file_path(&self) -> Option<&PlSmallStr> {
+        self.cols
+            .iter()
+            .find_map(|(name, kind)| matches!(kind, SyntheticColumn::FilePath).then_some(name))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cols.is_empty()
+    }
+}
+
+/// Split `schema` into the fields read from the data pages and the
+/// requested synthetic metadata columns. One implementation for the
+/// classic `ParquetHandler` and the plan executor's scan nodes, so the two
+/// read paths cannot drift on which specs the engine supports. RowIndex is
+/// the 0-based position within each file, FilePath its URL; any other spec
+/// errors loudly — a null-fill would silently misreport it.
+pub(crate) fn split_metadata_columns(
+    schema: &StructType,
+    context: &str,
+) -> DeltaResult<(StructType, MetadataColumns)> {
+    let mut row_index: Option<PlSmallStr> = None;
+    let mut file_path: Option<PlSmallStr> = None;
+    let mut cols: Vec<(PlSmallStr, SyntheticColumn)> = Vec::new();
+    for f in schema.fields() {
+        let Some(spec) = f.get_metadata_column_spec() else {
+            continue;
+        };
+        let name = PlSmallStr::from_str(f.name.as_str());
+        let (kind, slot) = match spec {
+            MetadataColumnSpec::RowIndex => (SyntheticColumn::RowIndex, &mut row_index),
+            MetadataColumnSpec::FilePath => (SyntheticColumn::FilePath, &mut file_path),
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "{context}: metadata column {other:?} is not supported"
+                )));
+            }
+        };
+        if slot.replace(name.clone()).is_some() {
+            return Err(Error::Unsupported(format!(
+                "{context}: more than one {spec:?} metadata column"
+            )));
+        }
+        cols.push((name, kind));
+    }
+    let read_fields: Vec<StructField> = schema
+        .fields()
+        .filter(|f| f.get_metadata_column_spec().is_none())
+        .cloned()
+        .collect();
+    Ok((StructType::try_new(read_fields)?, MetadataColumns { cols }))
 }
 
 pub(crate) struct PolarsParquetHandler {
@@ -111,41 +179,11 @@ impl ParquetHandler for PolarsParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        // RowIndex is the 0-based position within each file, FilePath its URL.
-        // Any other spec must error loudly — the Insert policy would otherwise
-        // null-fill it silently.
-        let mut row_index: Option<PlSmallStr> = None;
-        let mut file_path: Option<PlSmallStr> = None;
-        // In schema order, carrying the accepted kind rather than the raw
-        // spec, so the synthesis match below cannot fall through.
-        let mut meta_cols: Vec<(PlSmallStr, SyntheticColumn)> = Vec::new();
-        for f in physical_schema.fields() {
-            let Some(spec) = f.get_metadata_column_spec() else {
-                continue;
-            };
-            let name = PlSmallStr::from_str(f.name.as_str());
-            let (kind, slot) = match spec {
-                MetadataColumnSpec::RowIndex => (SyntheticColumn::RowIndex, &mut row_index),
-                MetadataColumnSpec::FilePath => (SyntheticColumn::FilePath, &mut file_path),
-                other => {
-                    return Err(Error::Unsupported(format!(
-                        "read_parquet_files: metadata column {other:?} is not supported"
-                    )));
-                }
-            };
-            if slot.replace(name.clone()).is_some() {
-                return Err(Error::Unsupported(format!(
-                    "read_parquet_files: more than one {spec:?} metadata column"
-                )));
-            }
-            meta_cols.push((name, kind));
-        }
-        let read_fields: Vec<StructField> = physical_schema
-            .fields()
-            .filter(|f| f.get_metadata_column_spec().is_none())
-            .cloned()
-            .collect();
-        let read_schema = StructType::try_new(read_fields)?;
+        let (read_schema, meta) =
+            split_metadata_columns(&physical_schema, "read_parquet_files")?;
+        let row_index = meta.row_index().cloned();
+        let file_path = meta.file_path().cloned();
+        let meta_cols = meta.cols;
 
         // Footer fast path — nothing needed from the data pages (empty or
         // metadata-only projection): `num_rows` drives synthesis, one batch
