@@ -62,7 +62,21 @@ check:
 # re-syncing between `just develop` and `just test-local` only re-locks
 # uv.lock for no gain here.
 test-rust:
-    cd python && PYO3_PYTHON="$(uv run --no-sync python -c 'import sys; print(sys.executable)')" cargo test --lib --no-default-features
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd python
+    py="$(uv run --no-sync python -c 'import sys; print(sys.executable)')" || {
+        echo "just test-rust: could not resolve the venv interpreter — run 'just develop' first" >&2
+        exit 1
+    }
+    case "$py" in
+        */.venv/*) ;;
+        *)
+            echo "just test-rust: '$py' is not the project venv — run 'just develop' first" >&2
+            exit 1
+            ;;
+    esac
+    PYO3_PYTHON="$py" cargo test --lib --no-default-features
 
 # Wipe build artifacts.
 clean:
