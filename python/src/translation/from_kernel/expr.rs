@@ -122,11 +122,23 @@ fn json_decode_lenient(raw: Expr, dtype: PlDataType) -> Expr {
             // documents inflates the output; a length mismatch means some
             // value is unparsable-as-one-document and must go NULL.
             let n = blanked.len();
-            let decoded = match blanked
-                .json_decode(Some(dtype.clone()), None)
-                .ok()
-                .filter(|s| s.len() == n)
-            {
+            let batch = match blanked.json_decode(Some(dtype.clone()), None) {
+                Ok(series) if series.len() == n => Some(series),
+                Ok(_) => None,
+                // A whole-batch failure is indistinguishable here from one bad
+                // value, but it is also how a wrong target dtype shows up —
+                // and that nulls every stat, silently disabling file skipping.
+                Err(e) => {
+                    tracing::debug!(
+                        target: "polars_deltalake::parse_json",
+                        error = %e,
+                        rows = n,
+                        "batch json_decode failed; retrying per value",
+                    );
+                    None
+                }
+            };
+            let decoded = match batch {
                 Some(series) => series,
                 None => {
                     let mut out = Series::new_empty(PlSmallStr::EMPTY, &dtype);
@@ -140,7 +152,8 @@ fn json_decode_lenient(raw: Expr, dtype: PlDataType) -> Expr {
                             .unwrap_or_else(|| Series::full_null(PlSmallStr::EMPTY, 1, &dtype));
                         out.append(&decoded)?;
                     }
-                    out
+                    // One chunk per value otherwise; every downstream op pays.
+                    out.rechunk()
                 }
             };
             Ok(Column::from(decoded.with_name(column.name().clone())))
