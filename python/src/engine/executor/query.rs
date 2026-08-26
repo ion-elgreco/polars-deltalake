@@ -519,37 +519,10 @@ fn concat_frames(frames: Vec<LazyFrame>, schema: &SchemaRef) -> DeltaResult<Lazy
 
 fn eval_values(values: Values) -> DeltaResult<NodeState> {
     let Values { schema, rows } = values;
-    let fields: Vec<&StructField> = schema.fields().collect();
-    if let Some(bad) = rows.iter().find(|r| r.len() != fields.len()) {
-        return Err(Error::Generic(format!(
-            "Values row has {} scalars, schema has {} fields",
-            bad.len(),
-            fields.len()
-        )));
-    }
-    if rows.is_empty() {
-        return Ok(NodeState {
-            lf: concat_frames(Vec::new(), &schema)?,
-            schema,
-        });
-    }
-    let df = {
-        let height = rows.len();
-        let columns = fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let scalars: Vec<&Scalar> = rows.iter().map(|r| &r[i]).collect();
-                // Foreign plans arrive via the proto round-trip, so
-                // scalar/schema agreement is not guaranteed here — and
-                // `build_series` panics on it.
-                crate::translation::ensure_scalar_types(scalars.iter().copied(), f, "Values")?;
-                crate::translation::build_series(f.name.as_str(), &f.data_type, &scalars)
-                    .map(polars::prelude::IntoColumn::into_column)
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-        DataFrame::new(height, columns).map_err(to_kernel_err)?
-    };
+    let row_slices: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
+    // Foreign plans arrive via the proto round-trip; the shared builder
+    // guards the scalar/schema agreement `build_series` panics on.
+    let df = crate::translation::scalar_rows_to_frame(&schema, &row_slices, "Values")?;
     Ok(NodeState {
         lf: df.lazy(),
         schema,

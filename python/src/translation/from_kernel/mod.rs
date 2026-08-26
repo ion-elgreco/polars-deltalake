@@ -111,42 +111,46 @@ impl EvaluationHandler for PolarsEvaluationHandler {
         schema: SchemaRef,
         rows: &[&[Scalar]],
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let row_count = rows.len();
-
-        if row_count == 0 {
-            let df =
-                DataFrame::empty_with_schema(schema.to_polars().map_err(to_kernel_err)?.as_ref());
-            return Ok(Box::new(PolarsEngineData::new(df)));
-        }
-
-        let fields: Vec<_> = schema.fields().collect();
-
-        if rows.iter().any(|row| row.len() != fields.len()) {
-            return Err(Error::Generic(format!(
-                "create_many: expected {} scalars per row, got mismatched row widths",
-                fields.len()
-            )));
-        }
-
-        let columns = fields
-            .iter()
-            .enumerate()
-            .map(|(col_idx, field)| {
-                let column_scalars: Vec<&Scalar> = rows.iter().map(|row| &row[col_idx]).collect();
-                // Untrusted boundary — `build_series` panics on a mismatch.
-                ensure_scalar_types(column_scalars.iter().copied(), field, "create_many")?;
-                build_series(&field.name, &field.data_type, &column_scalars)
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-
-        let df = DataFrame::new(
-            row_count,
-            columns.into_iter().map(IntoColumn::into_column).collect(),
-        )
-        .map_err(to_kernel_err)?;
-
+        let df = scalar_rows_to_frame(&schema, rows, "create_many")?;
         Ok(Box::new(PolarsEngineData::new(df)))
     }
+}
+
+/// Row-major scalars → one column per schema field. Shared by kernel's
+/// `create_many` and the plan executor's `Values` node — both sit on
+/// untrusted boundaries (FFI / proto round-trip) where scalar/schema
+/// agreement is not guaranteed and `build_series` panics on a mismatch.
+pub(crate) fn scalar_rows_to_frame(
+    schema: &delta_kernel::schema::StructType,
+    rows: &[&[Scalar]],
+    context: &str,
+) -> DeltaResult<DataFrame> {
+    let fields: Vec<_> = schema.fields().collect();
+    if let Some(bad) = rows.iter().find(|row| row.len() != fields.len()) {
+        return Err(Error::Generic(format!(
+            "{context}: row has {} scalars, schema has {} fields",
+            bad.len(),
+            fields.len()
+        )));
+    }
+    if rows.is_empty() {
+        let polars_schema = schema.to_polars().map_err(to_kernel_err)?;
+        return Ok(DataFrame::empty_with_schema(polars_schema.as_ref()));
+    }
+    let columns = fields
+        .iter()
+        .enumerate()
+        .map(|(col_idx, field)| {
+            let column_scalars: Vec<&Scalar> = rows.iter().map(|row| &row[col_idx]).collect();
+            ensure_scalar_types(column_scalars.iter().copied(), field, context)?;
+            build_series(&field.name, &field.data_type, &column_scalars)
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
+    DataFrame::new(
+        rows.len(),
+        columns.into_iter().map(IntoColumn::into_column).collect(),
+    )
+    .map_err(to_kernel_err)
 }
 
 /// One output column's evaluation plan. Real-world Transforms emit only
