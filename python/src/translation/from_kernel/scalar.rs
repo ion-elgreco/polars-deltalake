@@ -93,9 +93,9 @@ pub(crate) fn scalar_to_lit(scalar: &Scalar) -> Expr {
         // in Delta data; the dtype decision (day-time µs → Duration,
         // year-month → typed Int32 month count) lives in
         // `try_to_polars_scalar`.
-        Scalar::IntervalDayTime(_) | Scalar::IntervalYearMonth(_) => lit(
-            try_to_polars_scalar(scalar).expect("interval scalars are always representable"),
-        ),
+        Scalar::IntervalDayTime(_) | Scalar::IntervalYearMonth(_) => {
+            lit(try_to_polars_scalar(scalar).expect("interval scalars are always representable"))
+        }
         Scalar::Array(_) | Scalar::Map(_) | Scalar::Struct(_) | Scalar::Decimal(_) => {
             build_series("__lit__", &scalar.data_type(), &[scalar])
                 .map(lit)

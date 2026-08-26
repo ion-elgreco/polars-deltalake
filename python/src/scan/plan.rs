@@ -219,8 +219,12 @@ mod field_source_tests {
         let physical = StructType::try_new([StructField::nullable("id", DataType::LONG)]).unwrap();
         let partition_cols = ["part".to_string()];
 
-        let err = match field_sources(&logical, &physical, &partition_cols, ColumnMappingMode::None)
-        {
+        let err = match field_sources(
+            &logical,
+            &physical,
+            &partition_cols,
+            ColumnMappingMode::None,
+        ) {
             Ok(_) => panic!("ghost is neither physical nor a partition column"),
             Err(e) => e,
         };
@@ -236,8 +240,13 @@ mod field_source_tests {
         let physical = StructType::try_new(Vec::<StructField>::new()).unwrap();
         let partition_cols = ["part".to_string()];
 
-        let sources =
-            field_sources(&logical, &physical, &partition_cols, ColumnMappingMode::None).unwrap();
+        let sources = field_sources(
+            &logical,
+            &physical,
+            &partition_cols,
+            ColumnMappingMode::None,
+        )
+        .unwrap();
         assert!(matches!(
             &sources[0].1,
             FieldSource::Partition { physical } if physical == "part"
@@ -281,7 +290,10 @@ fn partition_literals(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let names: Vec<&str> = partition_fields.iter().map(|(f, _)| f.name.as_str()).collect();
+    let names: Vec<&str> = partition_fields
+        .iter()
+        .map(|(f, _)| f.name.as_str())
+        .collect();
     per_row_literals(&series_per_field, &names, row_count)
         .map_err(|e| anyhow::anyhow!("partition value read: {e:#}"))
 }

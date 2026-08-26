@@ -763,7 +763,9 @@ mod partition_parse_agreement_tests {
             let via_expr = DataFrame::new(3, vec![column])
                 .unwrap()
                 .lazy()
-                .select([parse_partition_string(col("p"), &target).unwrap().alias("p")])
+                .select([parse_partition_string(col("p"), &target)
+                    .unwrap()
+                    .alias("p")])
                 .collect()
                 .unwrap();
             let via_expr = via_expr.column("p").unwrap();

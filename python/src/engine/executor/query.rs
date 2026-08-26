@@ -272,8 +272,8 @@ impl PolarsPlanExecutor {
     /// here yet — matching the kernel's own sync executor, a row with a
     /// non-null DV descriptor is an error.
     fn eval_dynamic_scan(&self, ds: DynamicScan, input: &NodeState) -> DeltaResult<NodeState> {
-        let df = crate::engine::collect_streaming_single(input.lf.clone())
-            .map_err(to_kernel_err)?;
+        let df =
+            crate::engine::collect_streaming_single(input.lf.clone()).map_err(to_kernel_err)?;
 
         let dv = resolve_path(&df, &ds.dv_column).map_err(to_kernel_err)?;
         let mut dv_present = dv.is_not_null();
@@ -898,7 +898,13 @@ mod scan_entries_tests {
             literals: vec![],
         }];
         let out = executor()
-            .scan_entries(FileType::Parquet, entries, &read_schema, &output_schema, None)
+            .scan_entries(
+                FileType::Parquet,
+                entries,
+                &read_schema,
+                &output_schema,
+                None,
+            )
             .unwrap()
             .collect();
         let err = out.expect_err("missing non-nullable column must error");
@@ -983,7 +989,13 @@ mod scan_entries_tests {
             literals: vec![],
         }];
         let out = executor()
-            .scan_entries(FileType::Parquet, entries, &read_schema, &output_schema, None)
+            .scan_entries(
+                FileType::Parquet,
+                entries,
+                &read_schema,
+                &output_schema,
+                None,
+            )
             .unwrap()
             .collect();
         let err = out.expect_err("null leaf under a present parent must error");

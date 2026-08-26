@@ -108,14 +108,9 @@ fn cast_is_droppable(inner: &Expr, dtype: &DataTypeExpr, schema: &StructType) ->
                     | PlDataType::Float64
             ) | (
                 PlDataType::Int16,
-                PlDataType::Int32
-                    | PlDataType::Int64
-                    | PlDataType::Float32
-                    | PlDataType::Float64
-            ) | (
-                PlDataType::Int32,
-                PlDataType::Int64 | PlDataType::Float64
-            ) | (PlDataType::Float32, PlDataType::Float64)
+                PlDataType::Int32 | PlDataType::Int64 | PlDataType::Float32 | PlDataType::Float64
+            ) | (PlDataType::Int32, PlDataType::Int64 | PlDataType::Float64)
+                | (PlDataType::Float32, PlDataType::Float64)
         )
 }
 
@@ -641,7 +636,10 @@ mod narrow_scalar_tests {
             Some(Scalar::Integer(1))
         );
         assert_eq!(
-            narrow_scalar_exact(&Scalar::Long(i64::from(i32::MAX) + 1), &PrimitiveType::Integer),
+            narrow_scalar_exact(
+                &Scalar::Long(i64::from(i32::MAX) + 1),
+                &PrimitiveType::Integer
+            ),
             None
         );
     }

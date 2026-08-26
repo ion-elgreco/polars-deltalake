@@ -540,10 +540,21 @@ mod per_file_batch_tests {
             .unwrap()
             .dataframe();
         assert_eq!(df.height(), 3, "row count comes from the footer");
-        let ri: Vec<i64> = df.column("ri").unwrap().i64().unwrap().iter().flatten().collect();
+        let ri: Vec<i64> = df
+            .column("ri")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
         assert_eq!(ri, vec![0, 1, 2]);
         let fp = df.column("fp").unwrap().str().unwrap().get(0).unwrap();
-        assert_eq!(fp, location.as_str(), "the path column carries the file URL");
+        assert_eq!(
+            fp,
+            location.as_str(),
+            "the path column carries the file URL"
+        );
     }
 
     /// `FileDataReadResultIterator` contract: data arrives in file order and
@@ -564,9 +575,8 @@ mod per_file_batch_tests {
             Arc::new(ObjectStoreStorageHandler::new(&base, std::iter::empty(), rt).unwrap());
         let handler = PolarsParquetHandler::new(storage, HashMap::new()).unwrap();
 
-        let schema = Arc::new(
-            StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap(),
-        );
+        let schema =
+            Arc::new(StructType::try_new([StructField::not_null("x", DataType::LONG)]).unwrap());
         let files: Vec<FileMeta> = ["a.parquet", "b.parquet"]
             .iter()
             .map(|n| FileMeta {

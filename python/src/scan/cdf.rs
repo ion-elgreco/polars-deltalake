@@ -13,7 +13,6 @@ use polars::prelude::{DataFrame, Expr, IntoLazy, Schema as PlSchema};
 use pyo3::prelude::*;
 use pyo3_polars::PySchema;
 
-
 use crate::engine::{PolarsEngine, PolarsEngineData};
 use crate::errors::py_err;
 use crate::translation::schema::KernelSchemaExt;

@@ -381,7 +381,11 @@ mod align_nullability_tests {
         );
         let gate = df
             .lazy()
-            .select([col("o").struct_().field_by_name("m").is_not_null().alias("g")])
+            .select([col("o")
+                .struct_()
+                .field_by_name("m")
+                .is_not_null()
+                .alias("g")])
             .collect()
             .unwrap();
         assert_eq!(
@@ -526,11 +530,7 @@ mod json_string_tests {
         let handler = PolarsJsonHandler::new(storage);
 
         let schema = Arc::new(
-            StructType::try_new([StructField::nullable(
-                "a",
-                KernelDataType::LONG,
-            )])
-            .unwrap(),
+            StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap(),
         );
         let df = polars::df!("json" => [Some("{\n  \"a\": 3\n}")]).unwrap();
         let out = handler
