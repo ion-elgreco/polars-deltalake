@@ -623,9 +623,12 @@ fn non_null_by(
     let v = column_path_to_expr(value);
     let k = column_path_to_expr(key);
     let keep = v.clone().is_not_null().and(k.clone().is_not_null());
-    let sorted = v
-        .filter(keep.clone())
-        .sort_by([k.filter(keep)], SortMultipleOptions::default());
+    // Stable: duplicate keys otherwise pick a different row per run, and the
+    // metadata plan resolves the winning protocol/metaData through this.
+    let sorted = v.filter(keep.clone()).sort_by(
+        [k.filter(keep)],
+        SortMultipleOptions::default().with_maintain_order(true),
+    );
     if ascending {
         sorted.first()
     } else {
