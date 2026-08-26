@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import datetime
 import decimal
-import json
 from pathlib import Path
 from typing import Any, Callable
 
 import polars as pl
 import pytest
+from _log_helpers import rewrite_log_actions
 
 from polars_deltalake import scan_delta
 
@@ -50,10 +50,8 @@ def _rewrite_partition_values(
     `rewrite` receives the value `deltalake` wrote and returns the value to
     commit instead; returning `_DROP` removes the key entirely.
     """
-    log = Path(table_path) / "_delta_log" / f"{version:020d}.json"
-    lines = []
-    for line in log.read_text().splitlines():
-        action = json.loads(line)
+
+    def mutate(action: dict) -> None:
         add = action.get("add")
         if add is not None and "p" in add["partitionValues"]:
             new = rewrite(add["partitionValues"]["p"])
@@ -61,8 +59,8 @@ def _rewrite_partition_values(
                 del add["partitionValues"]["p"]
             else:
                 add["partitionValues"]["p"] = new
-        lines.append(json.dumps(action))
-    log.write_text("\n".join(lines) + "\n")
+
+    rewrite_log_actions(table_path, mutate, version)
 
 
 def _read_p(table_path: str) -> list[Any]:
@@ -312,14 +310,12 @@ class TestPruningParsesLikeProjection:
         """An extra key a foreign writer left in `partitionValues` names no
         logical column; a skip that never references it must still run."""
         table = _write_partitioned(tmp_path / "t", ["a", "b"], pl.String())
-        log = Path(table) / "_delta_log" / f"{0:020d}.json"
-        lines = []
-        for line in log.read_text().splitlines():
-            action = json.loads(line)
+
+        def add_stale_key(action: dict) -> None:
             if "add" in action:
                 action["add"]["partitionValues"]["dropped_col"] = "x"
-            lines.append(json.dumps(action))
-        log.write_text("\n".join(lines) + "\n")
+
+        rewrite_log_actions(table, add_stale_key)
 
         got = scan_delta(table).filter(pl.col("p").str.to_uppercase() == "A").collect()
         assert got["v"].to_list() == [0]

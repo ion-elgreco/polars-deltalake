@@ -5,25 +5,22 @@ nullable fields per the kernel plan contract."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import polars as pl
 import pytest
+from _log_helpers import rewrite_log_actions
 from deltalake import write_deltalake
 
 from polars_deltalake import scan_delta
 
 
 def _strip_add_path(table_path: Path, version: int = 0) -> None:
-    log = table_path / "_delta_log" / f"{version:020d}.json"
-    lines = []
-    for line in log.read_text().splitlines():
-        action = json.loads(line)
+    def strip(action: dict) -> None:
         if "add" in action:
             del action["add"]["path"]
-        lines.append(json.dumps(action))
-    log.write_text("\n".join(lines) + "\n")
+
+    rewrite_log_actions(table_path, strip, version)
 
 
 def test_add_without_path_errors(tmp_path: Path) -> None:
@@ -36,14 +33,11 @@ def test_add_without_path_errors(tmp_path: Path) -> None:
 
 
 def _rewrite_add_stats(table_path: Path, stats: str, version: int = 0) -> None:
-    log = table_path / "_delta_log" / f"{version:020d}.json"
-    lines = []
-    for line in log.read_text().splitlines():
-        action = json.loads(line)
+    def set_stats(action: dict) -> None:
         if "add" in action:
             action["add"]["stats"] = stats
-        lines.append(json.dumps(action))
-    log.write_text("\n".join(lines) + "\n")
+
+    rewrite_log_actions(table_path, set_stats, version)
 
 
 @pytest.mark.parametrize(

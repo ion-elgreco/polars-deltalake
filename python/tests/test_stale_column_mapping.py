@@ -18,6 +18,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+from _log_helpers import rewrite_log_actions
 from deltalake import write_deltalake
 
 from polars_deltalake import scan_delta
@@ -25,23 +26,22 @@ from polars_deltalake import scan_delta
 
 def _annotate_schema(table_path: Path, version: int = 0) -> None:
     """Add `delta.columnMapping.*` metadata to every field, leaving mode unset."""
-    log = table_path / "_delta_log" / f"{version:020d}.json"
-    lines = []
-    for line in log.read_text().splitlines():
-        action = json.loads(line)
+
+    def annotate(action: dict) -> None:
         meta = action.get("metaData")
-        if meta is not None:
-            schema = json.loads(meta["schemaString"])
-            for column_id, field in enumerate(schema["fields"], start=1):
-                field.setdefault("metadata", {}).update(
-                    {
-                        "delta.columnMapping.id": column_id,
-                        "delta.columnMapping.physicalName": f"col-{column_id}",
-                    }
-                )
-            meta["schemaString"] = json.dumps(schema)
-        lines.append(json.dumps(action))
-    log.write_text("\n".join(lines) + "\n")
+        if meta is None:
+            return
+        schema = json.loads(meta["schemaString"])
+        for column_id, field in enumerate(schema["fields"], start=1):
+            field.setdefault("metadata", {}).update(
+                {
+                    "delta.columnMapping.id": column_id,
+                    "delta.columnMapping.physicalName": f"col-{column_id}",
+                }
+            )
+        meta["schemaString"] = json.dumps(schema)
+
+    rewrite_log_actions(table_path, annotate, version)
 
 
 @pytest.fixture
