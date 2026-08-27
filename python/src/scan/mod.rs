@@ -336,6 +336,36 @@ impl TableScan {
         let source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send> =
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
 
+        // A post-transform conjunct runs on the logical frame, so every column
+        // it names has to be in the projection. Checked for both arms: with no
+        // rewrite the physical read *is* the logical frame and nothing applies
+        // the conjunct at all, so an unprojected column is the only way one
+        // gets here. Dropping it would silently return unfiltered rows, and
+        // leaving it to `LogicalScanIter` fails as an opaque missing-column
+        // error. Polars always projects the columns its own pushdown
+        // references, so this is a direct `TableScan` caller.
+        let projected: std::collections::HashSet<&str> = scan
+            .logical_schema()
+            .fields()
+            .map(|f| f.name.as_str())
+            .collect();
+        let mut unread: Vec<String> = routing
+            .post_transform
+            .iter()
+            .flat_map(polars_plan::utils::expr_to_leaf_column_names)
+            .filter(|n| !projected.contains(n.as_str()))
+            .map(|n| n.to_string())
+            .collect();
+        if !unread.is_empty() {
+            unread.sort_unstable();
+            unread.dedup();
+            return Err(anyhow::anyhow!(
+                "predicate references {} which the scan does not read; \
+                 add them to the projection or drop the predicate",
+                unread.join(", ")
+            ));
+        }
+
         let new_iter: BatchIter = if needs_rewrite {
             Box::new(
                 LogicalScanIter::new(
@@ -348,26 +378,6 @@ impl TableScan {
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
             )
         } else {
-            // No layer below can evaluate these, and dropping them would
-            // silently return unfiltered rows. Reached when a predicate names
-            // a column outside the projection: it is not read, so nothing
-            // materializes it. Polars always projects the columns its own
-            // pushdown references, so this is a direct `TableScan` caller.
-            if !routing.post_transform.is_empty() {
-                let mut cols: Vec<String> = routing
-                    .post_transform
-                    .iter()
-                    .flat_map(polars_plan::utils::expr_to_leaf_column_names)
-                    .map(|n| n.to_string())
-                    .collect();
-                cols.sort_unstable();
-                cols.dedup();
-                return Err(anyhow::anyhow!(
-                    "predicate references {} which the scan does not read; \
-                     add them to the projection or drop the predicate",
-                    cols.join(", ")
-                ));
-            }
             source
         };
         state.iter = Some(new_iter);
