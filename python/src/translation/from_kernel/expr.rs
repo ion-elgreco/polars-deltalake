@@ -391,23 +391,18 @@ fn translate_binary_expr(
 ) -> DeltaResult<Expr> {
     let lhs = translate_expr(&b.left, None, input_schema)?;
     let rhs = translate_expr(&b.right, None, input_schema)?;
-    Ok(match b.op {
-        BinaryExpressionOp::Plus => lhs + rhs,
-        BinaryExpressionOp::Minus => lhs - rhs,
-        BinaryExpressionOp::Multiply => lhs * rhs,
-        // Kernel divides integers as integers and errors on a zero divisor;
-        // polars `/` is always true division, so `7 / 2` would read back 3.5
-        // as a Float64 where the plan declares LONG 3, and `7 / 0` as inf.
-        // Kernel emits no Divide today, so refuse rather than diverge
-        // silently — the day it does, this names what to implement.
-        BinaryExpressionOp::Divide => {
-            return Err(Error::Unsupported(
-                "translate_expr: Divide has no polars form matching kernel's \
-                 integer-division semantics"
-                    .into(),
-            ));
-        }
-    })
+    match b.op {
+        BinaryExpressionOp::Plus => Ok(lhs + rhs),
+        BinaryExpressionOp::Minus => Ok(lhs - rhs),
+        BinaryExpressionOp::Multiply => Ok(lhs * rhs),
+        // Rust `Expr / Expr` is `Operator::RustDivide`, which truncates and
+        // keeps the operand dtype like kernel's `div` — but a zero divisor
+        // yields NULL where kernel fails the query. Kernel emits no Divide
+        // today, so refuse rather than diverge silently on that.
+        BinaryExpressionOp::Divide => Err(Error::Unsupported(
+            "translate_expr: Divide yields NULL on a zero divisor where kernel fails".into(),
+        )),
+    }
 }
 
 fn translate_variadic_expr(
@@ -862,38 +857,59 @@ mod array_shape_tests {
 
 #[cfg(test)]
 mod arithmetic_tests {
+    use polars::prelude::{IntoLazy, col, df};
+    use polars_plan::dsl::Operator;
+
     use super::*;
 
-    /// Kernel divides LONG by LONG as integers and errors on a zero divisor
-    /// (`evaluate_expression`'s `div`); polars `/` is true division, so a
-    /// translated `Divide` would answer 3.5 where the plan declares LONG 3.
-    #[test]
-    fn divide_declines_rather_than_true_divide() {
-        let expr = BinaryExpression {
-            op: BinaryExpressionOp::Divide,
+    fn binary(op: BinaryExpressionOp) -> BinaryExpression {
+        BinaryExpression {
+            op,
             left: Box::new(Expression::from(ColumnName::new(["a"]))),
             right: Box::new(Expression::literal(2i64)),
-        };
-        assert!(
-            translate_binary_expr(&expr, None).is_err(),
-            "Divide has no polars form matching kernel's integer semantics",
-        );
+        }
     }
 
-    /// The other three arms agree with kernel on LONG operands and stay wired.
+    /// Pinned on the variant, not just `is_err`: both operands translate
+    /// before the `op` match, so a failure there would keep a plain
+    /// `is_err` green with the Divide arm reverted.
     #[test]
-    fn plus_minus_multiply_translate() {
-        for op in [
-            BinaryExpressionOp::Plus,
-            BinaryExpressionOp::Minus,
-            BinaryExpressionOp::Multiply,
-        ] {
-            let expr = BinaryExpression {
-                op,
-                left: Box::new(Expression::from(ColumnName::new(["a"]))),
-                right: Box::new(Expression::literal(2i64)),
-            };
-            assert!(translate_binary_expr(&expr, None).is_ok(), "{op:?}");
+    fn divide_declines() {
+        match translate_binary_expr(&binary(BinaryExpressionOp::Divide), None) {
+            Err(Error::Unsupported(msg)) => assert!(msg.contains("Divide"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    /// The polars arithmetic ops are infallible constructors, so `is_ok`
+    /// alone cannot catch a swapped arm — assert the operator each emits.
+    #[test]
+    fn plus_minus_multiply_keep_their_operator() {
+        for (kernel_op, want) in [
+            (BinaryExpressionOp::Plus, Operator::Plus),
+            (BinaryExpressionOp::Minus, Operator::Minus),
+            (BinaryExpressionOp::Multiply, Operator::Multiply),
+        ] {
+            match translate_binary_expr(&binary(kernel_op), None).unwrap() {
+                Expr::BinaryExpr { op, .. } => assert_eq!(op, want, "{kernel_op:?}"),
+                other => panic!("{kernel_op:?} translated to {other:?}"),
+            }
+        }
+    }
+
+    /// The reason Divide is declined: `Operator::RustDivide` already
+    /// truncates and keeps LONG like kernel's `div`, so the sole divergence
+    /// is the zero divisor — NULL here, a failed query in kernel.
+    #[test]
+    fn rust_divide_truncates_but_nulls_a_zero_divisor() {
+        let out = df!["a" => [7i64, 7], "b" => [2i64, 0]]
+            .unwrap()
+            .lazy()
+            .select([(col("a") / col("b")).alias("r")])
+            .collect()
+            .unwrap();
+        let r = out.column("r").unwrap();
+        assert_eq!(r.dtype(), &polars::prelude::DataType::Int64);
+        assert_eq!(r.i64().unwrap().to_vec(), vec![Some(3), None]);
     }
 }
