@@ -9,7 +9,15 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from polars_deltalake import TableState, scan_delta
+from polars_deltalake import TableScan, TableState, scan_delta
+
+
+def _drain(scan: TableScan) -> pl.DataFrame:
+    """Collect every morsel a directly-driven `TableScan` yields."""
+    frames = []
+    while (df := scan.next()) is not None:
+        frames.append(df)
+    return pl.concat(frames) if frames else pl.DataFrame()
 
 
 @pytest.fixture
@@ -518,6 +526,53 @@ class TestMixedAtomicConjunct:
             .sort("id")
         )
         assert out["id"].to_list() == [1, 2, 3]
+
+    def test_unprojected_partition_column_is_read_then_dropped(
+        self, multi_file_partitioned
+    ):
+        """The scan widens past the projection to give the conjunct its
+        partition column, then projects back down. `scan_delta` never asks for
+        this — polars projects what its own pushdown references — so drive
+        `TableScan` directly."""
+        scan = TableScan(TableState(multi_file_partitioned))
+        scan.configure(
+            ["id"], None, (pl.col("g").str.to_uppercase() == "A") | (pl.col("id") == 3)
+        )
+        out = _drain(scan).sort("id")
+        assert out.columns == ["id"]
+        assert out["id"].to_list() == [1, 2, 3]
+
+    def test_unprojected_data_column_is_read_then_dropped(self, multi_file_partitioned):
+        """Same widening for the data leg: `id` is read only to evaluate the
+        conjunct and never reaches the caller."""
+        scan = TableScan(TableState(multi_file_partitioned))
+        scan.configure(
+            ["g"], None, (pl.col("g").str.to_uppercase() == "A") | (pl.col("id") == 3)
+        )
+        out = _drain(scan).sort("g")
+        assert out.columns == ["g"]
+        assert out["g"].to_list() == ["a", "a", "b"]
+
+    def test_widening_survives_full_partition_pruning(self, multi_file_partitioned):
+        """AND-ing a partition conjunct that prunes every file returns no rows
+        rather than failing on the widened column."""
+        scan = TableScan(TableState(multi_file_partitioned))
+        scan.configure(
+            ["id"],
+            None,
+            ((pl.col("g").str.to_uppercase() == "A") | (pl.col("id") == 3))
+            & (pl.col("g") == "nonexistent"),
+        )
+        assert _drain(scan).height == 0
+
+    def test_predicate_column_absent_from_table_errors(self, multi_file_partitioned):
+        """Widening can only reach columns the table declares."""
+        scan = TableScan(TableState(multi_file_partitioned))
+        scan.configure(
+            ["id"], None, (pl.col("g") == "a") | (pl.col("nope").str.len_chars() == 3)
+        )
+        with pytest.raises(RuntimeError, match="nope which the table does not have"):
+            scan.next()
 
 
 class TestDeletionVectors:

@@ -138,17 +138,27 @@ pub(crate) fn renames_nested_fields(dtype: &KernelDataType, mode: ColumnMappingM
     }
 }
 
+/// Leaf column names `exprs` reference that `schema` does not declare.
+/// `BTreeSet` for one-pass dedup with sorted iteration order.
+pub(crate) fn columns_outside_schema<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr>,
+    schema: &StructType,
+) -> BTreeSet<String> {
+    exprs
+        .into_iter()
+        .flat_map(polars_plan::utils::expr_to_leaf_column_names)
+        .filter(|n| !schema.contains(n.as_str()))
+        .map(|n| n.to_string())
+        .collect()
+}
+
 /// Used to drop predicates touching partition columns — kernel adds those
 /// post-read via `Transform`, so the parquet reader can't see them.
 pub(crate) fn predicate_only_touches_data_columns(
     expr: &Expr,
     physical_schema: &StructType,
 ) -> bool {
-    let phys_names: std::collections::HashSet<&str> =
-        physical_schema.fields().map(|f| f.name.as_str()).collect();
-    polars_plan::utils::expr_to_leaf_column_names(expr)
-        .iter()
-        .all(|n| phys_names.contains(n.as_str()))
+    columns_outside_schema([expr], physical_schema).is_empty()
 }
 
 /// Polars-driven partition pruning for predicates kernel can't translate

@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 
 use polars::prelude::{
     BooleanChunked, Column, DataFrame, Expr, IntoLazy, LiteralValue, NamedFrom, PolarsResult,
-    Scalar, StringChunked,
+    Scalar, StringChunked, col,
 };
 use polars_utils::pl_str::PlSmallStr;
 
@@ -120,6 +120,10 @@ pub(crate) struct LogicalScanIter {
     /// Mixed atomic conjuncts (touching both partition and data cols) —
     /// applied after the select list materializes partition values.
     orphan_predicate: Option<Expr>,
+    /// Set when the scan was widened past the caller's projection to give
+    /// `orphan_predicate` its columns. Drops the extras again once the
+    /// filter has run.
+    output_projection: Option<Vec<Expr>>,
     /// One inner frame may span multiple files; we slice into per-file
     /// frames here and drain before pulling the next inner frame.
     pending: VecDeque<Result<DataFrame, delta_kernel::Error>>,
@@ -132,6 +136,7 @@ impl LogicalScanIter {
         rewrites: Vec<LogicalRewrite>,
         physical_predicate: Option<Expr>,
         orphan_predicate: Option<Expr>,
+        output_projection: Option<Vec<String>>,
     ) -> Self {
         let files = rewrites
             .into_iter()
@@ -146,6 +151,8 @@ impl LogicalScanIter {
             files,
             physical_predicate,
             orphan_predicate,
+            output_projection: output_projection
+                .map(|cols| cols.iter().map(|c| col(c.as_str())).collect()),
             pending: VecDeque::new(),
         }
     }
@@ -223,9 +230,11 @@ impl LogicalScanIter {
         // predicate forces a streaming collect anyway, every active stage
         // chains into that one plan: the physical filter must precede the
         // select (physical names), the orphan filter must follow it
-        // (logical/partition names).
+        // (logical/partition names), and the projection comes last so the
+        // filter still sees the columns the read was widened for.
         let has_lazy_stage = self.physical_predicate.is_some()
             || self.orphan_predicate.is_some()
+            || self.output_projection.is_some()
             || (entry.simple.is_none() && entry.rewrite.select.is_some());
         if !has_lazy_stage {
             if let Some(fast) = &entry.simple {
@@ -245,6 +254,9 @@ impl LogicalScanIter {
         }
         if let Some(pred) = &self.orphan_predicate {
             lazy = lazy.filter(pred.clone());
+        }
+        if let Some(cols) = &self.output_projection {
+            lazy = lazy.select(cols.clone());
         }
         crate::engine::collect_streaming_single(lazy)
             .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))
