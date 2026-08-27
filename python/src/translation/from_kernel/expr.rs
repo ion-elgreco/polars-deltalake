@@ -395,7 +395,18 @@ fn translate_binary_expr(
         BinaryExpressionOp::Plus => lhs + rhs,
         BinaryExpressionOp::Minus => lhs - rhs,
         BinaryExpressionOp::Multiply => lhs * rhs,
-        BinaryExpressionOp::Divide => lhs / rhs,
+        // Kernel divides integers as integers and errors on a zero divisor;
+        // polars `/` is always true division, so `7 / 2` would read back 3.5
+        // as a Float64 where the plan declares LONG 3, and `7 / 0` as inf.
+        // Kernel emits no Divide today, so refuse rather than diverge
+        // silently — the day it does, this names what to implement.
+        BinaryExpressionOp::Divide => {
+            return Err(Error::Unsupported(
+                "translate_expr: Divide has no polars form matching kernel's \
+                 integer-division semantics"
+                    .into(),
+            ));
+        }
     })
 }
 
@@ -845,6 +856,44 @@ mod array_shape_tests {
                 translate_variadic_expr(&nested, None).is_err(),
                 "a list-typed ARRAY input must decline, not splice",
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_tests {
+    use super::*;
+
+    /// Kernel divides LONG by LONG as integers and errors on a zero divisor
+    /// (`evaluate_expression`'s `div`); polars `/` is true division, so a
+    /// translated `Divide` would answer 3.5 where the plan declares LONG 3.
+    #[test]
+    fn divide_declines_rather_than_true_divide() {
+        let expr = BinaryExpression {
+            op: BinaryExpressionOp::Divide,
+            left: Box::new(Expression::from(ColumnName::new(["a"]))),
+            right: Box::new(Expression::literal(2i64)),
+        };
+        assert!(
+            translate_binary_expr(&expr, None).is_err(),
+            "Divide has no polars form matching kernel's integer semantics",
+        );
+    }
+
+    /// The other three arms agree with kernel on LONG operands and stay wired.
+    #[test]
+    fn plus_minus_multiply_translate() {
+        for op in [
+            BinaryExpressionOp::Plus,
+            BinaryExpressionOp::Minus,
+            BinaryExpressionOp::Multiply,
+        ] {
+            let expr = BinaryExpression {
+                op,
+                left: Box::new(Expression::from(ColumnName::new(["a"]))),
+                right: Box::new(Expression::literal(2i64)),
+            };
+            assert!(translate_binary_expr(&expr, None).is_ok(), "{op:?}");
         }
     }
 }
