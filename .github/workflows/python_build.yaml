@@ -89,7 +89,10 @@ jobs:
       - name: Build and install polars-deltalake
         run: just develop
 
+      # Linux Rust tests live in the dedicated `rust` job; Windows keeps the
+      # step here to reuse this job's dependency build (no sccache there).
       - name: Run Rust unit tests
+        if: ${{ runner.os == 'Windows' }}
         run: just test-rust
 
       - name: Run local tests
@@ -99,3 +102,51 @@ jobs:
       - name: Run integration tests
         if: ${{ always() && runner.os == 'Linux' }}
         run: just test-integration
+
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+
+      # `test-rust` only needs the venv interpreter to link libpython —
+      # no maturin build.
+      - name: setup venv
+        run: just venv
+
+      - name: Run Rust unit tests
+        run: just test-rust
+
+  spark:
+    name: Spark tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+
+      - name: Build and install polars-deltalake
+        run: just develop
+
+      # Spark 4 needs JDK 17 or 21. The runner image ships Temurin under
+      # JAVA_HOME_17_X64; pointing at it directly beats pinning a setup-java
+      # action and keeps the spark markers from silently auto-skipping on a
+      # missing JDK.
+      - name: Run spark tests
+        run: JAVA_HOME="$JAVA_HOME_17_X64" just test-spark
