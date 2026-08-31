@@ -338,7 +338,7 @@ mod visit_add_rows_tests {
     use super::*;
 
     /// The protocol requires `add.partitionValues` (possibly empty, never
-    /// absent), and a defaulted empty map silently mis-prunes in partition
+    /// absent), and a defaulted empty map silently misprunes in partition
     /// eval — so the visitor must error like it does for every sibling
     /// field, not fall back to `{}`. The JSON/parquet non-nullable guards
     /// catch this upstream today; this pins the last line of defense.
@@ -572,7 +572,7 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
                     ));
                 };
                 // Required by the protocol (possibly empty, never absent);
-                // a defaulted `{}` would silently mis-prune in partition eval.
+                // a defaulted `{}` would silently missprune in partition eval.
                 let partition_values = getters[1]
                     .get_map(i, "add.partitionValues")?
                     .ok_or_else(|| {

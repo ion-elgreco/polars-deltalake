@@ -456,12 +456,16 @@ _E2E_CASES = [
     pytest.param(pl.col("s").is_in(["a", "c"]), [1, 3], id="is-in-strings"),
     # Float-spelled elements against an integer column: the integral ones
     # narrow, the fractional ones can match nothing and drop.
-    pytest.param(pl.col("small").is_in([2.0]), [2], id="is-in-float-lits"),
+    pytest.param(pl.col("small").is_in([2.0]), [2], id="is-in-float-literals"),
     pytest.param(
-        pl.col("small").is_in([2.0, 3.0]), [2, 3], id="is-in-float-lits-multi"
+        pl.col("small").is_in([2.0, 3.0]), [2, 3], id="is-in-float-literalss-multi"
     ),
-    pytest.param(pl.col("id").is_in([1.0, 2.5]), [1], id="is-in-float-lits-fractional"),
-    pytest.param(pl.col("id").is_in([2.5]), [], id="is-in-float-lits-all-fractional"),
+    pytest.param(
+        pl.col("id").is_in([1.0, 2.5]), [1], id="is-in-float-literals-fractional"
+    ),
+    pytest.param(
+        pl.col("id").is_in([2.5]), [], id="is-in-float-literals-all-fractional"
+    ),
     pytest.param(
         pl.col("d").is_in([date(2024, 1, 1), date(2024, 12, 31)]),
         [1, 3],
