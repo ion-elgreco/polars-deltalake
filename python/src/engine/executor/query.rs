@@ -59,8 +59,7 @@ impl PolarsPlanExecutor {
     pub(super) fn execute_query(&self, plan: Plan) -> DeltaResult<PlanResult> {
         let mut states: Vec<NodeState> = Vec::with_capacity(plan.nodes.len());
         for node in plan.nodes {
-            let state = self.eval_node(node, &states)?;
-            states.push(state);
+            states.push(self.eval_node(node, &states)?);
         }
         let terminal = states
             .pop()
@@ -351,12 +350,14 @@ fn row_index_as_long(lf: LazyFrame, name: &PlSmallStr) -> LazyFrame {
 }
 
 /// ScanParquet contract (kernel `plans/ir/nodes.rs`): a missing value for a
-/// non-nullable field is an error, not a null-fill — but polars' unified
-/// scan `Insert` policies null-fill silently. Each read column carrying a
-/// non-nullable constraint gets a guard riding the column itself (a bare
-/// validation expr would be projection-pruned): null under a present parent
-/// errors, mirroring the JSON arm's `align`. A present-but-null value in a
-/// corrupt file trips the same check.
+/// non-nullable field must fail the read, but polars'
+/// `MissingColumnsPolicy::Insert` (`unified_scan_args`) fills absent
+/// columns and struct fields with nulls instead. Each constrained read
+/// column gets a null check `map`ped onto the column itself — a standalone
+/// check expr has no consumer, so projection pruning would delete it. A
+/// null errors only when every ancestor is present (a child under a NULL
+/// ancestor holds no value), the same rule as the JSON arm's `align`; a
+/// real null from a corrupt file trips the same check.
 fn non_nullable_guards(read_schema: &StructType) -> Vec<Expr> {
     fn has_constraint(f: &StructField) -> bool {
         !f.nullable

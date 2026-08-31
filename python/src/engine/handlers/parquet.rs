@@ -90,8 +90,10 @@ pub(crate) fn split_metadata_columns(
     let mut row_index: Option<PlSmallStr> = None;
     let mut file_path: Option<PlSmallStr> = None;
     let mut cols: Vec<(PlSmallStr, SyntheticColumn)> = Vec::new();
+    let mut read_fields: Vec<StructField> = Vec::new();
     for f in schema.fields() {
         let Some(spec) = f.get_metadata_column_spec() else {
+            read_fields.push(f.clone());
             continue;
         };
         let name = PlSmallStr::from_str(f.name.as_str());
@@ -111,11 +113,6 @@ pub(crate) fn split_metadata_columns(
         }
         cols.push((name, kind));
     }
-    let read_fields: Vec<StructField> = schema
-        .fields()
-        .filter(|f| f.get_metadata_column_spec().is_none())
-        .cloned()
-        .collect();
     Ok((StructType::try_new(read_fields)?, MetadataColumns { cols }))
 }
 
