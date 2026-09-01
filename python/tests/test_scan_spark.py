@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from polars_deltalake import scan_delta
 
@@ -38,8 +39,16 @@ def test_int96_timestamps(
 
     out = scan_delta(path).collect().sort("id")
 
-    assert out.schema["ts"] == pl.Datetime("us", "UTC")
-    assert out["ts"].to_list() == [
-        datetime(2024, 1, 15, 12, 30, 45, 123456, tzinfo=timezone.utc),
-        datetime(1999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
-    ]
+    assert_frame_equal(
+        out,
+        pl.DataFrame(
+            {
+                "id": [1, 2],
+                "ts": [
+                    datetime(2024, 1, 15, 12, 30, 45, 123456, tzinfo=timezone.utc),
+                    datetime(1999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
+                ],
+            },
+            schema={"id": pl.Int32, "ts": pl.Datetime("us", "UTC")},
+        ),
+    )

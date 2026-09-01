@@ -20,6 +20,7 @@ import polars as pl
 import pytest
 from _log_helpers import rewrite_log_actions
 from deltalake import write_deltalake
+from polars.testing import assert_frame_equal
 
 from polars_deltalake import scan_delta
 
@@ -68,6 +69,4 @@ class TestStaleAnnotations:
 
     def test_scan_uses_logical_names(self, stale_annotations):
         out = scan_delta(stale_annotations).collect().sort("id")
-        assert out.columns == ["id", "v"]
-        assert out["id"].to_list() == [1, 2]
-        assert out["v"].to_list() == ["a", "b"]
+        assert_frame_equal(out, pl.DataFrame({"id": [1, 2], "v": ["a", "b"]}))

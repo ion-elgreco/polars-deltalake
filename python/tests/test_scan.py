@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from polars_deltalake import TableScan, TableState, scan_delta
 
@@ -56,10 +57,16 @@ class TestBasicScan:
     def test_full_table(self, simple_table):
         lf = scan_delta(str(simple_table))
         out = lf.collect().sort("id")
-        assert out.shape == (5, 3)
-        assert out["id"].to_list() == [1, 2, 3, 4, 5]
-        assert out["name"].to_list() == ["alice", "bob", "carol", "dan", "eve"]
-        assert out["active"].to_list() == [True, False, True, True, False]
+        assert_frame_equal(
+            out,
+            pl.DataFrame(
+                {
+                    "id": [1, 2, 3, 4, 5],
+                    "name": ["alice", "bob", "carol", "dan", "eve"],
+                    "active": [True, False, True, True, False],
+                }
+            ),
+        )
 
     def test_returns_lazyframe(self, simple_table):
         lf = scan_delta(str(simple_table))
@@ -67,8 +74,15 @@ class TestBasicScan:
 
     def test_projection_pushdown(self, simple_table):
         out = scan_delta(str(simple_table)).select("id", "name").collect().sort("id")
-        assert out.columns == ["id", "name"]
-        assert out["id"].to_list() == [1, 2, 3, 4, 5]
+        assert_frame_equal(
+            out,
+            pl.DataFrame(
+                {
+                    "id": [1, 2, 3, 4, 5],
+                    "name": ["alice", "bob", "carol", "dan", "eve"],
+                }
+            ),
+        )
 
     def test_slice_pushdown(self, simple_table):
         out = scan_delta(str(simple_table)).head(2).collect()
@@ -78,7 +92,16 @@ class TestBasicScan:
         out = (
             scan_delta(str(simple_table)).filter(pl.col("active")).collect().sort("id")
         )
-        assert out["id"].to_list() == [1, 3, 4]
+        assert_frame_equal(
+            out,
+            pl.DataFrame(
+                {
+                    "id": [1, 3, 4],
+                    "name": ["alice", "carol", "dan"],
+                    "active": [True, True, True],
+                }
+            ),
+        )
 
     def test_multiple_files(self, tmp_path):
         """Multi-commit table — exercises the iterator across files."""
@@ -91,7 +114,7 @@ class TestBasicScan:
         write_deltalake(table_path, b.to_arrow(), mode="append")
 
         out = scan_delta(table_path).collect().sort("x")
-        assert out["x"].to_list() == [1, 2, 3, 4, 5, 6]
+        assert_frame_equal(out, pl.DataFrame({"x": [1, 2, 3, 4, 5, 6]}))
 
     def test_time_travel(self, tmp_path):
         """Reading at version=0 should see only the first commit's rows."""
@@ -104,10 +127,10 @@ class TestBasicScan:
         write_deltalake(table_path, b.to_arrow(), mode="append")
 
         v0 = scan_delta(table_path, version=0).collect().sort("x")
-        assert v0["x"].to_list() == [1, 2]
+        assert_frame_equal(v0, pl.DataFrame({"x": [1, 2]}))
 
         latest = scan_delta(table_path).collect().sort("x")
-        assert latest["x"].to_list() == [1, 2, 3, 4]
+        assert_frame_equal(latest, pl.DataFrame({"x": [1, 2, 3, 4]}))
 
 
 class TestPartitionedScan:
@@ -127,10 +150,7 @@ class TestPartitionedScan:
         write_deltalake(table_path, df.to_arrow(), partition_by=["region"])
 
         out = scan_delta(table_path).collect().sort("id")
-        assert set(out.columns) == {"region", "id", "value"}
-        assert out["region"].to_list() == ["eu", "eu", "us", "us"]
-        assert out["id"].to_list() == [1, 2, 3, 4]
-        assert out["value"].to_list() == [10.0, 20.0, 30.0, 40.0]
+        assert_frame_equal(out, df)
 
     def test_partition_col_only_projection(self, tmp_path):
         """Projecting only the partition column still works (the partition
@@ -143,8 +163,7 @@ class TestPartitionedScan:
         write_deltalake(table_path, df.to_arrow(), partition_by=["region"])
 
         out = scan_delta(table_path).select("region").collect().sort("region")
-        assert out.columns == ["region"]
-        assert out["region"].to_list() == ["eu", "us"]
+        assert_frame_equal(out, pl.DataFrame({"region": ["eu", "us"]}))
 
     def test_multi_column_partition(self, tmp_path):
         """Multi-column partition layout — `Transform` injects two literal cols."""
@@ -161,9 +180,7 @@ class TestPartitionedScan:
         write_deltalake(table_path, df.to_arrow(), partition_by=["year", "month"])
 
         out = scan_delta(table_path).collect().sort(["year", "month"])
-        assert out["year"].to_list() == [2024, 2024, 2025]
-        assert out["month"].to_list() == [1, 2, 1]
-        assert out["value"].to_list() == [10, 20, 30]
+        assert_frame_equal(out, df)
 
 
 class TestPredicatePushdown:
@@ -179,8 +196,7 @@ class TestPredicatePushdown:
             .collect()
             .sort("id")
         )
-        assert out["g"].to_list() == ["b", "b"]
-        assert out["id"].to_list() == [3, 4]
+        assert_frame_equal(out, pl.DataFrame({"g": ["b", "b"], "id": [3, 4]}))
 
     def test_and_chain(self, multi_file_partitioned):
         """Partition + data AND — kernel file-skips `g`, polars-io row-filters `id`."""
@@ -189,7 +205,7 @@ class TestPredicatePushdown:
             .filter((pl.col("g") == "b") & (pl.col("id") >= 4))
             .collect()
         )
-        assert out["id"].to_list() == [4]
+        assert_frame_equal(out, pl.DataFrame({"g": ["b"], "id": [4]}))
 
     def test_or_chain(self, multi_file_partitioned):
         """OR across partitions — single conjunct, translatable, kernel
@@ -200,8 +216,9 @@ class TestPredicatePushdown:
             .collect()
             .sort("id")
         )
-        assert out["g"].to_list() == ["a", "a", "c", "c"]
-        assert out["id"].to_list() == [1, 2, 5, 6]
+        assert_frame_equal(
+            out, pl.DataFrame({"g": ["a", "a", "c", "c"], "id": [1, 2, 5, 6]})
+        )
 
     def test_is_null(self, tmp_path):
         """Kernel `UnaryPredicate`."""
@@ -212,7 +229,12 @@ class TestPredicatePushdown:
         write_deltalake(table_path, df.to_arrow())
 
         out = scan_delta(table_path).filter(pl.col("name").is_null()).collect()
-        assert out["id"].to_list() == [2]
+        assert_frame_equal(
+            out,
+            pl.DataFrame(
+                {"id": [2], "name": [None]}, schema_overrides={"name": pl.String}
+            ),
+        )
 
     def test_is_between(self, multi_file_partitioned):
         """is_between → kernel `>=` AND `<=`."""
@@ -222,7 +244,9 @@ class TestPredicatePushdown:
             .collect()
             .sort("id")
         )
-        assert out["id"].to_list() == [2, 3, 4, 5]
+        assert_frame_equal(
+            out, pl.DataFrame({"g": ["a", "b", "b", "c"], "id": [2, 3, 4, 5]})
+        )
 
     def test_is_in(self, multi_file_partitioned):
         """is_in → kernel `In` binary predicate."""
@@ -232,7 +256,9 @@ class TestPredicatePushdown:
             .collect()
             .sort("id")
         )
-        assert out["g"].to_list() == ["a", "a", "c", "c"]
+        assert_frame_equal(
+            out, pl.DataFrame({"g": ["a", "a", "c", "c"], "id": [1, 2, 5, 6]})
+        )
 
     def test_mixed_untranslatable_data_leg(self, multi_file_partitioned):
         """Kernel handles partition `g == 'b'`, polars-io row-filters the
@@ -242,7 +268,7 @@ class TestPredicatePushdown:
             .filter((pl.col("g") == "b") & (pl.col("id").abs() >= 4))
             .collect()
         )
-        assert out["id"].to_list() == [4]
+        assert_frame_equal(out, pl.DataFrame({"g": ["b"], "id": [4]}))
 
     def test_mixed_untranslatable_partition_leg(self, multi_file_partitioned):
         """Option-2 polars-driven file-skip handles untranslatable
@@ -252,7 +278,7 @@ class TestPredicatePushdown:
             .filter((pl.col("g").str.to_uppercase() == "B") & (pl.col("id") >= 4))
             .collect()
         )
-        assert out["id"].to_list() == [4]
+        assert_frame_equal(out, pl.DataFrame({"g": ["b"], "id": [4]}))
 
     def test_three_way_and(self, multi_file_partitioned):
         """Three-conjunct AND — partition + translatable data + untranslatable data."""
@@ -264,7 +290,7 @@ class TestPredicatePushdown:
             .collect()
             .sort("id")
         )
-        assert out["id"].to_list() == [3, 4]
+        assert_frame_equal(out, pl.DataFrame({"g": ["b", "b"], "id": [3, 4]}))
 
     def test_bare_bool_column(self, tmp_path):
         """Kernel `Predicate::BooleanExpression(Column(...))`."""
@@ -275,8 +301,7 @@ class TestPredicatePushdown:
         write_deltalake(table_path, df.to_arrow())
 
         out = scan_delta(table_path).filter(pl.col("active")).collect().sort("id")
-        assert out["id"].to_list() == [1, 3]
-        assert out["active"].to_list() == [True, True]
+        assert_frame_equal(out, pl.DataFrame({"id": [1, 3], "active": [True, True]}))
 
     def test_ne_missing_distinct(self, tmp_path):
         """`ne_missing` → kernel `Predicate::Binary(Distinct)`. Unlike `!=`,
@@ -293,8 +318,7 @@ class TestPredicatePushdown:
             .collect()
             .sort("id")
         )
-        assert out["id"].to_list() == [3, 4]
-        assert out["v"].to_list() == [7, None]
+        assert_frame_equal(out, pl.DataFrame({"id": [3, 4], "v": [7, None]}))
 
     def test_not_via_neq(self, multi_file_partitioned):
         """`!=` → kernel `Predicate::Not(Binary(Equal))`."""
@@ -304,8 +328,9 @@ class TestPredicatePushdown:
             .collect()
             .sort("id")
         )
-        assert out["g"].to_list() == ["a", "a", "c", "c"]
-        assert out["id"].to_list() == [1, 2, 5, 6]
+        assert_frame_equal(
+            out, pl.DataFrame({"g": ["a", "a", "c", "c"], "id": [1, 2, 5, 6]})
+        )
 
     def test_not_around_is_null(self, tmp_path):
         """`~is_null()` → kernel `Predicate::Not(Unary(IsNull))`."""
@@ -321,8 +346,7 @@ class TestPredicatePushdown:
             .collect()
             .sort("id")
         )
-        assert out["id"].to_list() == [1, 3]
-        assert out["name"].to_list() == ["a", "c"]
+        assert_frame_equal(out, pl.DataFrame({"id": [1, 3], "name": ["a", "c"]}))
 
     def test_untranslatable_data_op(self, simple_table):
         """Untranslatable string op on a data column — polars-io's row-level
@@ -332,7 +356,9 @@ class TestPredicatePushdown:
             .filter(pl.col("name").str.starts_with("a"))
             .collect()
         )
-        assert out["name"].to_list() == ["alice"]
+        assert_frame_equal(
+            out, pl.DataFrame({"id": [1], "name": ["alice"], "active": [True]})
+        )
 
     @pytest.mark.xfail(
         reason="polars optimizer floor-casts sub-µs Datetime(ns) literals to "
@@ -359,7 +385,7 @@ class TestPredicatePushdown:
             .filter(pl.col("ts") < pl.lit(1_500).cast(pl.Datetime("ns")))
             .collect()
         )
-        assert out["id"].to_list() == [1]
+        assert_frame_equal(out, df)
 
 
 class TestPartitionSkip:
@@ -373,8 +399,7 @@ class TestPartitionSkip:
             .collect()
             .sort("id")
         )
-        assert out["g"].to_list() == ["b", "b"]
-        assert out["id"].to_list() == [3, 4]
+        assert_frame_equal(out, pl.DataFrame({"g": ["b", "b"], "id": [3, 4]}))
 
     def test_untranslatable_dt_year(self, tmp_path):
         """Date partition with `dt.year()` — non-string-cast partition col."""
@@ -401,7 +426,9 @@ class TestPartitionSkip:
             .collect()
             .sort("id")
         )
-        assert out["id"].to_list() == [3, 4]
+        assert_frame_equal(
+            out, pl.DataFrame({"d": [date(2024, 3, 15)] * 2, "id": [3, 4]})
+        )
 
     def test_drops_every_file(self, multi_file_partitioned):
         out = (
@@ -525,7 +552,7 @@ class TestMixedAtomicConjunct:
             .collect()
             .sort("id")
         )
-        assert out["id"].to_list() == [1, 2, 3]
+        assert_frame_equal(out, pl.DataFrame({"g": ["a", "a", "b"], "id": [1, 2, 3]}))
 
     def test_unprojected_partition_column_is_read_then_dropped(
         self, multi_file_partitioned
@@ -539,8 +566,7 @@ class TestMixedAtomicConjunct:
             ["id"], None, (pl.col("g").str.to_uppercase() == "A") | (pl.col("id") == 3)
         )
         out = _drain(scan).sort("id")
-        assert out.columns == ["id"]
-        assert out["id"].to_list() == [1, 2, 3]
+        assert_frame_equal(out, pl.DataFrame({"id": [1, 2, 3]}))
 
     def test_unprojected_data_column_is_read_then_dropped(self, multi_file_partitioned):
         """Same widening for the data leg: `id` is read only to evaluate the
@@ -550,8 +576,7 @@ class TestMixedAtomicConjunct:
             ["g"], None, (pl.col("g").str.to_uppercase() == "A") | (pl.col("id") == 3)
         )
         out = _drain(scan).sort("g")
-        assert out.columns == ["g"]
-        assert out["g"].to_list() == ["a", "a", "b"]
+        assert_frame_equal(out, pl.DataFrame({"g": ["a", "a", "b"]}))
 
     def test_widening_survives_full_partition_pruning(self, multi_file_partitioned):
         """AND-ing a partition conjunct that prunes every file returns no rows
@@ -591,8 +616,7 @@ class TestDeletionVectors:
         DeltaTable(table_path).delete("id >= 3")
 
         out = scan_delta(table_path).collect().sort("id")
-        assert out["id"].to_list() == [1, 2]
-        assert out["name"].to_list() == ["a", "b"]
+        assert_frame_equal(out, pl.DataFrame({"id": [1, 2], "name": ["a", "b"]}))
 
     def test_dv_enabled_delete(self, tmp_path):
         """DELETE on a DV-enabled table — `deltalake` still rewrites the
@@ -610,7 +634,9 @@ class TestDeletionVectors:
         DeltaTable(table_path).delete("id == 2 OR id == 4")
 
         out = scan_delta(table_path).collect().sort("id")
-        assert out["id"].to_list() == [1, 3, 5]
+        assert_frame_equal(
+            out, pl.DataFrame({"id": [1, 3, 5], "name": ["a", "c", "e"]})
+        )
 
     def test_dv_with_projection(self, tmp_path):
         """DELETE + projection on a DV-enabled table — deleted rows must not
@@ -628,7 +654,7 @@ class TestDeletionVectors:
         DeltaTable(table_path).delete("id < 4")
 
         out = scan_delta(table_path).select("value").collect().sort("value")
-        assert out["value"].to_list() == [40, 50, 60]
+        assert_frame_equal(out, pl.DataFrame({"value": [40, 50, 60]}))
 
     def test_dv_with_predicate(self):
         """A DV indexes the file's *physical* rows, so a pushed-down predicate
@@ -661,7 +687,16 @@ class TestEagerRead:
 
         out = read_delta(str(simple_table)).sort("id")
         assert isinstance(out, pl.DataFrame)
-        assert out["id"].to_list() == [1, 2, 3, 4, 5]
+        assert_frame_equal(
+            out,
+            pl.DataFrame(
+                {
+                    "id": [1, 2, 3, 4, 5],
+                    "name": ["alice", "bob", "carol", "dan", "eve"],
+                    "active": [True, False, True, True, False],
+                }
+            ),
+        )
 
     def test_version_arg(self, tmp_path):
         """`read_delta` honours the `version` kwarg for time travel."""
@@ -674,7 +709,7 @@ class TestEagerRead:
         write_deltalake(table_path, pl.DataFrame({"x": [2]}).to_arrow(), mode="append")
 
         v0 = read_delta(table_path, version=0)
-        assert v0["x"].to_list() == [1]
+        assert_frame_equal(v0, pl.DataFrame({"x": [1]}))
 
     @pytest.mark.parametrize("engine", ["auto", "in-memory", "streaming"])
     def test_engine_arg(self, simple_table, engine):
@@ -682,8 +717,16 @@ class TestEagerRead:
         from polars_deltalake import read_delta
 
         out = read_delta(str(simple_table), engine=engine).sort("id")
-        assert out.shape == (5, 3)
-        assert out["id"].to_list() == [1, 2, 3, 4, 5]
+        assert_frame_equal(
+            out,
+            pl.DataFrame(
+                {
+                    "id": [1, 2, 3, 4, 5],
+                    "name": ["alice", "bob", "carol", "dan", "eve"],
+                    "active": [True, False, True, True, False],
+                }
+            ),
+        )
 
 
 class TestScanOrderStability:

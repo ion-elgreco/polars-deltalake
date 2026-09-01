@@ -11,6 +11,7 @@ import polars as pl
 import pytest
 from _log_helpers import rewrite_log_actions
 from deltalake import write_deltalake
+from polars.testing import assert_frame_equal
 
 from polars_deltalake import scan_delta
 
@@ -75,5 +76,5 @@ def test_unparsable_stats_reads_every_row(tmp_path: Path, stats: str) -> None:
     write_deltalake(table, pl.DataFrame({"x": [3, 4]}).to_arrow(), mode="append")
     _rewrite_add_stats(table, stats, version=0)
 
-    got = scan_delta(str(table)).filter(pl.col("x") >= 0).collect()
-    assert sorted(got["x"].to_list()) == [1, 2, 3, 4]
+    got = scan_delta(str(table)).filter(pl.col("x") >= 0).collect().sort("x")
+    assert_frame_equal(got, pl.DataFrame({"x": [1, 2, 3, 4]}))

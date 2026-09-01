@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from polars_deltalake import scan_delta
 
@@ -55,6 +56,19 @@ def column_mapped_table(
     return path
 
 
+# The rows the fixture INSERTs, under the logical names.
+_TABLE_DF = pl.DataFrame(
+    {
+        "id": [1, 2],
+        "person": [
+            {"name": "alice", "age": 30},
+            {"name": "bob", "age": 40},
+        ],
+        "address": [{"geo": {"lat": 1.5}}, {"geo": {"lat": 2.5}}],
+    }
+)
+
+
 class TestFixture:
     def test_physical_names_differ_at_every_level(self, column_mapped_table):
         """Without this the suite would pass on an unmapped table."""
@@ -78,7 +92,7 @@ class TestTopLevelNames:
 
     def test_top_level_values(self, column_mapped_table):
         out = scan_delta(column_mapped_table).collect().sort("id")
-        assert out["id"].to_list() == [1, 2]
+        assert_frame_equal(out, _TABLE_DF)
 
 
 class TestNestedNames:
@@ -103,14 +117,7 @@ class TestNestedNames:
     def test_nested_values_survive_the_rename(self, column_mapped_table):
         """A cast-based rename would produce this schema with all-null values."""
         out = scan_delta(column_mapped_table).collect().sort("id")
-        assert out["person"].to_list() == [
-            {"name": "alice", "age": 30},
-            {"name": "bob", "age": 40},
-        ]
-        assert out["address"].to_list() == [
-            {"geo": {"lat": 1.5}},
-            {"geo": {"lat": 2.5}},
-        ]
+        assert_frame_equal(out, _TABLE_DF)
 
     def test_select_nested_logical_field(self, column_mapped_table):
         out = (
@@ -118,7 +125,7 @@ class TestNestedNames:
             .select(pl.col("person").struct.field("name").alias("name"))
             .collect()
         )
-        assert sorted(out["name"].to_list()) == ["alice", "bob"]
+        assert_frame_equal(out.sort("name"), pl.DataFrame({"name": ["alice", "bob"]}))
 
     def test_filter_on_nested_logical_field(self, column_mapped_table):
         out = (
@@ -126,5 +133,4 @@ class TestNestedNames:
             .filter(pl.col("person").struct.field("name") == "alice")
             .collect()
         )
-        assert out.height == 1
-        assert out["id"].to_list() == [1]
+        assert_frame_equal(out, _TABLE_DF.head(1))

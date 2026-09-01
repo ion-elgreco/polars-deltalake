@@ -20,6 +20,7 @@ from typing import Any, Callable
 import polars as pl
 import pytest
 from _log_helpers import rewrite_log_actions
+from polars.testing import assert_frame_equal
 
 from polars_deltalake import scan_delta
 
@@ -63,8 +64,16 @@ def _rewrite_partition_values(
     rewrite_log_actions(table_path, mutate, version)
 
 
-def _read_p(table_path: str) -> list[Any]:
-    return scan_delta(table_path).collect().sort("v")["p"].to_list()
+def _read(table_path: str) -> pl.DataFrame:
+    return scan_delta(table_path).collect().sort("v")
+
+
+def _p_frame(values: list[Any], dtype: pl.DataType) -> pl.DataFrame:
+    """The frame `_write_partitioned(_, values, dtype)` reads back as."""
+    return pl.DataFrame(
+        {"p": values, "v": list(range(len(values)))},
+        schema_overrides={"p": dtype},
+    )
 
 
 class TestRoundtrip:
@@ -98,13 +107,11 @@ class TestRoundtrip:
     )
     def test_dtype_roundtrip(self, tmp_path, dtype, value):
         table = _write_partitioned(tmp_path / "t", [value], dtype)
-        out = scan_delta(table).collect()
-        assert out["p"].to_list() == [value]
-        assert out.schema["p"] == dtype
+        assert_frame_equal(_read(table), _p_frame([value], dtype))
 
     def test_multi_value_partition_roundtrip(self, tmp_path):
         table = _write_partitioned(tmp_path / "t", [3, 1, 2], pl.Int32())
-        assert sorted(_read_p(table)) == [1, 2, 3]
+        assert_frame_equal(_read(table), _p_frame([3, 1, 2], pl.Int32()))
 
 
 class TestNullProducingValues:
@@ -113,22 +120,22 @@ class TestNullProducingValues:
     def test_missing_key_is_null(self, tmp_path):
         table = _write_partitioned(tmp_path / "t", [7], pl.Int32())
         _rewrite_partition_values(table, lambda _: _DROP)
-        assert _read_p(table) == [None]
+        assert_frame_equal(_read(table), _p_frame([None], pl.Int32()))
 
     def test_json_null_is_null(self, tmp_path):
         table = _write_partitioned(tmp_path / "t", [7], pl.Int32())
         _rewrite_partition_values(table, lambda _: None)
-        assert _read_p(table) == [None]
+        assert_frame_equal(_read(table), _p_frame([None], pl.Int32()))
 
     def test_empty_string_is_null_for_non_string(self, tmp_path):
         table = _write_partitioned(tmp_path / "t", [7], pl.Int32())
         _rewrite_partition_values(table, lambda _: "")
-        assert _read_p(table) == [None]
+        assert_frame_equal(_read(table), _p_frame([None], pl.Int32()))
 
     def test_empty_string_is_itself_for_string(self, tmp_path):
         table = _write_partitioned(tmp_path / "t", ["a"], pl.String())
         _rewrite_partition_values(table, lambda _: "")
-        assert _read_p(table) == [""]
+        assert_frame_equal(_read(table), _p_frame([""], pl.String()))
 
 
 class TestUnparsableValueFails:
@@ -178,7 +185,7 @@ class TestAcceptedSpellings:
     def test_boolean_is_case_insensitive(self, tmp_path, spelling):
         table = _write_partitioned(tmp_path / "t", [False], pl.Boolean())
         _rewrite_partition_values(table, lambda _: spelling)
-        assert _read_p(table) == [True]
+        assert_frame_equal(_read(table), _p_frame([True], pl.Boolean()))
 
     @pytest.mark.parametrize(
         "spelling",
@@ -194,7 +201,7 @@ class TestAcceptedSpellings:
         expected = datetime.datetime(2021, 1, 2, 8, 45, tzinfo=UTC)
         table = _write_partitioned(tmp_path / "t", [expected], pl.Datetime("us", "UTC"))
         _rewrite_partition_values(table, lambda _: spelling)
-        assert _read_p(table) == [expected]
+        assert_frame_equal(_read(table), _p_frame([expected], pl.Datetime("us", "UTC")))
 
     def test_timestamp_offset_is_normalized_to_utc(self, tmp_path):
         table = _write_partitioned(
@@ -203,7 +210,13 @@ class TestAcceptedSpellings:
             pl.Datetime("us", "UTC"),
         )
         _rewrite_partition_values(table, lambda _: "2021-01-02T14:15:00+05:30")
-        assert _read_p(table) == [datetime.datetime(2021, 1, 2, 8, 45, tzinfo=UTC)]
+        assert_frame_equal(
+            _read(table),
+            _p_frame(
+                [datetime.datetime(2021, 1, 2, 8, 45, tzinfo=UTC)],
+                pl.Datetime("us", "UTC"),
+            ),
+        )
 
     @pytest.mark.parametrize(
         ("dtype", "value", "spelling"),
@@ -219,7 +232,7 @@ class TestAcceptedSpellings:
         """Spellings `PrimitiveType::parse_scalar` accepts beyond the canonical form."""
         table = _write_partitioned(tmp_path / "t", [value], dtype)
         _rewrite_partition_values(table, lambda _: spelling)
-        assert _read_p(table) == [value]
+        assert_frame_equal(_read(table), _p_frame([value], dtype))
 
     @pytest.mark.parametrize(
         ("dtype", "value", "spelling"),
@@ -264,7 +277,9 @@ class TestAcceptedSpellings:
             table,
             lambda old: "2021-03-04T10:30:00Z" if old.startswith("2021-03-04") else old,
         )
-        assert _read_p(table) == [first, second]
+        assert_frame_equal(
+            _read(table), _p_frame([first, second], pl.Datetime("us", "UTC"))
+        )
 
 
 class TestPruningParsesLikeProjection:
@@ -290,7 +305,7 @@ class TestPruningParsesLikeProjection:
         # `.dt.year()` has no kernel translation, so this routes to the
         # polars-side partition-pruning frame.
         got = scan_delta(table).filter(pl.col("p").dt.year() == 2021).collect()
-        assert got["v"].to_list() == [0]
+        assert_frame_equal(got, _p_frame([value], dtype))
 
     def test_unreferenced_partition_column_is_not_materialized(self, tmp_path):
         """A boolean partition column polars cannot cast from string must not
@@ -304,7 +319,7 @@ class TestPruningParsesLikeProjection:
         )
         write_deltalake(table, df.to_arrow(), partition_by=["g", "flag"])
         got = scan_delta(table).filter(pl.col("g").str.to_uppercase() == "A").collect()
-        assert got["v"].to_list() == [0]
+        assert_frame_equal(got, pl.DataFrame({"g": ["a"], "flag": [True], "v": [0]}))
 
     def test_stale_partition_key_is_ignored(self, tmp_path):
         """An extra key a foreign writer left in `partitionValues` names no
@@ -318,7 +333,7 @@ class TestPruningParsesLikeProjection:
         rewrite_log_actions(table, add_stale_key)
 
         got = scan_delta(table).filter(pl.col("p").str.to_uppercase() == "A").collect()
-        assert got["v"].to_list() == [0]
+        assert_frame_equal(got, pl.DataFrame({"p": ["a"], "v": [0]}))
 
 
 class TestTranslatablePartitionPredicateIsExact:
@@ -339,5 +354,11 @@ class TestTranslatablePartitionPredicateIsExact:
             schema_overrides={"a": pl.Int32(), "b": pl.Int32()},
         )
         write_deltalake(table, df.to_arrow(), partition_by=["a", "b"])
-        got = scan_delta(table).filter(pl.col("a") == pl.col("b")).collect()
-        assert sorted(got["v"].to_list()) == [0, 2]
+        got = scan_delta(table).filter(pl.col("a") == pl.col("b")).collect().sort("v")
+        assert_frame_equal(
+            got,
+            pl.DataFrame(
+                {"a": [1, 2], "b": [1, 2], "v": [0, 2]},
+                schema_overrides={"a": pl.Int32, "b": pl.Int32},
+            ),
+        )
