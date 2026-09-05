@@ -61,7 +61,7 @@ jobs:
   testing:
     name: Python tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 45 }}
     permissions:
       contents: read
     env:
