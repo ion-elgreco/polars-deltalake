@@ -143,6 +143,40 @@ pub(crate) fn parse_ndjson_inferred(bytes: &[u8]) -> DeltaResult<DataFrame> {
     Ok(df)
 }
 
+/// One or more commit files parsed as a single NDJSON document, in file
+/// order. `rows_per_file` recovers per-file columns after the parse.
+pub(crate) struct ParsedLog {
+    pub(crate) df: DataFrame,
+    pub(crate) rows_per_file: Vec<usize>,
+}
+
+/// Parse commit files as one NDJSON document, in order. Each file's row
+/// count is its number of non-blank lines, which polars parses one row
+/// each.
+pub(crate) fn parse_commit_files(payloads: &[bytes::Bytes]) -> DeltaResult<ParsedLog> {
+    let mut joined = Vec::with_capacity(payloads.iter().map(|b| b.len() + 1).sum());
+    let mut rows_per_file = Vec::with_capacity(payloads.len());
+    for bytes in payloads {
+        rows_per_file.push(
+            bytes
+                .split(|&b| b == b'\n')
+                .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+                .count(),
+        );
+        joined.extend_from_slice(bytes);
+        joined.push(b'\n');
+    }
+    let df = parse_ndjson_inferred(&joined)?;
+    let expected: usize = rows_per_file.iter().sum();
+    if df.height() != expected {
+        return Err(Error::Generic(format!(
+            "commit files parsed to {} rows but hold {expected} lines",
+            df.height()
+        )));
+    }
+    Ok(ParsedLog { df, rows_per_file })
+}
+
 /// Reshape an inferred polars DataFrame to the kernel-declared layout:
 /// missing fields → null columns, inferred `Struct{...}` map fields →
 /// `List<Struct<{key, value}>>`, struct children recurse. Returned lazy so

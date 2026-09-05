@@ -16,19 +16,19 @@ use delta_kernel::plans::ir::plan::{Plan, PlanNode};
 use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
-    BooleanChunked, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType, LazyFrame,
-    MaintainOrderJoin, NULL, PolarsError, PolarsResult, Schema as PlSchema, Series,
-    SortMultipleOptions, UnionArgs, col, concat, len, lit, when,
+    BooleanChunked, DataFrame, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType,
+    LazyFrame, MaintainOrderJoin, NULL, NamedFrom, PolarsError, PolarsResult, Schema as PlSchema,
+    Series, SortMultipleOptions, UnionArgs, col, concat, len, lit, when,
 };
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
 use url::Url;
 
 use crate::engine::data::resolve_path;
+use crate::engine::handlers::parse_commit_files;
 use crate::engine::handlers::{
-    MetadataColumns, align_lazy, dsl_parquet_scan, ensure_no_field_id_matching,
-    parse_ndjson_inferred, path_for_polars_io, row_index_as_long, split_metadata_columns,
-    unified_scan_args,
+    MetadataColumns, align_lazy, dsl_parquet_scan, ensure_no_field_id_matching, path_for_polars_io,
+    row_index_as_long, split_metadata_columns, unified_scan_args,
 };
 use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
@@ -41,6 +41,51 @@ use crate::translation::schema::{KernelDataTypeExt, KernelSchemaExt};
 use delta_kernel::StorageHandler;
 
 use super::PolarsPlanExecutor;
+
+/// Each file's constant literals repeated over that file's rows, one column
+/// per constant. The literals are evaluated in a single select.
+fn constant_columns(entries: &[FileEntry], rows_per_file: &[usize]) -> DeltaResult<Vec<Expr>> {
+    let n_cols = entries.first().map_or(0, |e| e.literals.len());
+    if n_cols == 0 {
+        return Ok(Vec::new());
+    }
+    let cells: Vec<Expr> = entries
+        .iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            e.literals
+                .iter()
+                .enumerate()
+                .map(move |(j, l)| l.clone().alias(format!("{i}_{j}")))
+        })
+        .collect();
+    let values = DataFrame::empty()
+        .lazy()
+        .select(cells)
+        .collect()
+        .map_err(to_kernel_err)?;
+    (0..n_cols)
+        .map(|j| {
+            let name = polars_plan::utils::expr_output_name(&entries[0].literals[j])
+                .map_err(to_kernel_err)?;
+            let mut column: Option<Series> = None;
+            for (i, &n) in rows_per_file.iter().enumerate() {
+                let cell = values
+                    .column(&format!("{i}_{j}"))
+                    .map_err(to_kernel_err)?
+                    .as_materialized_series()
+                    .new_from_index(0, n);
+                match column.as_mut() {
+                    None => column = Some(cell),
+                    Some(acc) => {
+                        acc.append(&cell).map_err(to_kernel_err)?;
+                    }
+                }
+            }
+            Ok(lit(column.expect("at least one file")).alias(name))
+        })
+        .collect()
+}
 
 /// One evaluated plan node: the lazy pipeline plus the kernel schema its
 /// rows carry (needed to translate downstream expressions).
@@ -237,11 +282,12 @@ impl PolarsPlanExecutor {
                 })
                 .collect::<DeltaResult<_>>()?,
             FileType::Json => {
-                // Whole-file fetches in one parallel `read_files` batch;
-                // NDJSON parse per file. The align select stays lazy so only
-                // the raw parses are pinned until the terminal collect.
-                // TODO: fetch+parse are still eager per file. Deferring them
-                // into the pipeline (restoring kernel's P&M early-out) needs
+                // One parse over every commit file: polars infers one schema
+                // for all lines and the align select runs once, so the plan
+                // carries one branch instead of one per file. Per-file
+                // columns are rebuilt from each file's line count.
+                // TODO: fetch+parse are still eager. Deferring them into the
+                // pipeline (restoring kernel's P&M early-out) needs
                 // AnonymousScan under the streaming engine; polars-stream
                 // `todo!()`s on `FileScanIR::Anonymous` through 0.55.2.
                 let slices = entries.iter().map(|e| (e.location.clone(), None)).collect();
@@ -249,21 +295,26 @@ impl PolarsPlanExecutor {
                     .storage
                     .read_files(slices)?
                     .collect::<DeltaResult<_>>()?;
-                payloads
-                    .into_iter()
-                    .zip(entries)
-                    .map(|(bytes, e)| {
-                        let df = parse_ndjson_inferred(&bytes)?;
-                        let mut lf = align_lazy(df, read_schema)?;
-                        if let Some(name) = &row_index {
-                            lf = row_index_as_long(lf.with_row_index(name.clone(), None), name);
-                        }
-                        if let Some(name) = &file_path {
-                            lf = lf.with_columns([lit(e.location.as_str()).alias(name.clone())]);
-                        }
-                        Ok(shape(lf, e.literals))
-                    })
-                    .collect::<DeltaResult<_>>()?
+                let parsed = parse_commit_files(&payloads)?;
+                let rows = &parsed.rows_per_file;
+                let mut per_file: Vec<Expr> = constant_columns(&entries, rows)?;
+                if let Some(name) = &row_index {
+                    let index: Vec<i64> = rows.iter().flat_map(|&n| 0..n as i64).collect();
+                    per_file.push(lit(Series::new(name.clone(), index)));
+                }
+                if let Some(name) = &file_path {
+                    let paths: Vec<&str> = entries
+                        .iter()
+                        .zip(rows)
+                        .flat_map(|(e, &n)| std::iter::repeat_n(e.location.as_str(), n))
+                        .collect();
+                    per_file.push(lit(Series::new(name.clone(), paths)));
+                }
+                let mut lf = align_lazy(parsed.df, read_schema)?;
+                if !per_file.is_empty() {
+                    lf = lf.with_columns(per_file);
+                }
+                vec![lf.select(select.clone())]
             }
         };
         concat_frames(frames, output_schema)

@@ -9,7 +9,9 @@ mod parquet;
 mod storage;
 
 pub(super) use json::PolarsJsonHandler;
-pub(crate) use json::{align_lazy, parse_ndjson_inferred};
+#[cfg(test)]
+pub(crate) use json::parse_ndjson_inferred;
+pub(crate) use json::{align_lazy, parse_commit_files};
 pub(super) use parquet::PolarsParquetHandler;
 pub(crate) use parquet::{
     MetadataColumns, dsl_parquet_scan, ensure_no_field_id_matching, fetch_parquet_metadata,
