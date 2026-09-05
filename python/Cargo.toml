@@ -191,6 +191,10 @@ serde_json = "1"
 # Weighted in-memory cache for parsed Delta log files (`engine/log_cache.rs`).
 foyer-memory = "0.22"
 
+[build-dependencies]
+# Tracks pyo3's minor.
+pyo3-build-config = { version = "0.29", optional = true, features = ["resolve-config"] }
+
 [dev-dependencies]
 # RAII temp dirs for the unit tests — unique names, removed on drop.
 tempfile = "3"
@@ -198,6 +202,8 @@ tempfile = "3"
 [features]
 default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
+# `just test-rust` only: rpath the test binary to its libpython.
+libpython-rpath = ["dep:pyo3-build-config"]
 
 [profile.release]
 lto = true

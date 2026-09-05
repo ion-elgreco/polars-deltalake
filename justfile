@@ -57,6 +57,7 @@ check:
 # cargo unit tests on the cdylib crate. `--no-default-features` drops
 # pyo3/extension-module so the test binary links libpython — pointed at the
 # venv `just develop` built, since the system python3 can predate abi3-py310.
+# `libpython-rpath` rpaths the binary to that libpython (see build.rs).
 # `uv run` resolves the interpreter so the recipe works on Windows too, where
 # the venv puts it in `Scripts/python.exe`. Deliberately not `: venv`:
 # re-syncing between `just develop` and `just test-local` only re-locks
@@ -80,7 +81,7 @@ test-rust:
     esac
     # Same profile as `just develop`, so CI reuses that build's dependency
     # artifacts instead of recompiling polars and delta-kernel from scratch.
-    PYO3_PYTHON="$py" cargo test --lib --no-default-features --profile '{{ profile }}'
+    PYO3_PYTHON="$py" cargo test --lib --no-default-features --features libpython-rpath --profile '{{ profile }}'
 
 # Wipe build artifacts.
 clean:
