@@ -3,7 +3,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::sync::Arc;
 
+use delta_kernel::StorageHandler;
 use polars::prelude::{
     BooleanChunked, Column, DataFrame, Expr, IdxCa, IdxSize, IntoLazy, LiteralValue, PolarsResult,
     Scalar, StringChunked, col,
@@ -11,9 +13,10 @@ use polars::prelude::{
 use polars::series::IsSorted;
 use polars_arrow::bitmap::MutableBitmap;
 use polars_utils::pl_str::PlSmallStr;
+use url::Url;
 
 use crate::engine::select_anchored;
-use crate::scan::plan::{LogicalRewrite, ScanFileMeta};
+use crate::scan::plan::{LazyDv, LogicalRewrite, ScanFileMeta};
 use crate::scan::read::{FILE_ID_COL, ROW_INDEX_COL};
 use crate::scan::row_offsets::place_dvs;
 
@@ -104,20 +107,9 @@ impl SimpleSelect {
 
 /// A file's deletion vector placed in the scan-wide row index.
 struct PlacedDv {
-    /// Sorted ascending file-local row indices to drop.
-    deleted: Vec<u64>,
+    dv: LazyDv,
     /// `ROW_INDEX_COL` values the file's physical rows occupy.
     rows: Range<u64>,
-}
-
-impl PlacedDv {
-    /// `row_indexes` inherits whatever order the DV bitmap iterates, and the
-    /// keep-mask merge requires ascending — enforce it here rather than
-    /// trust the kernel rev.
-    fn new(mut deleted: Vec<u64>, rows: Range<u64>) -> Self {
-        deleted.sort_unstable();
-        Self { deleted, rows }
-    }
 }
 
 /// One file's select list, its pre-parsed fast path, and its placed DV.
@@ -138,6 +130,9 @@ pub(crate) struct LogicalScanIter {
     files: Vec<FileRewrite>,
     /// The read also carries `ROW_INDEX_COL`: on whenever a file has a DV.
     row_index: bool,
+    /// For reading a file's DV the first time one of its batches arrives.
+    storage: Arc<dyn StorageHandler>,
+    table_root: Url,
     /// Mixed atomic conjuncts (touching both partition and data cols) —
     /// applied after the select list materializes partition values.
     orphan_predicate: Option<Expr>,
@@ -159,6 +154,8 @@ impl LogicalScanIter {
         path_index: HashMap<String, usize>,
         files: Vec<ScanFileMeta>,
         row_count: impl Fn(&ScanFileMeta) -> anyhow::Result<u64> + Sync,
+        storage: Arc<dyn StorageHandler>,
+        table_root: Url,
         orphan_predicate: Option<Expr>,
         output_projection: Option<Vec<String>>,
     ) -> anyhow::Result<Self> {
@@ -168,16 +165,11 @@ impl LogicalScanIter {
             .into_iter()
             .zip(spans)
             .map(|(file, rows)| {
-                let LogicalRewrite {
-                    select,
-                    deleted_rows,
-                } = file.rewrite;
+                let LogicalRewrite { select, dv } = file.rewrite;
                 FileRewrite {
                     simple: select.as_deref().and_then(SimpleSelect::parse),
                     select,
-                    dv: deleted_rows
-                        .zip(rows)
-                        .map(|(deleted, rows)| PlacedDv::new(deleted, rows)),
+                    dv: dv.zip(rows).map(|(dv, rows)| PlacedDv { dv, rows }),
                 }
             })
             .collect();
@@ -186,6 +178,8 @@ impl LogicalScanIter {
             path_index,
             files,
             row_index,
+            storage,
+            table_root,
             orphan_predicate,
             output_projection: output_projection
                 .map(|cols| cols.iter().map(|c| col(c.as_str())).collect()),
@@ -269,7 +263,11 @@ impl LogicalScanIter {
                         "{ROW_INDEX_COL} is not an index column: {e}"
                     ))
                 })?;
-            if let Some(mask) = keep_mask(dv, rows)? {
+            let deleted = dv
+                .dv
+                .rows(&self.storage, &self.table_root)
+                .map_err(|e| delta_kernel::Error::Generic(format!("{e:#}")))?;
+            if let Some(mask) = keep_mask(deleted, &dv.rows, rows)? {
                 df = df
                     .filter(&mask)
                     .map_err(|e| delta_kernel::Error::Generic(format!("DV filter: {e}")))?;
@@ -337,7 +335,11 @@ fn find_run_end<'a>(
 /// deleted list; a descending step re-seeks with a binary search rather
 /// than trusting the order. Every index must fall inside the file, or the
 /// placement is wrong and the mask would be too.
-fn keep_mask(dv: &PlacedDv, rows: &IdxCa) -> Result<Option<BooleanChunked>, delta_kernel::Error> {
+fn keep_mask(
+    deleted: &[u64],
+    span: &Range<u64>,
+    rows: &IdxCa,
+) -> Result<Option<BooleanChunked>, delta_kernel::Error> {
     const NAME: &str = "__pldl_dv__";
     if rows.null_count() > 0 {
         return Err(delta_kernel::Error::Generic(format!(
@@ -346,16 +348,14 @@ fn keep_mask(dv: &PlacedDv, rows: &IdxCa) -> Result<Option<BooleanChunked>, delt
     }
     let file_local = |global: IdxSize| {
         let global = global as u64;
-        if dv.rows.contains(&global) {
-            Ok(global - dv.rows.start)
+        if span.contains(&global) {
+            Ok(global - span.start)
         } else {
             Err(delta_kernel::Error::Generic(format!(
-                "row index {global} falls outside its file's rows {:?}",
-                dv.rows
+                "row index {global} falls outside its file's rows {span:?}"
             )))
         }
     };
-    let deleted = &dv.deleted;
     let n = rows.len();
     let mut keep = MutableBitmap::from_len_set(n);
 
@@ -486,8 +486,18 @@ mod keep_mask_tests {
 
     use super::*;
 
-    fn dv(deleted: Vec<u64>, rows: Range<u64>) -> PlacedDv {
-        PlacedDv::new(deleted, rows)
+    struct Dv {
+        deleted: Vec<u64>,
+        rows: Range<u64>,
+    }
+
+    fn dv(mut deleted: Vec<u64>, rows: Range<u64>) -> Dv {
+        deleted.sort_unstable();
+        Dv { deleted, rows }
+    }
+
+    fn keep_mask(dv: &Dv, rows: &IdxCa) -> Result<Option<BooleanChunked>, delta_kernel::Error> {
+        super::keep_mask(&dv.deleted, &dv.rows, rows)
     }
 
     /// `None` means every row survives.
@@ -499,7 +509,7 @@ mod keep_mask_tests {
     }
 
     /// Unflagged, so the merge path.
-    fn mask(dv: &PlacedDv, rows: &[IdxSize]) -> Result<Vec<bool>, delta_kernel::Error> {
+    fn mask(dv: &Dv, rows: &[IdxSize]) -> Result<Vec<bool>, delta_kernel::Error> {
         keep_mask(dv, &IdxCa::new("r".into(), rows)).map(|m| bools(m, rows.len()))
     }
 

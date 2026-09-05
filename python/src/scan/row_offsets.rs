@@ -6,7 +6,7 @@ use delta_kernel::StorageHandler;
 use polars::prelude::IdxSize;
 use rayon::prelude::*;
 
-use crate::scan::plan::ScanFileMeta;
+use crate::scan::plan::{LazyDv, ScanFileMeta};
 
 /// The physical row range of every DV file, aligned with `files`. Every
 /// file up to the last DV file needs a count: earlier files place a DV
@@ -17,7 +17,7 @@ pub(crate) fn place_dvs(
     row_count: impl Fn(&ScanFileMeta) -> anyhow::Result<u64> + Sync,
 ) -> anyhow::Result<Vec<Option<Range<u64>>>> {
     let mut spans = vec![None; files.len()];
-    let Some(last_dv) = files.iter().rposition(|f| f.rewrite.deleted_rows.is_some()) else {
+    let Some(last_dv) = files.iter().rposition(|f| f.rewrite.dv.is_some()) else {
         return Ok(spans);
     };
     // Footer reads are round trips; run them side by side.
@@ -30,7 +30,7 @@ pub(crate) fn place_dvs(
         .collect::<anyhow::Result<_>>()?;
     let mut offset: u64 = 0;
     for ((file, span), num_rows) in files.iter().zip(spans.iter_mut()).zip(counts) {
-        if file.rewrite.deleted_rows.is_some() {
+        if file.rewrite.dv.is_some() {
             *span = Some(offset..offset + num_rows);
         }
         offset = offset.saturating_add(num_rows);
@@ -82,7 +82,7 @@ mod tests {
             path: PlRefPath::new(name),
             rewrite: LogicalRewrite {
                 select: None,
-                deleted_rows: dv.then(|| vec![1]),
+                dv: dv.then(|| LazyDv::loaded(vec![1])),
             },
             partition_values: HashMap::new(),
             num_records,

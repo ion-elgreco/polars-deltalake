@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::engine_data::{GetData, RowVisitor};
@@ -18,11 +18,12 @@ use delta_kernel::plans::{Operation, PlanExecutor};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, StructType};
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
-use delta_kernel::{DeltaResult, Engine, FileMeta};
+use delta_kernel::{DeltaResult, Engine, FileMeta, StorageHandler};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{DataFrame, Expr, col};
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
+use url::Url;
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::engine::{PolarsEngine, PolarsEngineData, path_for_polars_io, resolve_series_path};
@@ -37,9 +38,63 @@ pub(crate) struct LogicalRewrite {
     /// literals, in logical-schema order. `None` when the physical frame is
     /// already logical (non-partitioned, non-column-mapped).
     pub(crate) select: Option<Vec<Expr>>,
-    /// File-local physical row indices the DV drops, in the order the DV
-    /// bitmap iterates. `None` if the file has no DV.
-    pub(crate) deleted_rows: Option<Vec<u64>>,
+    /// The file's deletion vector, read on first use. `None` if the file
+    /// has no DV.
+    pub(crate) dv: Option<LazyDv>,
+}
+
+/// A deletion vector whose row list is read from storage the first time a
+/// scan needs it, so a row limit or a file-skipping predicate never pays
+/// for the DVs of files it does not read.
+pub(crate) struct LazyDv {
+    descriptor: DeletionVectorDescriptor,
+    rows: OnceLock<Vec<u64>>,
+}
+
+impl LazyDv {
+    pub(crate) fn new(descriptor: DeletionVectorDescriptor) -> Self {
+        Self {
+            descriptor,
+            rows: OnceLock::new(),
+        }
+    }
+
+    /// Test seam: a DV whose rows are already known.
+    #[cfg(test)]
+    pub(crate) fn loaded(mut rows: Vec<u64>) -> Self {
+        let dv = Self::new(
+            DeletionVectorDescriptor::try_new(
+                DeletionVectorStorageType::Inline,
+                "",
+                None,
+                0,
+                rows.len() as i64,
+            )
+            .expect("placeholder descriptor"),
+        );
+        rows.sort_unstable();
+        dv.rows.set(rows).expect("fresh");
+        dv
+    }
+
+    /// Sorted file-local physical row indices the DV drops. `row_indexes`
+    /// inherits the DV bitmap's iteration order; the keep-mask merge and the
+    /// row-limit prefix need ascending.
+    pub(crate) fn rows(
+        &self,
+        storage: &Arc<dyn StorageHandler>,
+        table_root: &Url,
+    ) -> anyhow::Result<&[u64]> {
+        if let Some(rows) = self.rows.get() {
+            return Ok(rows);
+        }
+        let mut rows = self
+            .descriptor
+            .row_indexes(storage.clone(), table_root)
+            .map_err(|e| anyhow::anyhow!("deletion vector read failed: {e:#}"))?;
+        rows.sort_unstable();
+        Ok(self.rows.get_or_init(|| rows))
+    }
 }
 
 pub(crate) struct ScanFileMeta {
@@ -118,7 +173,6 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
         }
     });
 
-    let storage = engine.storage_handler();
     let select_template = needs_select.then(|| data_expr_template(&sources, mode));
     // Without the reader feature no file can carry a DV, so nothing needs
     // the row counts and the stats JSON stays unparsed.
@@ -145,16 +199,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
                 .map_err(|e| anyhow::anyhow!("failed to resolve add path {}: {e}", row.path))?;
             let pl_path = path_for_polars_io(&abs)?;
 
-            // `Vec<u64>` of deleted row indices is far smaller than a
-            // `Vec<bool>` keep-mask for sparse deletes.
-            let deleted_rows = row
-                .dv
-                .map(|descriptor| {
-                    descriptor
-                        .row_indexes(storage.clone(), &table_root)
-                        .map_err(|e| anyhow::anyhow!("deletion vector read failed: {e:#}"))
-                })
-                .transpose()?;
+            let dv = row.dv.map(LazyDv::new);
 
             let select = select_template.as_ref().map(|t| fill_select(t, literals));
 
@@ -176,10 +221,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
                     size: row.size,
                 },
                 path: pl_path,
-                rewrite: LogicalRewrite {
-                    select,
-                    deleted_rows,
-                },
+                rewrite: LogicalRewrite { select, dv },
                 partition_values: row.partition_values,
                 num_records: row.num_records,
             });

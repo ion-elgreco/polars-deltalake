@@ -339,7 +339,7 @@ impl TableScan {
         // Skip the file-id column + `LogicalScanIter` when no file needs
         // DV/select — the common case (non-partitioned, non-DV, non-CM). A
         // DV file also needs `ROW_INDEX_COL` (see its doc).
-        let has_dv = files.iter().any(|f| f.rewrite.deleted_rows.is_some());
+        let has_dv = files.iter().any(|f| f.rewrite.dv.is_some());
         let needs_rewrite = has_dv || files.iter().any(|f| f.rewrite.select.is_some());
         let paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
 
@@ -366,6 +366,8 @@ impl TableScan {
                     path_index,
                     files,
                     |file| footer_row_count(storage.as_ref(), file),
+                    storage.clone(),
+                    scan.table_root().clone(),
                     conjunction(routing.post_transform),
                     output_projection,
                 )?

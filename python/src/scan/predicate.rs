@@ -307,7 +307,7 @@ mod partition_prune_tests {
             path: PlRefPath::new(format!("/t/{region}.parquet")),
             rewrite: LogicalRewrite {
                 select: None,
-                deleted_rows: None,
+                dv: None,
             },
             partition_values: [("col-3".to_string(), region.to_string())]
                 .into_iter()
