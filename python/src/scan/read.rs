@@ -3,7 +3,7 @@
 use delta_kernel::schema::StructType;
 use polars::io::cloud::CloudOptions;
 use polars::lazy::frame::LazyFrame;
-use polars::prelude::Expr;
+use polars::prelude::{Expr, IdxSize};
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
 
@@ -25,6 +25,9 @@ pub(crate) const ROW_INDEX_COL: &str = "__pldl_row__";
 /// `scan_parquet` plan over `paths`. `include_file_id` injects FILE_ID_COL
 /// so the read path can slice rows back to source files for DV / select;
 /// `include_row_index` injects ROW_INDEX_COL for the DV keep-mask.
+/// `physical_limit` caps the rows read after the predicate: polars pushes
+/// it into the reader when there is no predicate and stops the scan early
+/// otherwise.
 pub(crate) fn build_lazy_scan(
     paths: Vec<PlRefPath>,
     cloud_opts: Option<&CloudOptions>,
@@ -33,6 +36,7 @@ pub(crate) fn build_lazy_scan(
     physical_schema: &StructType,
     include_file_id: bool,
     include_row_index: bool,
+    physical_limit: Option<IdxSize>,
 ) -> anyhow::Result<LazyFrame> {
     let file_id = include_file_id.then(|| PlSmallStr::from_static(FILE_ID_COL));
     let row_index = include_row_index.then(|| PlSmallStr::from_static(ROW_INDEX_COL));
@@ -59,6 +63,9 @@ pub(crate) fn build_lazy_scan(
     let mut plan = lazy;
     if let Some(pred) = predicate {
         plan = plan.filter(pred.clone());
+    }
+    if let Some(len) = physical_limit {
+        plan = plan.slice(0, len);
     }
     Ok(plan.select(final_select))
 }

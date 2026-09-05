@@ -62,19 +62,35 @@ impl LazyDv {
     /// Test seam: a DV whose rows are already known.
     #[cfg(test)]
     pub(crate) fn loaded(mut rows: Vec<u64>) -> Self {
-        let dv = Self::new(
+        rows.sort_unstable();
+        let dv = Self::unread(rows.len() as i64);
+        dv.rows.set(rows).expect("fresh");
+        dv
+    }
+
+    /// Test seam: a DV of `cardinality` rows that must not be read.
+    #[cfg(test)]
+    pub(crate) fn unread(cardinality: i64) -> Self {
+        Self::new(
             DeletionVectorDescriptor::try_new(
                 DeletionVectorStorageType::Inline,
                 "",
                 None,
                 0,
-                rows.len() as i64,
+                cardinality,
             )
             .expect("placeholder descriptor"),
-        );
-        rows.sort_unstable();
-        dv.rows.set(rows).expect("fresh");
-        dv
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loaded_rows(&self) -> Option<&[u64]> {
+        self.rows.get().map(Vec::as_slice)
+    }
+
+    /// Deleted rows as the log states it, without reading the DV.
+    pub(crate) fn cardinality(&self) -> u64 {
+        self.descriptor.cardinality.max(0) as u64
     }
 
     /// Sorted file-local physical row indices the DV drops. `row_indexes`

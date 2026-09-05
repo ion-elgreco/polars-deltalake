@@ -762,6 +762,15 @@ class TestDeletionVectorPushdown:
         assert out.height == 3
         assert set(out["int"]) <= set(expected["int"])
 
+    @pytest.mark.parametrize("n", [1, 3, 4_000, 10_001])
+    def test_head_counts_logical_rows(self, dv_table, expected, n):
+        """A row limit counts rows after the DV, so a physical prefix that
+        starts with deleted rows must not come up short."""
+        out = scan_delta(dv_table).head(n).collect()
+        assert out.height == min(n, expected.height)
+        assert set(out["int"]) <= set(expected["int"])
+        assert out["int"].n_unique() == out.height
+
 
 class TestEagerRead:
     def test_read_delta_eager(self, simple_table):

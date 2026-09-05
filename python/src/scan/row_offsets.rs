@@ -46,6 +46,55 @@ pub(crate) fn place_dvs(
     Ok(spans)
 }
 
+/// Physical rows from the start of the scan that hold at least `n` logical
+/// rows: files in scan order, each DV file's deleted rows skipped. Only the
+/// DVs of files the prefix reaches are read. `None` when the whole scan
+/// holds fewer than `n` logical rows. A file without a row count ends the
+/// walk with the loose bound `n + every remaining DV's cardinality`, which
+/// always suffices.
+pub(crate) fn physical_prefix(
+    files: &[ScanFileMeta],
+    spans: &[Option<Range<u64>>],
+    n: usize,
+    read_dv: impl Fn(&LazyDv) -> anyhow::Result<&[u64]>,
+) -> anyhow::Result<Option<u64>> {
+    let mut need = n as u64;
+    let mut prefix = 0u64;
+    for (i, (file, span)) in files.iter().zip(spans).enumerate() {
+        let num_rows = match (span, file.num_records) {
+            (Some(span), _) => span.end - span.start,
+            (None, Some(rows)) => rows,
+            (None, None) => {
+                let remaining: u64 = files[i..]
+                    .iter()
+                    .map(|f| f.rewrite.dv.as_ref().map_or(0, LazyDv::cardinality))
+                    .sum();
+                return Ok(Some(prefix + need + remaining));
+            }
+        };
+        let deleted: &[u64] = match &file.rewrite.dv {
+            Some(dv) => read_dv(dv)?,
+            None => &[],
+        };
+        let live = num_rows.saturating_sub(deleted.len() as u64);
+        if live >= need {
+            // Smallest p with p - |deleted below p| >= need.
+            let mut p = need;
+            loop {
+                let below = deleted.partition_point(|&d| d < p) as u64;
+                if p - below >= need {
+                    break;
+                }
+                p = need + below;
+            }
+            return Ok(Some(prefix + p));
+        }
+        need -= live;
+        prefix += num_rows;
+    }
+    Ok(None)
+}
+
 pub(crate) fn footer_row_count(
     storage: &dyn StorageHandler,
     file: &ScanFileMeta,
@@ -115,6 +164,59 @@ mod tests {
         fetched.sort();
         assert_eq!(fetched, ["b", "d"], "e is after the last DV file");
         assert_eq!(spans, [None, Some(10..15), None, Some(22..25), None]);
+    }
+
+    fn loaded(dv: &LazyDv) -> anyhow::Result<&[u64]> {
+        Ok(dv.loaded_rows().expect("test DVs are preloaded"))
+    }
+
+    /// Errors on a DV the prefix should never reach.
+    fn read(dv: &LazyDv) -> anyhow::Result<&[u64]> {
+        dv.loaded_rows()
+            .ok_or_else(|| anyhow::anyhow!("read a DV past the prefix"))
+    }
+
+    #[test]
+    fn prefix_skips_deleted_rows_at_the_start() {
+        let mut files = vec![file("a", Some(10), true)];
+        files[0].rewrite.dv = Some(LazyDv::loaded(vec![0, 1, 2]));
+        let spans = vec![Some(0..10)];
+        assert_eq!(physical_prefix(&files, &spans, 1, loaded).unwrap(), Some(4));
+        assert_eq!(
+            physical_prefix(&files, &spans, 7, loaded).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            physical_prefix(&files, &spans, 8, loaded).unwrap(),
+            None,
+            "only 7 live rows"
+        );
+    }
+
+    /// Files past the prefix keep their DV unread.
+    #[test]
+    fn prefix_spans_files_and_falls_back_without_counts() {
+        let mut files = vec![
+            file("a", Some(3), false),
+            file("b", Some(10), true),
+            file("c", Some(10), true),
+        ];
+        files[1].rewrite.dv = Some(LazyDv::loaded(vec![0]));
+        files[2].rewrite.dv = Some(LazyDv::unread(1));
+        let spans = vec![None, Some(3..13), Some(13..23)];
+        assert_eq!(physical_prefix(&files, &spans, 4, read).unwrap(), Some(5));
+        let mut unknown = vec![file("a", None, false), file("b", Some(10), true)];
+        unknown[1].rewrite.dv = Some(LazyDv::unread(2));
+        assert_eq!(
+            physical_prefix(&unknown, &[None, Some(0..10)], 4, read).unwrap(),
+            Some(6),
+            "unknown count: n + remaining cardinality, no DV read"
+        );
+        let plain = vec![file("a", None, false)];
+        assert_eq!(
+            physical_prefix(&plain, &[None], 5, loaded).unwrap(),
+            Some(5)
+        );
     }
 
     #[test]

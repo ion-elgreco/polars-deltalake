@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::expressions::{Predicate, PredicateRef};
 use delta_kernel::scan::{PartitionValuesOptions, Scan};
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
-use polars::prelude::{DataFrame, Expr, Schema as PlSchema};
+use polars::prelude::{DataFrame, Expr, IdxSize, Schema as PlSchema};
 use pyo3::prelude::*;
 use pyo3_polars::PySchema;
 use url::Url;
@@ -35,7 +35,7 @@ use predicate::{
     extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
 };
 use read::build_lazy_scan;
-use row_offsets::footer_row_count;
+use row_offsets::{footer_row_count, physical_prefix, place_dvs};
 
 type BatchIter = Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>;
 
@@ -339,9 +339,24 @@ impl TableScan {
         // Skip the file-id column + `LogicalScanIter` when no file needs
         // DV/select — the common case (non-partitioned, non-DV, non-CM). A
         // DV file also needs `ROW_INDEX_COL` (see its doc).
-        let has_dv = files.iter().any(|f| f.rewrite.dv.is_some());
+        let storage = self.engine.storage_handler();
+        let spans = place_dvs(&files, |file| footer_row_count(storage.as_ref(), file))?;
+        let has_dv = spans.iter().any(Option::is_some);
         let needs_rewrite = has_dv || files.iter().any(|f| f.rewrite.select.is_some());
         let paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
+
+        // A row limit counts logical rows, so the scan reads the physical
+        // prefix that holds `n` of them; `next_morsel` trims to `n`. A
+        // post-transform conjunct filters after the scan, so no prefix is
+        // safe then.
+        let table_root = scan.table_root().clone();
+        let physical_limit = match state.morsel.n_rows {
+            Some(n) if routing.post_transform.is_empty() => {
+                physical_prefix(&files, &spans, n, |dv| dv.rows(&storage, &table_root))?
+                    .and_then(|p| IdxSize::try_from(p).ok())
+            }
+            _ => None,
+        };
 
         let lazy = build_lazy_scan(
             paths,
@@ -351,6 +366,7 @@ impl TableScan {
             &physical_schema,
             needs_rewrite,
             has_dv,
+            physical_limit,
         )?;
 
         let batches = crate::engine::collect_streaming_batches(lazy)
@@ -359,18 +375,17 @@ impl TableScan {
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
 
         let new_iter: BatchIter = if needs_rewrite {
-            let storage = self.engine.storage_handler();
             Box::new(
                 LogicalScanIter::new(
                     source,
                     path_index,
                     files,
-                    |file| footer_row_count(storage.as_ref(), file),
-                    storage.clone(),
-                    scan.table_root().clone(),
+                    spans,
+                    storage,
+                    table_root,
                     conjunction(routing.post_transform),
                     output_projection,
-                )?
+                )
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
             )
         } else if routing.post_transform.is_empty() {

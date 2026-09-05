@@ -18,7 +18,6 @@ use url::Url;
 use crate::engine::select_anchored;
 use crate::scan::plan::{LazyDv, LogicalRewrite, ScanFileMeta};
 use crate::scan::read::{FILE_ID_COL, ROW_INDEX_COL};
-use crate::scan::row_offsets::place_dvs;
 
 /// One column of a pre-parsed simple select: a rename of a read column or a
 /// broadcast literal (partition value).
@@ -146,20 +145,18 @@ pub(crate) struct LogicalScanIter {
 }
 
 impl LogicalScanIter {
-    /// `files` in scan order, the order polars numbers `ROW_INDEX_COL` in.
-    /// `row_count` supplies the physical row count of a file whose add
-    /// action carries no `numRecords`.
+    /// `files` in scan order, the order polars numbers `ROW_INDEX_COL` in;
+    /// `spans` are their `place_dvs` placements.
     pub(crate) fn new(
         source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>,
         path_index: HashMap<String, usize>,
         files: Vec<ScanFileMeta>,
-        row_count: impl Fn(&ScanFileMeta) -> anyhow::Result<u64> + Sync,
+        spans: Vec<Option<Range<u64>>>,
         storage: Arc<dyn StorageHandler>,
         table_root: Url,
         orphan_predicate: Option<Expr>,
         output_projection: Option<Vec<String>>,
-    ) -> anyhow::Result<Self> {
-        let spans = place_dvs(&files, row_count)?;
+    ) -> Self {
         let row_index = spans.iter().any(Option::is_some);
         let files = files
             .into_iter()
@@ -173,7 +170,7 @@ impl LogicalScanIter {
                 }
             })
             .collect();
-        Ok(Self {
+        Self {
             source,
             path_index,
             files,
@@ -184,7 +181,7 @@ impl LogicalScanIter {
             output_projection: output_projection
                 .map(|cols| cols.iter().map(|c| col(c.as_str())).collect()),
             pending: VecDeque::new(),
-        })
+        }
     }
 
     /// Slice on file-id boundaries, push each per-file logical frame onto
