@@ -37,27 +37,32 @@ pub(crate) struct LogicalRewrite {
     /// literals, in logical-schema order. `None` when the physical frame is
     /// already logical (non-partitioned, non-column-mapped).
     pub(crate) select: Option<Vec<Expr>>,
-    /// Per-file DV state — sorted deleted row indices + cursor of how many
-    /// rows of the file have been consumed by prior batches. `None` if the
-    /// file has no DV.
+    /// Per-file DV — sorted deleted row indices plus the file's place in the
+    /// scan's physical row index. `None` if the file has no DV.
     pub(crate) dv: Option<DvState>,
 }
 
 pub(crate) struct DvState {
-    /// Sorted ascending row indices to drop. Consumed entries are drained
-    /// off the front as batches are processed.
+    /// Sorted ascending file-local row indices to drop.
     pub(crate) deleted: Vec<u64>,
-    /// Absolute row offset within the file already covered by past batches.
-    pub(crate) cursor: u64,
+    /// Scan-wide row index of the file's first physical row. Set by
+    /// `assign_dv_row_offsets` once the final file order is known.
+    pub(crate) row_offset: u64,
+    /// Physical rows in the file; bounds the index → file mapping.
+    pub(crate) num_rows: u64,
 }
 
 impl DvState {
     /// `row_indexes` inherits whatever order the DV bitmap iterates, and the
-    /// keep-mask math (`partition_point` + cursor subtraction) requires
-    /// ascending — enforce it here rather than trust the kernel rev.
+    /// keep-mask merge requires ascending — enforce it here rather than
+    /// trust the kernel rev.
     pub(crate) fn new(mut deleted: Vec<u64>) -> Self {
         deleted.sort_unstable();
-        Self { deleted, cursor: 0 }
+        Self {
+            deleted,
+            row_offset: 0,
+            num_rows: 0,
+        }
     }
 }
 
@@ -65,6 +70,9 @@ pub(crate) struct ScanFileMeta {
     pub(crate) path: PlRefPath,
     pub(crate) rewrite: LogicalRewrite,
     pub(crate) partition_values: HashMap<String, String>,
+    /// `numRecords` from the add action's stats: the file's physical row
+    /// count. `None` when the writer left stats out.
+    pub(crate) num_records: Option<u64>,
 }
 
 /// The metadata plan drained into bulk-read inputs.
@@ -79,6 +87,7 @@ struct AddRow {
     path: String,
     dv: Option<DeletionVectorDescriptor>,
     partition_values: HashMap<String, String>,
+    num_records: Option<u64>,
 }
 
 /// A projected logical field's physical source: the next physical column
@@ -177,6 +186,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
                 path: pl_path,
                 rewrite: LogicalRewrite { select, dv },
                 partition_values: row.partition_values,
+                num_records: row.num_records,
             });
         }
     }
@@ -367,7 +377,8 @@ mod visit_add_rows_tests {
         .unwrap()
         .with_outer_validity(Some(Bitmap::from([false])))
         .into_series();
-        let add = StructChunked::from_series("add".into(), 1, [path, pv, dv].iter())
+        let stats = Series::full_null("stats".into(), 1, &PlDataType::String);
+        let add = StructChunked::from_series("add".into(), 1, [path, pv, dv, stats].iter())
             .unwrap()
             .into_series();
         let df = DataFrame::new(1, vec![add.into_column()]).unwrap();
@@ -517,9 +528,9 @@ fn fill_select(template: &[Option<Expr>], literals: Vec<Expr>) -> Vec<Expr> {
         .collect()
 }
 
-/// Extract (path, DV descriptor, partition-values map) per add row through
-/// the kernel row-visitor machinery — the same getters kernel's own log
-/// replay uses.
+/// Extract (path, DV descriptor, partition-values map, row count) per add
+/// row through the kernel row-visitor machinery — the same getters kernel's
+/// own log replay uses.
 fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<AddRow>> {
     struct Visitor {
         rows: Vec<AddRow>,
@@ -537,6 +548,7 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
                     ColumnName::new(["add", "deletionVector", "offset"]),
                     ColumnName::new(["add", "deletionVector", "sizeInBytes"]),
                     ColumnName::new(["add", "deletionVector", "cardinality"]),
+                    ColumnName::new(["add", "stats"]),
                 ],
                 vec![
                     KernelDataType::STRING,
@@ -546,6 +558,7 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
                     KernelDataType::INTEGER,
                     KernelDataType::INTEGER,
                     KernelDataType::LONG,
+                    KernelDataType::STRING,
                 ],
             )
         })
@@ -615,10 +628,15 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
                     }
                 };
 
+                let num_records = getters[7]
+                    .get_str(i, "add.stats")?
+                    .and_then(num_records_from_stats);
+
                 self.rows.push(AddRow {
                     path: path.to_string(),
                     dv,
                     partition_values,
+                    num_records,
                 });
             }
             Ok(())
@@ -632,4 +650,30 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
         .visit_rows_of(batch)
         .map_err(|e| anyhow::anyhow!("add-row visit failed: {e:#}"))?;
     Ok(visitor.rows)
+}
+
+/// `numRecords` out of an add action's stats JSON. Delta keeps it at the
+/// file's physical row count even under a DV (the logical count is that
+/// minus the DV cardinality), which is what the scan's row index needs.
+/// Anything unparsable reads as absent; the footer then supplies the count.
+fn num_records_from_stats(stats: &str) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Stats {
+        #[serde(rename = "numRecords")]
+        num_records: Option<u64>,
+    }
+    serde_json::from_str::<Stats>(stats).ok()?.num_records
+}
+
+#[cfg(test)]
+mod num_records_tests {
+    use super::num_records_from_stats;
+
+    #[test]
+    fn reads_num_records_and_tolerates_absence() {
+        let stats = r#"{"numRecords":5,"minValues":{"a":1},"tightBounds":false}"#;
+        assert_eq!(num_records_from_stats(stats), Some(5));
+        assert_eq!(num_records_from_stats(r#"{"minValues":{"a":1}}"#), None);
+        assert_eq!(num_records_from_stats("not json"), None);
+    }
 }

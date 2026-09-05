@@ -23,6 +23,7 @@ mod logical;
 mod plan;
 mod predicate;
 mod read;
+mod row_offsets;
 
 pub(crate) use cdf::{CdfTableScan, CdfTableState};
 pub(crate) use read::build_lazy_scan;
@@ -34,6 +35,7 @@ use predicate::{
     Conjunct, ConjunctClassification, classify_conjuncts, columns_outside_schema, conjunction,
     extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
 };
+use row_offsets::assign_dv_row_offsets;
 
 type BatchIter = Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>;
 
@@ -334,6 +336,16 @@ impl TableScan {
 
         let polars_predicate: Option<Expr> = conjunction(routing.parquet_filter);
 
+        // A DV addresses the file's physical rows. The read carries a
+        // physical row index for those files, so the predicate still goes
+        // into the parquet reader and the keep-mask matches on the index
+        // afterwards. Offsets follow the final file order, hence after
+        // pruning.
+        let has_dv = files.iter().any(|f| f.rewrite.dv.is_some());
+        if has_dv {
+            assign_dv_row_offsets(&mut files, self.engine.cloud_options())?;
+        }
+
         let (paths, rewrites): (Vec<_>, Vec<_>) =
             files.into_iter().map(|f| (f.path, f.rewrite)).unzip();
 
@@ -343,23 +355,14 @@ impl TableScan {
             .iter()
             .any(|r| r.select.is_some() || r.dv.is_some());
 
-        // A DV's row indices address the file's physical rows, so a filter
-        // inside the scan would shift them. Hold it back to `LogicalScanIter`
-        // (below the keep-mask) at the cost of row-group pushdown.
-        let has_dv = rewrites.iter().any(|r| r.dv.is_some());
-        let (scan_predicate, post_dv_predicate) = if has_dv {
-            (None, polars_predicate)
-        } else {
-            (polars_predicate, None)
-        };
-
         let lazy = build_lazy_scan(
             paths,
             self.engine.cloud_options(),
             &select_exprs,
-            scan_predicate.as_ref(),
+            polars_predicate.as_ref(),
             &physical_schema,
             needs_rewrite,
+            has_dv,
         )?;
 
         let batches = crate::engine::collect_streaming_batches(lazy)
@@ -373,7 +376,7 @@ impl TableScan {
                     source,
                     path_index,
                     rewrites,
-                    post_dv_predicate,
+                    has_dv,
                     conjunction(routing.post_transform),
                     output_projection,
                 )

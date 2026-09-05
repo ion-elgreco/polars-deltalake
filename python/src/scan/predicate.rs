@@ -307,6 +307,7 @@ mod partition_prune_tests {
             partition_values: [("col-3".to_string(), region.to_string())]
                 .into_iter()
                 .collect(),
+            num_records: None,
         }
     }
 

@@ -186,6 +186,7 @@ rayon = "1"
 # feature set and ours with a subset, so `#[cfg]`-gated `FunctionExpr`
 # variants shift discriminants and the round-trip miscompiles silently. The
 # JSON form is variant-name keyed and survives feature mismatches.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]

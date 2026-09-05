@@ -680,6 +680,96 @@ class TestDeletionVectors:
         assert read(pl.col("letter") == "b") == survivor
 
 
+class TestDeletionVectorPushdown:
+    """A DV addresses a file's physical rows. The scan pushes the predicate
+    into the parquet reader anyway and carries a physical row index, so the
+    keep-mask matches on the index instead of on batch position. The tables
+    here put the DV file on either side of plain files (their row counts set
+    the DV file's offset) and take the row count from the log's `numRecords`
+    or, when a plain file was committed without stats, from the parquet
+    footer."""
+
+    # Two plain files, ten row groups each, with sorted `int` ranges that
+    # never overlap the DAT rows (25..692).
+    PLAIN_X = (1_000, 5_000, "x")
+    PLAIN_Y = (100_000, 5_000, "y")
+
+    PREDICATES = {
+        # DAT file only; every plain row group is skipped by statistics.
+        "dat_only": pl.col("int") < 300,
+        # A deleted row: must stay deleted.
+        "deleted_row": pl.col("int") == 692,
+        # Survivor plus every plain row.
+        "survivor_and_plain": pl.col("int") > 200,
+        # Last row group of the last file.
+        "last_row_group": pl.col("int") >= 104_500,
+        # One row group in the middle of the first file.
+        "middle_row_group": pl.col("int").is_between(3_000, 3_010),
+        # All four deleted rows.
+        "deleted_letter": pl.col("letter") == "a",
+        "survivor_letter": pl.col("letter") == "b",
+        "mixed": (pl.col("int") > 100) & (pl.col("letter") != "x"),
+    }
+
+    @pytest.fixture(
+        params=[("first", True), ("last", True), ("first", False), ("last", False)],
+        ids=["dv-first", "dv-last", "dv-first-no-stats", "dv-last-no-stats"],
+    )
+    def dv_table(self, request, tmp_path):
+        from _dv_helpers import build_dv_table, plain_frame
+
+        dv_commit, num_records = request.param
+        plain = [plain_frame(*self.PLAIN_X), plain_frame(*self.PLAIN_Y)]
+        return str(
+            build_dv_table(
+                tmp_path / "tbl",
+                plain,
+                dv_commit=dv_commit,
+                row_group_size=500,
+                num_records=num_records,
+            )
+        )
+
+    @pytest.fixture
+    def expected(self):
+        from datetime import date
+
+        from _dv_helpers import plain_frame
+
+        survivor = pl.DataFrame(
+            {"letter": ["b"], "int": [228], "date": [date(1978, 12, 1)]},
+            schema={"letter": pl.String, "int": pl.Int64, "date": pl.Date},
+        )
+        return pl.concat(
+            [survivor, plain_frame(*self.PLAIN_X), plain_frame(*self.PLAIN_Y)]
+        )
+
+    def test_full_scan(self, dv_table, expected):
+        out = scan_delta(dv_table).collect()
+        assert_frame_equal(out.sort("int"), expected.sort("int"))
+
+    @pytest.mark.parametrize("pred", PREDICATES.values(), ids=PREDICATES.keys())
+    def test_pushed_predicate_matches_post_filter(self, dv_table, expected, pred):
+        pushed = scan_delta(dv_table).filter(pred).collect().sort("int")
+        assert_frame_equal(pushed, expected.filter(pred).sort("int"))
+        post = scan_delta(dv_table).collect().filter(pred).sort("int")
+        assert_frame_equal(pushed, post)
+
+    def test_predicate_column_projected_away(self, dv_table, expected):
+        out = scan_delta(dv_table).filter(pl.col("int") < 300).select("letter")
+        assert out.collect().to_dicts() == [{"letter": "b"}]
+        out = scan_delta(dv_table).filter(pl.col("letter") == "y").select("int")
+        assert_frame_equal(
+            out.collect().sort("int"),
+            expected.filter(pl.col("letter") == "y").select("int"),
+        )
+
+    def test_head_under_pushed_predicate(self, dv_table, expected):
+        out = scan_delta(dv_table).filter(pl.col("int") > 200).head(3).collect()
+        assert out.height == 3
+        assert set(out["int"]) <= set(expected["int"])
+
+
 class TestEagerRead:
     def test_read_delta_eager(self, simple_table):
         """`read_delta` is the eager equivalent of `scan_delta(...).collect()`."""
