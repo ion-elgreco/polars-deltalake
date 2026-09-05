@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 # `declarative-plans` is experimental and its IR churns per release, so expect
 # the PlanExecutor to need work on every bump. `vendored-protoc` supplies the
 # protoc binary the declarative-plans proto codegen runs at build time.
-delta_kernel = { version = "0.27.1", default-features = false, features = [
+delta_kernel = { version = "0.28.0", default-features = false, features = [
     "internal-api",
     "declarative-plans",
     "vendored-protoc",

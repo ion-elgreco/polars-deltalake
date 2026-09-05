@@ -140,7 +140,7 @@ impl JsonHandler for PolarsJsonHandler {
                 + '_,
         >,
         _overwrite: bool,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<delta_kernel::FileSize> {
         Err(Error::Unsupported(
             "polars-deltalake is read-only; write support is not yet implemented".into(),
         ))
