@@ -63,13 +63,12 @@ def test_dv_predicate_pushdown_across_row_groups(
     has to address rows by physical position, not by batch order. Every
     deleted row must stay deleted and a pushed predicate must match the same
     filter applied after a full scan."""
-    import json
-
+    import pyarrow.parquet as pq
+    from _log_helpers import read_log_actions
     from pyspark.sql import functions as F
 
-    import pyarrow.parquet as pq
-
-    path = str(tmp_path / "dv_rg")
+    table = tmp_path / "dv_rg"
+    path = str(table)
     # Small row groups so a selective predicate can skip most of each file.
     # Only the JVM-side Hadoop conf reaches the parquet writer.
     hadoop_conf = cast(Any, spark_session.sparkContext._jsc).hadoopConfiguration()
@@ -85,16 +84,16 @@ def test_dv_predicate_pushdown_across_row_groups(
     finally:
         hadoop_conf.unset("parquet.block.size")
 
-    data_files = list((tmp_path / "dv_rg").glob("*.parquet"))
+    data_files = list(table.glob("*.parquet"))
     assert data_files and all(
         pq.ParquetFile(f).metadata.num_row_groups > 4 for f in data_files
     ), "files came out as one row group; nothing for the predicate to skip"
 
-    last_commit = sorted((tmp_path / "dv_rg" / "_delta_log").glob("*.json"))[-1]
-    adds = [json.loads(line) for line in last_commit.read_text().splitlines()]
-    assert any(a.get("add", {}).get("deletionVector") for a in adds), (
-        "Spark rewrote the files instead of writing a deletion vector"
-    )
+    last_version = max(int(p.stem) for p in (table / "_delta_log").glob("*.json"))
+    assert any(
+        a.get("add", {}).get("deletionVector")
+        for a in read_log_actions(table, last_version)
+    ), "Spark rewrote the files instead of writing a deletion vector"
 
     full = scan_delta(path).collect()
     assert full.height == 200_000 - len(range(0, 200_000, 7))

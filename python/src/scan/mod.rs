@@ -26,7 +26,6 @@ mod read;
 mod row_offsets;
 
 pub(crate) use cdf::{CdfTableScan, CdfTableState};
-pub(crate) use read::build_lazy_scan;
 
 use ffi::{MorselState, SendExport, morsel_to_py, next_morsel};
 use logical::LogicalScanIter;
@@ -35,7 +34,8 @@ use predicate::{
     Conjunct, ConjunctClassification, classify_conjuncts, columns_outside_schema, conjunction,
     extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
 };
-use row_offsets::assign_dv_row_offsets;
+use read::build_lazy_scan;
+use row_offsets::footer_row_count;
 
 type BatchIter = Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>;
 
@@ -336,24 +336,12 @@ impl TableScan {
 
         let polars_predicate: Option<Expr> = conjunction(routing.parquet_filter);
 
-        // A DV addresses the file's physical rows. The read carries a
-        // physical row index for those files, so the predicate still goes
-        // into the parquet reader and the keep-mask matches on the index
-        // afterwards. Offsets follow the final file order, hence after
-        // pruning.
-        let has_dv = files.iter().any(|f| f.rewrite.dv.is_some());
-        if has_dv {
-            assign_dv_row_offsets(&mut files, self.engine.cloud_options())?;
-        }
-
-        let (paths, rewrites): (Vec<_>, Vec<_>) =
-            files.into_iter().map(|f| (f.path, f.rewrite)).unzip();
-
         // Skip the file-id column + `LogicalScanIter` when no file needs
-        // DV/select — the common case (non-partitioned, non-DV, non-CM).
-        let needs_rewrite = rewrites
-            .iter()
-            .any(|r| r.select.is_some() || r.dv.is_some());
+        // DV/select — the common case (non-partitioned, non-DV, non-CM). A
+        // DV file also needs `ROW_INDEX_COL` (see its doc).
+        let has_dv = files.iter().any(|f| f.rewrite.deleted_rows.is_some());
+        let needs_rewrite = has_dv || files.iter().any(|f| f.rewrite.select.is_some());
+        let paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
 
         let lazy = build_lazy_scan(
             paths,
@@ -371,15 +359,16 @@ impl TableScan {
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
 
         let new_iter: BatchIter = if needs_rewrite {
+            let storage = self.engine.storage_handler();
             Box::new(
                 LogicalScanIter::new(
                     source,
                     path_index,
-                    rewrites,
-                    has_dv,
+                    files,
+                    |file| footer_row_count(storage.as_ref(), file),
                     conjunction(routing.post_transform),
                     output_projection,
-                )
+                )?
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
             )
         } else if routing.post_transform.is_empty() {

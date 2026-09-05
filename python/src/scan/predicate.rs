@@ -299,10 +299,15 @@ mod partition_prune_tests {
     /// Kernel writes `add.partitionValues` keyed by *physical* name.
     fn file(region: &str) -> ScanFileMeta {
         ScanFileMeta {
+            file: delta_kernel::FileMeta {
+                location: url::Url::parse(&format!("file:///t/{region}.parquet")).unwrap(),
+                last_modified: 0,
+                size: 0,
+            },
             path: PlRefPath::new(format!("/t/{region}.parquet")),
             rewrite: LogicalRewrite {
                 select: None,
-                dv: None,
+                deleted_rows: None,
             },
             partition_values: [("col-3".to_string(), region.to_string())]
                 .into_iter()

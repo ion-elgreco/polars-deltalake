@@ -24,7 +24,9 @@ pub(crate) use executor::PolarsPlanExecutor;
 #[cfg(test)]
 pub(crate) use handlers::parse_ndjson_inferred;
 use handlers::{ObjectStoreStorageHandler, PolarsJsonHandler, PolarsParquetHandler};
-pub(crate) use handlers::{dsl_parquet_scan, path_for_polars_io, unified_scan_args};
+pub(crate) use handlers::{
+    dsl_parquet_scan, fetch_parquet_metadata, path_for_polars_io, unified_scan_args,
+};
 
 use crate::translation::PolarsEvaluationHandler;
 

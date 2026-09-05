@@ -27,7 +27,8 @@ use url::Url;
 use crate::engine::data::resolve_path;
 use crate::engine::handlers::{
     MetadataColumns, align_lazy, dsl_parquet_scan, ensure_no_field_id_matching,
-    parse_ndjson_inferred, path_for_polars_io, split_metadata_columns, unified_scan_args,
+    parse_ndjson_inferred, path_for_polars_io, row_index_as_long, split_metadata_columns,
+    unified_scan_args,
 };
 use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
@@ -267,6 +268,9 @@ impl PolarsPlanExecutor {
         ensure_no_field_id_matching(read_schema)?;
         let args = unified_scan_args(self.cloud_opts.as_ref(), None);
         let mut lf = dsl_parquet_scan(paths, read_schema, args, row_index.as_ref())?;
+        if let Some(name) = &row_index {
+            lf = row_index_as_long(lf, name);
+        }
         let guards = non_nullable_guards(read_schema);
         if !guards.is_empty() {
             lf = lf.with_columns(guards);
@@ -340,13 +344,6 @@ impl PolarsPlanExecutor {
         let lf = self.scan_entries(ds.file_type, entries, &read_schema, &schema, meta_cols)?;
         Ok(NodeState { lf, schema })
     }
-}
-
-/// Kernel's plan contract types metadata columns LONG; polars' row index
-/// is IDX_DTYPE (u32). The parquet arms cast inside `dsl_parquet_scan`;
-/// this casts the JSON arm's `with_row_index` column.
-fn row_index_as_long(lf: LazyFrame, name: &PlSmallStr) -> LazyFrame {
-    lf.with_columns([col(name.clone()).cast(DataType::Int64)])
 }
 
 /// ScanParquet contract (kernel `plans/ir/nodes.rs`): a missing value for a

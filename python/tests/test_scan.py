@@ -660,10 +660,9 @@ class TestDeletionVectors:
         """A DV indexes the file's *physical* rows, so a pushed-down predicate
         must not run before the keep-mask. Uses the DAT fixture because
         `deltalake` cannot write a deletion vector."""
-        from _dat_helper import reader_cases
+        from _dv_helpers import dat_dv_table
 
-        case = next(c for c in reader_cases() if c.name == "deletion_vectors")
-        table = str(case / "delta")
+        table = str(dat_dv_table())
         # The DELETE behind this DV removed every `letter == 'a'` row.
         survivor = [{"letter": "b", "int": 228}]
 
@@ -732,16 +731,10 @@ class TestDeletionVectorPushdown:
 
     @pytest.fixture
     def expected(self):
-        from datetime import date
+        from _dv_helpers import DAT_SURVIVOR, plain_frame
 
-        from _dv_helpers import plain_frame
-
-        survivor = pl.DataFrame(
-            {"letter": ["b"], "int": [228], "date": [date(1978, 12, 1)]},
-            schema={"letter": pl.String, "int": pl.Int64, "date": pl.Date},
-        )
         return pl.concat(
-            [survivor, plain_frame(*self.PLAIN_X), plain_frame(*self.PLAIN_Y)]
+            [DAT_SURVIVOR, plain_frame(*self.PLAIN_X), plain_frame(*self.PLAIN_Y)]
         )
 
     def test_full_scan(self, dv_table, expected):

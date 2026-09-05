@@ -17,8 +17,8 @@ use delta_kernel::expressions::ColumnName;
 use delta_kernel::plans::{Operation, PlanExecutor};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, StructType};
-use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::{DeltaResult, Engine};
+use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
+use delta_kernel::{DeltaResult, Engine, FileMeta};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{DataFrame, Expr, col};
 use polars_utils::pl_path::PlRefPath;
@@ -37,41 +37,21 @@ pub(crate) struct LogicalRewrite {
     /// literals, in logical-schema order. `None` when the physical frame is
     /// already logical (non-partitioned, non-column-mapped).
     pub(crate) select: Option<Vec<Expr>>,
-    /// Per-file DV — sorted deleted row indices plus the file's place in the
-    /// scan's physical row index. `None` if the file has no DV.
-    pub(crate) dv: Option<DvState>,
-}
-
-pub(crate) struct DvState {
-    /// Sorted ascending file-local row indices to drop.
-    pub(crate) deleted: Vec<u64>,
-    /// Scan-wide row index of the file's first physical row. Set by
-    /// `assign_dv_row_offsets` once the final file order is known.
-    pub(crate) row_offset: u64,
-    /// Physical rows in the file; bounds the index → file mapping.
-    pub(crate) num_rows: u64,
-}
-
-impl DvState {
-    /// `row_indexes` inherits whatever order the DV bitmap iterates, and the
-    /// keep-mask merge requires ascending — enforce it here rather than
-    /// trust the kernel rev.
-    pub(crate) fn new(mut deleted: Vec<u64>) -> Self {
-        deleted.sort_unstable();
-        Self {
-            deleted,
-            row_offset: 0,
-            num_rows: 0,
-        }
-    }
+    /// File-local physical row indices the DV drops, in the order the DV
+    /// bitmap iterates. `None` if the file has no DV.
+    pub(crate) deleted_rows: Option<Vec<u64>>,
 }
 
 pub(crate) struct ScanFileMeta {
+    /// Location and size, as the kernel storage handler reads files.
+    pub(crate) file: FileMeta,
+    /// The same location as polars-io scans it.
     pub(crate) path: PlRefPath,
     pub(crate) rewrite: LogicalRewrite,
     pub(crate) partition_values: HashMap<String, String>,
     /// `numRecords` from the add action's stats: the file's physical row
-    /// count. `None` when the writer left stats out.
+    /// count. `None` when the writer left stats out, or on tables without
+    /// the DV feature, where nothing needs it.
     pub(crate) num_records: Option<u64>,
 }
 
@@ -85,6 +65,8 @@ pub(crate) struct ResolvedScan {
 /// One `add` row pulled out of a plan output batch via the row visitor.
 struct AddRow {
     path: String,
+    size: u64,
+    modification_time: i64,
     dv: Option<DeletionVectorDescriptor>,
     partition_values: HashMap<String, String>,
     num_records: Option<u64>,
@@ -138,12 +120,18 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
 
     let storage = engine.storage_handler();
     let select_template = needs_select.then(|| data_expr_template(&sources, mode));
+    // Without the reader feature no file can carry a DV, so nothing needs
+    // the row counts and the stats JSON stays unparsed.
+    let dv_tables = config
+        .protocol()
+        .reader_features()
+        .is_some_and(|features| features.contains(&TableFeature::DeletionVectors));
     let mut files: Vec<ScanFileMeta> = Vec::new();
     let mut path_index: HashMap<String, usize> = HashMap::new();
 
     for batch in batches {
         let batch = batch.map_err(|e| anyhow::anyhow!("metadata plan batch failed: {e:#}"))?;
-        let rows = visit_add_rows(batch.as_ref())?;
+        let rows = visit_add_rows(batch.as_ref(), dv_tables)?;
         let polars_batch = batch
             .any_ref()
             .downcast_ref::<PolarsEngineData>()
@@ -159,13 +147,12 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
 
             // `Vec<u64>` of deleted row indices is far smaller than a
             // `Vec<bool>` keep-mask for sparse deletes.
-            let dv = row
+            let deleted_rows = row
                 .dv
-                .map(|descriptor| -> anyhow::Result<DvState> {
-                    let deleted = descriptor
+                .map(|descriptor| {
+                    descriptor
                         .row_indexes(storage.clone(), &table_root)
-                        .map_err(|e| anyhow::anyhow!("deletion vector read failed: {e:#}"))?;
-                    Ok(DvState::new(deleted))
+                        .map_err(|e| anyhow::anyhow!("deletion vector read failed: {e:#}"))
                 })
                 .transpose()?;
 
@@ -174,8 +161,8 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
             let idx = files.len();
             // `LogicalScanIter` maps a scanned row back to its file through
             // this index, so two live adds for one path would share the last
-            // one's DV cursor and select list — deleted rows resurface, live
-            // ones vanish. The log has no valid shape that produces it.
+            // one's DV and select list — deleted rows resurface, live ones
+            // vanish. The log has no valid shape that produces it.
             if path_index
                 .insert(pl_path.as_str().to_string(), idx)
                 .is_some()
@@ -183,8 +170,16 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
                 anyhow::bail!("log replay produced two live add actions for {pl_path}");
             }
             files.push(ScanFileMeta {
+                file: FileMeta {
+                    location: abs,
+                    last_modified: row.modification_time,
+                    size: row.size,
+                },
                 path: pl_path,
-                rewrite: LogicalRewrite { select, dv },
+                rewrite: LogicalRewrite {
+                    select,
+                    deleted_rows,
+                },
                 partition_values: row.partition_values,
                 num_records: row.num_records,
             });
@@ -377,13 +372,16 @@ mod visit_add_rows_tests {
         .unwrap()
         .with_outer_validity(Some(Bitmap::from([false])))
         .into_series();
+        let size = Series::new("size".into(), [1i64]);
+        let mtime = Series::new("modificationTime".into(), [0i64]);
         let stats = Series::full_null("stats".into(), 1, &PlDataType::String);
-        let add = StructChunked::from_series("add".into(), 1, [path, pv, dv, stats].iter())
-            .unwrap()
-            .into_series();
+        let add =
+            StructChunked::from_series("add".into(), 1, [path, pv, dv, size, mtime, stats].iter())
+                .unwrap()
+                .into_series();
         let df = DataFrame::new(1, vec![add.into_column()]).unwrap();
 
-        let err = match visit_add_rows(&PolarsEngineData::new(df)) {
+        let err = match visit_add_rows(&PolarsEngineData::new(df), true) {
             Ok(_) => panic!("a null partitionValues must error, not default to {{}}"),
             Err(e) => e,
         };
@@ -528,12 +526,17 @@ fn fill_select(template: &[Option<Expr>], literals: Vec<Expr>) -> Vec<Expr> {
         .collect()
 }
 
-/// Extract (path, DV descriptor, partition-values map, row count) per add
-/// row through the kernel row-visitor machinery — the same getters kernel's
-/// own log replay uses.
-fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<AddRow>> {
+/// Extract one `AddRow` per add row through the kernel row-visitor
+/// machinery — the same getters kernel's own log replay uses. The stats
+/// JSON is parsed for `numRecords` only when `parse_num_records`, since
+/// only DV placement reads it.
+fn visit_add_rows(
+    batch: &dyn delta_kernel::EngineData,
+    parse_num_records: bool,
+) -> anyhow::Result<Vec<AddRow>> {
     struct Visitor {
         rows: Vec<AddRow>,
+        parse_num_records: bool,
     }
 
     fn names_and_types() -> &'static (Vec<ColumnName>, Vec<KernelDataType>) {
@@ -548,6 +551,8 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
                     ColumnName::new(["add", "deletionVector", "offset"]),
                     ColumnName::new(["add", "deletionVector", "sizeInBytes"]),
                     ColumnName::new(["add", "deletionVector", "cardinality"]),
+                    ColumnName::new(["add", "size"]),
+                    ColumnName::new(["add", "modificationTime"]),
                     ColumnName::new(["add", "stats"]),
                 ],
                 vec![
@@ -557,6 +562,8 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
                     KernelDataType::STRING,
                     KernelDataType::INTEGER,
                     KernelDataType::INTEGER,
+                    KernelDataType::LONG,
+                    KernelDataType::LONG,
                     KernelDataType::LONG,
                     KernelDataType::STRING,
                 ],
@@ -628,12 +635,27 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
                     }
                 };
 
-                let num_records = getters[7]
-                    .get_str(i, "add.stats")?
-                    .and_then(num_records_from_stats);
+                let size: i64 = getters[7].get_long(i, "add.size")?.ok_or_else(|| {
+                    delta_kernel::Error::Generic("metadata plan emitted a null add.size".into())
+                })?;
+                let size = u64::try_from(size).map_err(|_| {
+                    delta_kernel::Error::Generic(format!("add.size {size} is negative"))
+                })?;
+                let modification_time = getters[8]
+                    .get_long(i, "add.modificationTime")?
+                    .unwrap_or_default();
+                let num_records = if self.parse_num_records {
+                    getters[9]
+                        .get_str(i, "add.stats")?
+                        .and_then(num_records_from_stats)
+                } else {
+                    None
+                };
 
                 self.rows.push(AddRow {
                     path: path.to_string(),
+                    size,
+                    modification_time,
                     dv,
                     partition_values,
                     num_records,
@@ -645,6 +667,7 @@ fn visit_add_rows(batch: &dyn delta_kernel::EngineData) -> anyhow::Result<Vec<Ad
 
     let mut visitor = Visitor {
         rows: Vec::with_capacity(batch.len()),
+        parse_num_records,
     };
     visitor
         .visit_rows_of(batch)

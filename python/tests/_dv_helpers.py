@@ -1,32 +1,28 @@
-"""Hand-authored deletion-vector tables.
+"""Deletion-vector tables assembled from the DAT fixture.
 
-`deltalake` cannot write a deletion vector and Spark is heavy, so these
-helpers reuse the DAT `deletion_vectors` fixture: one 5-row parquet file
-whose DV drops the four `letter == 'a'` rows. A new table is assembled
-from its protocol, metadata, data file and DV file, plus any number of
-plain data files written by polars and committed by hand. The DV commit
-can go first or last so the DV file lands on either side of the plain
-files in scan order.
+`deltalake` cannot write a deletion vector and Spark is heavy, so a DV
+table starts from the DAT `deletion_vectors` fixture: one 5-row parquet
+file whose DV drops the four `letter == 'a'` rows. Its protocol, metadata,
+data file and DV file are copied over, `deltalake` appends the plain data
+files, and the DV commit goes first or last so the DV file lands on either
+side of the plain files in scan order.
 """
 
 from __future__ import annotations
 
-import json
 import shutil
-import time
+from datetime import date
 from pathlib import Path
 
 import polars as pl
 from _dat_helper import reader_cases
+from _log_helpers import read_log_actions, rewrite_log_actions, write_log_actions
 
-# The physical rows of the DAT file; the DV keeps only `b, 228`.
-DAT_PHYSICAL = pl.DataFrame(
-    {
-        "letter": ["a", "b", "a", "a", "a"],
-        "int": [25, 228, 692, 604, 95],
-    }
+# The one logical row of the DAT file after its DV.
+DAT_SURVIVOR = pl.DataFrame(
+    {"letter": ["b"], "int": [228], "date": [date(1978, 12, 1)]},
+    schema={"letter": pl.String, "int": pl.Int64, "date": pl.Date},
 )
-DAT_SURVIVOR = DAT_PHYSICAL.filter(pl.col("letter") == "b")
 
 
 def dat_dv_table() -> Path:
@@ -34,83 +30,56 @@ def dat_dv_table() -> Path:
     return case / "delta"
 
 
-def _dat_actions() -> tuple[dict, dict, dict]:
-    """(protocol, metaData, add-with-DV) actions from the DAT log."""
-    log = dat_dv_table() / "_delta_log"
-    protocol = metadata = dv_add = None
-    for commit in sorted(log.glob("*.json")):
-        for line in commit.read_text().splitlines():
-            action = json.loads(line)
-            if "protocol" in action:
-                protocol = action
-            elif "metaData" in action:
-                metadata = action
-            elif "add" in action and action["add"].get("deletionVector"):
-                dv_add = action
-    assert protocol and metadata and dv_add
-    return protocol, metadata, dv_add
-
-
-def _write_commit(table: Path, version: int, actions: list[dict]) -> None:
-    commit = table / "_delta_log" / f"{version:020d}.json"
-    commit.write_text("".join(json.dumps(a) + "\n" for a in actions))
-
-
-def _plain_add(
-    table: Path, df: pl.DataFrame, name: str, row_group_size: int, num_records: bool
-) -> dict:
-    file = table / name
-    df.write_parquet(file, row_group_size=row_group_size, statistics=True)
-    add = {
-        "path": name,
-        "partitionValues": {},
-        "size": file.stat().st_size,
-        "modificationTime": int(time.time() * 1000),
-        "dataChange": True,
-    }
-    if num_records:
-        add["stats"] = json.dumps({"numRecords": df.height})
-    return {"add": add}
+def _versions(table: Path) -> list[int]:
+    return sorted(int(p.stem) for p in (table / "_delta_log").glob("*.json"))
 
 
 def build_dv_table(
     dst: Path,
     plain: list[pl.DataFrame],
     *,
-    dv_commit: str = "last",
-    row_group_size: int = 1000,
-    num_records: bool = True,
+    dv_commit: str,
+    row_group_size: int,
+    num_records: bool,
 ) -> Path:
     """Assemble a DV table at `dst`.
 
-    `plain` frames become one parquet file each (schema: letter, int, date),
-    committed one per version. `dv_commit` places the DAT DV file in the
-    oldest ("first") or newest ("last") commit. `num_records=False` commits
-    the plain files without any stats, the shape a stats-less writer
+    Each frame in `plain` becomes one appended parquet file (schema:
+    letter, int, date). `dv_commit` puts the DAT DV file in the oldest
+    ("first") or newest ("last") commit. `num_records=False` strips the
+    stats off the plain files' add actions, the shape a stats-less writer
     produces, which forces the reader to fetch row counts from the footers.
     """
+    from deltalake import WriterProperties, write_deltalake
+
     assert dv_commit in ("first", "last")
-    protocol, metadata, dv_add = _dat_actions()
     src = dat_dv_table()
+    actions = [a for v in _versions(src) for a in read_log_actions(src, v)]
+    protocol = next(a for a in actions if "protocol" in a)
+    metadata = next(a for a in actions if "metaData" in a)
+    dv_add = next(a for a in actions if a.get("add", {}).get("deletionVector"))
+
     dst.mkdir(parents=True)
     (dst / "_delta_log").mkdir()
-    shutil.copy(src / dv_add["add"]["path"], dst / dv_add["add"]["path"])
+    shutil.copy(src / dv_add["add"]["path"], dst)
     for dv_file in src.glob("deletion_vector_*.bin"):
-        shutil.copy(dv_file, dst / dv_file.name)
+        shutil.copy(dv_file, dst)
 
-    _write_commit(dst, 0, [protocol, metadata])
-    version = 1
-    if dv_commit == "first":
-        _write_commit(dst, version, [dv_add])
-        version += 1
-    for i, df in enumerate(plain):
-        add = _plain_add(
-            dst, df, f"part-plain-{i}.parquet", row_group_size, num_records
+    first = [protocol, metadata] + ([dv_add] if dv_commit == "first" else [])
+    write_log_actions(dst, 0, first)
+    for df in plain:
+        write_deltalake(
+            dst,
+            df.to_arrow(),
+            mode="append",
+            writer_properties=WriterProperties(max_row_group_size=row_group_size),
         )
-        _write_commit(dst, version, [add])
-        version += 1
+        if not num_records:
+            rewrite_log_actions(
+                dst, lambda a: a.get("add", {}).pop("stats", None), _versions(dst)[-1]
+            )
     if dv_commit == "last":
-        _write_commit(dst, version, [dv_add])
+        write_log_actions(dst, _versions(dst)[-1] + 1, [dv_add])
     return dst
 
 

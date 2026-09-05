@@ -2,20 +2,20 @@
 //! applies the per-file DV keep-mask + physical→logical select list.
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 
 use polars::prelude::{
     BooleanChunked, Column, DataFrame, Expr, IdxCa, IdxSize, IntoLazy, LiteralValue, PolarsResult,
     Scalar, StringChunked, col,
 };
 use polars::series::IsSorted;
-use polars_arrow::array::BooleanArray;
 use polars_arrow::bitmap::MutableBitmap;
-use polars_arrow::datatypes::ArrowDataType;
 use polars_utils::pl_str::PlSmallStr;
 
 use crate::engine::select_anchored;
-use crate::scan::plan::{DvState, LogicalRewrite};
+use crate::scan::plan::{LogicalRewrite, ScanFileMeta};
 use crate::scan::read::{FILE_ID_COL, ROW_INDEX_COL};
+use crate::scan::row_offsets::place_dvs;
 
 /// One column of a pre-parsed simple select: a rename of a read column or a
 /// broadcast literal (partition value).
@@ -102,10 +102,29 @@ impl SimpleSelect {
     }
 }
 
-/// One file's rewrite state plus its pre-parsed select fast path.
+/// A file's deletion vector placed in the scan-wide row index.
+struct PlacedDv {
+    /// Sorted ascending file-local row indices to drop.
+    deleted: Vec<u64>,
+    /// `ROW_INDEX_COL` values the file's physical rows occupy.
+    rows: Range<u64>,
+}
+
+impl PlacedDv {
+    /// `row_indexes` inherits whatever order the DV bitmap iterates, and the
+    /// keep-mask merge requires ascending — enforce it here rather than
+    /// trust the kernel rev.
+    fn new(mut deleted: Vec<u64>, rows: Range<u64>) -> Self {
+        deleted.sort_unstable();
+        Self { deleted, rows }
+    }
+}
+
+/// One file's select list, its pre-parsed fast path, and its placed DV.
 struct FileRewrite {
-    rewrite: LogicalRewrite,
+    select: Option<Vec<Expr>>,
     simple: Option<SimpleSelect>,
+    dv: Option<PlacedDv>,
 }
 
 /// Splits each bulk-read frame on `FILE_ID_COL` runs and applies the
@@ -117,9 +136,7 @@ pub(crate) struct LogicalScanIter {
     /// `FILE_ID_COL` value → index in `files`.
     path_index: HashMap<String, usize>,
     files: Vec<FileRewrite>,
-    /// The read also carries `ROW_INDEX_COL` — on whenever a file has a DV,
-    /// so the keep-mask can address rows by physical position after the
-    /// parquet reader has filtered and skipped row groups.
+    /// The read also carries `ROW_INDEX_COL`: on whenever a file has a DV.
     row_index: bool,
     /// Mixed atomic conjuncts (touching both partition and data cols) —
     /// applied after the select list materializes partition values.
@@ -134,22 +151,37 @@ pub(crate) struct LogicalScanIter {
 }
 
 impl LogicalScanIter {
+    /// `files` in scan order, the order polars numbers `ROW_INDEX_COL` in.
+    /// `row_count` supplies the physical row count of a file whose add
+    /// action carries no `numRecords`.
     pub(crate) fn new(
         source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>,
         path_index: HashMap<String, usize>,
-        rewrites: Vec<LogicalRewrite>,
-        row_index: bool,
+        files: Vec<ScanFileMeta>,
+        row_count: impl Fn(&ScanFileMeta) -> anyhow::Result<u64> + Sync,
         orphan_predicate: Option<Expr>,
         output_projection: Option<Vec<String>>,
-    ) -> Self {
-        let files = rewrites
+    ) -> anyhow::Result<Self> {
+        let spans = place_dvs(&files, row_count)?;
+        let row_index = spans.iter().any(Option::is_some);
+        let files = files
             .into_iter()
-            .map(|rewrite| {
-                let simple = rewrite.select.as_deref().and_then(SimpleSelect::parse);
-                FileRewrite { rewrite, simple }
+            .zip(spans)
+            .map(|(file, rows)| {
+                let LogicalRewrite {
+                    select,
+                    deleted_rows,
+                } = file.rewrite;
+                FileRewrite {
+                    simple: select.as_deref().and_then(SimpleSelect::parse),
+                    select,
+                    dv: deleted_rows
+                        .zip(rows)
+                        .map(|(deleted, rows)| PlacedDv::new(deleted, rows)),
+                }
             })
             .collect();
-        Self {
+        Ok(Self {
             source,
             path_index,
             files,
@@ -158,7 +190,7 @@ impl LogicalScanIter {
             output_projection: output_projection
                 .map(|cols| cols.iter().map(|c| col(c.as_str())).collect()),
             pending: VecDeque::new(),
-        }
+        })
     }
 
     /// Slice on file-id boundaries, push each per-file logical frame onto
@@ -227,19 +259,21 @@ impl LogicalScanIter {
         })?;
         let entry = &self.files[idx];
 
-        if let Some(dv) = &entry.rewrite.dv {
-            let rows = row_index.as_ref().ok_or_else(|| {
-                delta_kernel::Error::Generic(format!(
-                    "{file_id} has a deletion vector but the scan carries no row index"
-                ))
-            })?;
-            let rows = rows.idx().map_err(|e| {
-                delta_kernel::Error::Generic(format!("{ROW_INDEX_COL} is not an index column: {e}"))
-            })?;
-            let mask = keep_mask(dv, rows)?;
-            df = df
-                .filter(&mask)
-                .map_err(|e| delta_kernel::Error::Generic(format!("DV filter: {e}")))?;
+        if let Some(dv) = &entry.dv {
+            let rows = row_index
+                .as_ref()
+                .expect("row index requested whenever a file has a DV")
+                .idx()
+                .map_err(|e| {
+                    delta_kernel::Error::Generic(format!(
+                        "{ROW_INDEX_COL} is not an index column: {e}"
+                    ))
+                })?;
+            if let Some(mask) = keep_mask(dv, rows)? {
+                df = df
+                    .filter(&mask)
+                    .map_err(|e| delta_kernel::Error::Generic(format!("DV filter: {e}")))?;
+            }
         }
 
         // With no lazy stage the fast path stays collect-free; once one is
@@ -249,7 +283,7 @@ impl LogicalScanIter {
         // was widened for.
         let has_lazy_stage = self.orphan_predicate.is_some()
             || self.output_projection.is_some()
-            || (entry.simple.is_none() && entry.rewrite.select.is_some());
+            || (entry.simple.is_none() && entry.select.is_some());
         if !has_lazy_stage {
             if let Some(fast) = &entry.simple {
                 df = fast.apply(&df).map_err(|e| {
@@ -260,7 +294,7 @@ impl LogicalScanIter {
         }
 
         let mut lazy = df.lazy();
-        if let Some(select) = &entry.rewrite.select {
+        if let Some(select) = &entry.select {
             lazy = select_anchored(lazy, select);
         }
         if let Some(pred) = &self.orphan_predicate {
@@ -296,15 +330,15 @@ fn find_run_end<'a>(
     lo
 }
 
-/// Keep-mask for one file's batch: a row survives unless its file-local
-/// physical index is in `dv.deleted`. An unfiltered batch is one contiguous
-/// physical slice (polars flags its row index ascending), so the deleted
-/// positions inside it go straight into the bitmap. A filtered batch merges
-/// its ascending index against the deleted list; a descending step re-seeks
-/// with a binary search rather than trusting the order. Every index must
-/// fall inside the file, or the offsets are wrong and the mask would be
-/// too.
-fn keep_mask(dv: &DvState, rows: &IdxCa) -> Result<BooleanChunked, delta_kernel::Error> {
+/// Keep-mask for one file's batch, `None` when no row is deleted. An
+/// unfiltered batch is one contiguous physical slice (polars flags its row
+/// index ascending), so the deleted positions inside it go straight into
+/// the bitmap. A filtered batch merges its ascending index against the
+/// deleted list; a descending step re-seeks with a binary search rather
+/// than trusting the order. Every index must fall inside the file, or the
+/// placement is wrong and the mask would be too.
+fn keep_mask(dv: &PlacedDv, rows: &IdxCa) -> Result<Option<BooleanChunked>, delta_kernel::Error> {
+    const NAME: &str = "__pldl_dv__";
     if rows.null_count() > 0 {
         return Err(delta_kernel::Error::Generic(format!(
             "{ROW_INDEX_COL} has nulls"
@@ -312,57 +346,59 @@ fn keep_mask(dv: &DvState, rows: &IdxCa) -> Result<BooleanChunked, delta_kernel:
     }
     let file_local = |global: IdxSize| {
         let global = global as u64;
-        global
-            .checked_sub(dv.row_offset)
-            .filter(|l| *l < dv.num_rows)
-            .ok_or_else(|| {
-                delta_kernel::Error::Generic(format!(
-                    "row index {global} falls outside its file's rows [{}, {})",
-                    dv.row_offset,
-                    dv.row_offset + dv.num_rows
-                ))
-            })
+        if dv.rows.contains(&global) {
+            Ok(global - dv.rows.start)
+        } else {
+            Err(delta_kernel::Error::Generic(format!(
+                "row index {global} falls outside its file's rows {:?}",
+                dv.rows
+            )))
+        }
     };
     let deleted = &dv.deleted;
     let n = rows.len();
     let mut keep = MutableBitmap::from_len_set(n);
-    let contiguous = rows.is_sorted_flag() == IsSorted::Ascending
-        && match (rows.first(), rows.last()) {
-            (Some(f), Some(l)) => (l as u64).checked_sub(f as u64) == Some(n as u64 - 1),
-            _ => false,
-        };
-    if contiguous {
-        let lo = file_local(rows.first().expect("n > 0"))?;
-        file_local(rows.last().expect("n > 0"))?;
+
+    if rows.is_sorted_flag() == IsSorted::Ascending
+        && let (Some(first), Some(last)) = (rows.first(), rows.last())
+        && (last as u64).checked_sub(first as u64) == Some(n as u64 - 1)
+    {
+        let lo = file_local(first)?;
+        file_local(last)?;
         let start = deleted.partition_point(|&d| d < lo);
         let end = deleted.partition_point(|&d| d < lo + n as u64);
+        if start == end {
+            return Ok(None);
+        }
         for &d in &deleted[start..end] {
             keep.set((d - lo) as usize, false);
         }
-    } else {
-        let mut i = 0usize;
-        let mut p = 0usize;
-        let mut prev = 0u64;
-        for arr in rows.downcast_iter() {
-            for &idx in arr.values().iter() {
-                let local = file_local(idx)?;
-                if local < prev {
-                    p = deleted.partition_point(|&d| d < local);
-                } else {
-                    while p < deleted.len() && deleted[p] < local {
-                        p += 1;
-                    }
+        return Ok(Some(BooleanChunked::from_bitmap(NAME.into(), keep.into())));
+    }
+
+    let mut dropped = 0usize;
+    let mut i = 0usize;
+    let mut p = 0usize;
+    let mut prev = u64::MAX;
+    for arr in rows.downcast_iter() {
+        for &idx in arr.values().iter() {
+            let local = file_local(idx)?;
+            if local < prev {
+                p = deleted.partition_point(|&d| d < local);
+            } else {
+                while p < deleted.len() && deleted[p] < local {
+                    p += 1;
                 }
-                if p < deleted.len() && deleted[p] == local {
-                    keep.set(i, false);
-                }
-                prev = local;
-                i += 1;
             }
+            if p < deleted.len() && deleted[p] == local {
+                keep.set(i, false);
+                dropped += 1;
+            }
+            prev = local;
+            i += 1;
         }
     }
-    let arr = BooleanArray::new(ArrowDataType::Boolean, keep.into(), None);
-    Ok(BooleanChunked::with_chunk("__pldl_dv__".into(), arr))
+    Ok((dropped > 0).then(|| BooleanChunked::from_bitmap(NAME.into(), keep.into())))
 }
 
 impl Iterator for LogicalScanIter {
@@ -446,24 +482,25 @@ mod simple_select_tests {
 
 #[cfg(test)]
 mod keep_mask_tests {
-    use polars::prelude::{IdxSize, NamedFrom};
+    use polars::prelude::NamedFrom;
 
     use super::*;
 
-    fn dv(deleted: Vec<u64>, row_offset: u64, num_rows: u64) -> DvState {
-        let mut dv = DvState::new(deleted);
-        dv.row_offset = row_offset;
-        dv.num_rows = num_rows;
-        dv
+    fn dv(deleted: Vec<u64>, rows: Range<u64>) -> PlacedDv {
+        PlacedDv::new(deleted, rows)
     }
 
-    fn bools(m: BooleanChunked) -> Vec<bool> {
-        (0..m.len()).map(|i| m.get(i).unwrap()).collect()
+    /// `None` means every row survives.
+    fn bools(mask: Option<BooleanChunked>, n: usize) -> Vec<bool> {
+        match mask {
+            Some(m) => (0..n).map(|i| m.get(i).unwrap()).collect(),
+            None => vec![true; n],
+        }
     }
 
     /// Unflagged, so the merge path.
-    fn mask(dv: &DvState, rows: &[IdxSize]) -> Result<Vec<bool>, delta_kernel::Error> {
-        keep_mask(dv, &IdxCa::new("r".into(), rows)).map(bools)
+    fn mask(dv: &PlacedDv, rows: &[IdxSize]) -> Result<Vec<bool>, delta_kernel::Error> {
+        keep_mask(dv, &IdxCa::new("r".into(), rows)).map(|m| bools(m, rows.len()))
     }
 
     /// Flagged ascending, as polars hands over a scan row index.
@@ -475,22 +512,19 @@ mod keep_mask_tests {
 
     /// kernel's `row_indexes` inherits the DV bitmap's iteration order; the
     /// merge requires ascending. Unsorted input must still mask exactly the
-    /// deleted rows, batch after batch.
+    /// deleted rows.
     #[test]
     fn keep_mask_is_exact_for_unsorted_dv_indices() {
-        let dv = dv(vec![5, 100, 3], 0, 200);
-        let first: Vec<IdxSize> = (0..10).collect();
-        let expected: Vec<bool> = (0..10u64).map(|i| i != 3 && i != 5).collect();
-        assert_eq!(mask(&dv, &first).unwrap(), expected);
-        let second: Vec<IdxSize> = (10..110).collect();
-        let expected: Vec<bool> = (10..110u64).map(|i| i != 100).collect();
-        assert_eq!(mask(&dv, &second).unwrap(), expected);
+        let dv = dv(vec![5, 100, 3], 0..200);
+        let rows: Vec<IdxSize> = (0..110).collect();
+        let expected: Vec<bool> = (0..110u64).map(|i| i != 3 && i != 5 && i != 100).collect();
+        assert_eq!(mask(&dv, &rows).unwrap(), expected);
     }
 
     /// The DV indexes the file; the scan indexes every file before it too.
     #[test]
-    fn file_offset_maps_scan_index_to_file_index() {
-        let dv = dv(vec![2], 1000, 10);
+    fn file_span_maps_scan_index_to_file_index() {
+        let dv = dv(vec![2], 1000..1010);
         assert_eq!(
             mask(&dv, &[1000, 1001, 1002, 1003]).unwrap(),
             [true, true, false, true]
@@ -501,7 +535,7 @@ mod keep_mask_tests {
     /// must still land on their own physical positions.
     #[test]
     fn skipped_rows_do_not_shift_the_mask() {
-        let dv = dv(vec![1, 7, 8], 0, 10);
+        let dv = dv(vec![1, 7, 8], 0..10);
         assert_eq!(
             mask(&dv, &[6, 7, 8, 9]).unwrap(),
             [true, false, false, true]
@@ -510,46 +544,50 @@ mod keep_mask_tests {
 
     #[test]
     fn non_ascending_rows_still_mask_exactly() {
-        let dv = dv(vec![1, 3], 0, 10);
+        let dv = dv(vec![1, 3], 0..10);
         assert_eq!(
             mask(&dv, &[3, 1, 2, 3, 0]).unwrap(),
             [false, false, true, false, true]
         );
     }
 
-    /// An index outside the file means the offsets are wrong; masking on
+    /// An index outside the file means the placement is wrong; masking on
     /// would silently keep deleted rows or drop live ones.
     #[test]
     fn index_outside_the_file_errors() {
-        let dv = dv(vec![0], 10, 5);
+        let dv = dv(vec![0], 10..15);
         assert!(mask(&dv, &[9]).is_err());
         assert!(mask(&dv, &[15]).is_err());
         assert_eq!(mask(&dv, &[10, 14]).unwrap(), [false, true]);
     }
 
     /// An unfiltered batch is one contiguous slice and takes the positional
-    /// path; it must still respect the file's bounds.
+    /// path; it must still respect the file's bounds, and a slice with no
+    /// deleted row in it needs no mask at all.
     #[test]
     fn contiguous_flagged_batch_masks_positionally() {
-        let dv = dv(vec![0, 3, 4, 9], 100, 10);
+        let dv = dv(vec![0, 3, 4, 9], 100..110);
         let rows: Vec<IdxSize> = (100..110).collect();
         assert_eq!(
-            bools(keep_mask(&dv, &flagged(&rows)).unwrap()),
+            bools(keep_mask(&dv, &flagged(&rows)).unwrap(), 10),
             [
                 false, true, true, false, false, true, true, true, true, false
             ]
         );
         let rows: Vec<IdxSize> = (105..115).collect();
         assert!(keep_mask(&dv, &flagged(&rows)).is_err());
+        let rows: Vec<IdxSize> = (105..109).collect();
+        assert!(keep_mask(&dv, &flagged(&rows)).unwrap().is_none());
     }
 
     /// A filtered batch keeps the flag but has gaps, so it merges instead.
     #[test]
     fn flagged_batch_with_gaps_merges() {
-        let dv = dv(vec![1, 7, 8], 0, 10);
+        let dv = dv(vec![1, 7, 8], 0..10);
         assert_eq!(
-            bools(keep_mask(&dv, &flagged(&[0, 1, 7, 9])).unwrap()),
+            bools(keep_mask(&dv, &flagged(&[0, 1, 7, 9])).unwrap(), 4),
             [true, false, false, true]
         );
+        assert!(keep_mask(&dv, &flagged(&[0, 2, 9])).unwrap().is_none());
     }
 }

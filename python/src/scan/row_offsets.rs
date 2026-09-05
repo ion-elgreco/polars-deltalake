@@ -1,41 +1,37 @@
-//! Places each DV file in the scan's physical row index.
-//!
-//! polars numbers physical rows across every file in path order, so a DV
-//! file's rows start at the row count of all files before it. The count
-//! comes from the log's `numRecords` stat; a writer that left stats out
-//! costs one footer read per file.
+//! Places each DV file in the scan-wide `ROW_INDEX_COL` (see its doc).
 
-use polars::io::cloud::CloudOptions;
-use polars::prelude::{IdxSize, ParquetObjectStore};
-use polars_utils::pl_path::PlRefPath;
+use std::ops::Range;
+
+use delta_kernel::StorageHandler;
+use polars::prelude::IdxSize;
+use rayon::prelude::*;
 
 use crate::scan::plan::ScanFileMeta;
 
-pub(crate) fn assign_dv_row_offsets(
-    files: &mut [ScanFileMeta],
-    cloud_opts: Option<&CloudOptions>,
-) -> anyhow::Result<()> {
-    assign_with(files, |path| footer_row_count(path, cloud_opts))
-}
-
-/// Every file up to the last DV file needs a count: earlier files place a
-/// DV file, and its own count bounds the index → file mapping.
-fn assign_with(
-    files: &mut [ScanFileMeta],
-    mut row_count: impl FnMut(&PlRefPath) -> anyhow::Result<u64>,
-) -> anyhow::Result<()> {
-    let Some(last_dv) = files.iter().rposition(|f| f.rewrite.dv.is_some()) else {
-        return Ok(());
+/// The physical row range of every DV file, aligned with `files`. Every
+/// file up to the last DV file needs a count: earlier files place a DV
+/// file, its own count bounds the index → file mapping. `row_count` fills
+/// in files whose add action carries no `numRecords`.
+pub(crate) fn place_dvs(
+    files: &[ScanFileMeta],
+    row_count: impl Fn(&ScanFileMeta) -> anyhow::Result<u64> + Sync,
+) -> anyhow::Result<Vec<Option<Range<u64>>>> {
+    let mut spans = vec![None; files.len()];
+    let Some(last_dv) = files.iter().rposition(|f| f.rewrite.deleted_rows.is_some()) else {
+        return Ok(spans);
     };
+    // Footer reads are round trips; run them side by side.
+    let counts: Vec<u64> = files[..=last_dv]
+        .par_iter()
+        .map(|f| match f.num_records {
+            Some(n) => Ok(n),
+            None => row_count(f),
+        })
+        .collect::<anyhow::Result<_>>()?;
     let mut offset: u64 = 0;
-    for file in &mut files[..=last_dv] {
-        let num_rows = match file.num_records {
-            Some(n) => n,
-            None => row_count(&file.path)?,
-        };
-        if let Some(dv) = file.rewrite.dv.as_mut() {
-            dv.row_offset = offset;
-            dv.num_rows = num_rows;
+    for ((file, span), num_rows) in files.iter().zip(spans.iter_mut()).zip(counts) {
+        if file.rewrite.deleted_rows.is_some() {
+            *span = Some(offset..offset + num_rows);
         }
         offset = offset.saturating_add(num_rows);
     }
@@ -47,90 +43,102 @@ fn assign_with(
             IdxSize::MAX
         );
     }
-    Ok(())
+    Ok(spans)
 }
 
-fn footer_row_count(path: &PlRefPath, cloud_opts: Option<&CloudOptions>) -> anyhow::Result<u64> {
-    let uri = path.clone();
-    let n = crate::engine::rt()
-        .block_on(async move {
-            let mut store = ParquetObjectStore::from_uri(uri, cloud_opts, None).await?;
-            store.num_rows_only().await
+pub(crate) fn footer_row_count(
+    storage: &dyn StorageHandler,
+    file: &ScanFileMeta,
+) -> anyhow::Result<u64> {
+    crate::engine::fetch_parquet_metadata(storage, &file.file)
+        .map(|m| m.num_rows as u64)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "row count from parquet footer of {}: {e:#}",
+                file.file.location
+            )
         })
-        .map_err(|e| anyhow::anyhow!("row count from parquet footer of {path}: {e:#}"))?;
-    u64::try_from(n).map_err(|_| anyhow::anyhow!("parquet footer of {path} reports {n} rows"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use delta_kernel::FileMeta;
+    use polars_utils::pl_path::PlRefPath;
+    use url::Url;
 
     use super::*;
-    use crate::scan::plan::{DvState, LogicalRewrite};
+    use crate::scan::plan::LogicalRewrite;
 
     fn file(name: &str, num_records: Option<u64>, dv: bool) -> ScanFileMeta {
         ScanFileMeta {
+            file: FileMeta {
+                location: Url::parse(&format!("memory:///{name}")).unwrap(),
+                last_modified: 0,
+                size: 0,
+            },
             path: PlRefPath::new(name),
             rewrite: LogicalRewrite {
                 select: None,
-                dv: dv.then(|| DvState::new(vec![1])),
+                deleted_rows: dv.then(|| vec![1]),
             },
             partition_values: HashMap::new(),
             num_records,
         }
     }
 
-    fn placement(f: &ScanFileMeta) -> Option<(u64, u64)> {
-        f.rewrite.dv.as_ref().map(|dv| (dv.row_offset, dv.num_rows))
-    }
-
-    /// Offsets accumulate over every earlier file, DV or not, and only files
+    /// Spans accumulate over every earlier file, DV or not, and only files
     /// without stats up to the last DV file cost a footer read.
     #[test]
-    fn offsets_accumulate_and_footers_fill_missing_counts() {
-        let mut files = vec![
+    fn spans_accumulate_and_footers_fill_missing_counts() {
+        let files = vec![
             file("a", Some(10), false),
             file("b", None, true),
             file("c", Some(7), false),
             file("d", None, true),
             file("e", None, false),
         ];
-        let mut fetched = Vec::new();
-        assign_with(&mut files, |p| {
-            fetched.push(p.to_string());
-            Ok(match p.as_str() {
+        let fetched = Mutex::new(Vec::new());
+        let spans = place_dvs(&files, |f| {
+            let name = f.path.to_string();
+            fetched.lock().unwrap().push(name.clone());
+            Ok(match name.as_str() {
                 "b" => 5,
                 "d" => 3,
                 other => panic!("unexpected footer read for {other}"),
             })
         })
         .unwrap();
+        let mut fetched = fetched.into_inner().unwrap();
+        fetched.sort();
         assert_eq!(fetched, ["b", "d"], "e is after the last DV file");
-        assert_eq!(placement(&files[1]), Some((10, 5)));
-        assert_eq!(placement(&files[3]), Some((22, 3)));
+        assert_eq!(spans, [None, Some(10..15), None, Some(22..25), None]);
     }
 
     #[test]
     fn no_dv_needs_no_counts() {
-        let mut files = vec![file("a", None, false), file("b", None, false)];
-        assign_with(&mut files, |p| panic!("footer read for {p}")).unwrap();
+        let files = vec![file("a", None, false), file("b", None, false)];
+        let spans = place_dvs(&files, |f| panic!("footer read for {}", f.path)).unwrap();
+        assert_eq!(spans, [None, None]);
     }
 
     #[test]
     fn footer_error_propagates() {
-        let mut files = vec![file("a", None, false), file("b", Some(1), true)];
+        let files = vec![file("a", None, false), file("b", Some(1), true)];
         let err =
-            assign_with(&mut files, |p| Err(anyhow::anyhow!("no footer for {p}"))).unwrap_err();
+            place_dvs(&files, |f| Err(anyhow::anyhow!("no footer for {}", f.path))).unwrap_err();
         assert!(err.to_string().contains("no footer for a"), "{err}");
     }
 
     #[test]
     fn past_the_index_limit_errors() {
-        let mut files = vec![
+        let files = vec![
             file("a", Some(IdxSize::MAX as u64), false),
             file("b", Some(1), true),
         ];
-        let err = assign_with(&mut files, |_| unreachable!()).unwrap_err();
+        let err = place_dvs(&files, |_| unreachable!()).unwrap_err();
         assert!(err.to_string().contains("row index limit"), "{err}");
     }
 }

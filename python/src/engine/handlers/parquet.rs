@@ -275,8 +275,8 @@ pub(crate) fn kernel_parquet_footer(
 }
 
 /// Fetch a parquet file's thrift footer via two range reads
-fn fetch_parquet_metadata(
-    storage: &ObjectStoreStorageHandler,
+pub(crate) fn fetch_parquet_metadata(
+    storage: &dyn StorageHandler,
     file: &FileMeta,
 ) -> DeltaResult<FileMetadata> {
     if file.size < FOOTER_SIZE {
@@ -339,10 +339,9 @@ pub(crate) fn parquet_options(physical_schema: &StructType) -> DeltaResult<Parqu
 }
 
 /// The one shared `DslBuilder::scan_parquet` construction: schema-typed
-/// options over `paths`, with the synthetic row index requested and typed
-/// in one place — kernel's plan contract types metadata columns LONG,
-/// polars' native row index is IDX_DTYPE (u32). Callers customize the
-/// remaining `args` first (file-id column).
+/// options over `paths`, with the synthetic row index requested in one
+/// place, in polars' native IDX_DTYPE. Callers customize the remaining
+/// `args` first (file-id column).
 pub(crate) fn dsl_parquet_scan(
     paths: Vec<PlRefPath>,
     physical_schema: &StructType,
@@ -356,14 +355,18 @@ pub(crate) fn dsl_parquet_scan(
         });
     }
     let options = parquet_options(physical_schema)?;
-    let lazy: LazyFrame = DslBuilder::scan_parquet(ScanSources::Paths(paths.into()), options, args)
-        .map_err(to_kernel_err)?
-        .build()
-        .into();
-    Ok(match row_index {
-        Some(name) => lazy.with_columns([col(name.clone()).cast(PlDataType::Int64)]),
-        None => lazy,
-    })
+    Ok(
+        DslBuilder::scan_parquet(ScanSources::Paths(paths.into()), options, args)
+            .map_err(to_kernel_err)?
+            .build()
+            .into(),
+    )
+}
+
+/// Kernel's plan contract types metadata columns LONG; polars' row index
+/// is IDX_DTYPE (u32). Every kernel-facing arm casts its row index here.
+pub(crate) fn row_index_as_long(lf: LazyFrame, name: &PlSmallStr) -> LazyFrame {
+    lf.with_columns([col(name.clone()).cast(PlDataType::Int64)])
 }
 
 /// The ScanParquet plan contract resolves a field carrying
@@ -462,6 +465,10 @@ fn file_batches(path: PlRefPath, location: &str, args: &FileScanArgs) -> DeltaRe
         scan_args,
         args.row_index.as_ref(),
     )?;
+    let lazy = match &args.row_index {
+        Some(name) => row_index_as_long(lazy, name),
+        None => lazy,
+    };
     let lazy = match &args.file_path {
         Some(name) => lazy.with_columns([lit(location).alias(name.clone())]),
         None => lazy,
