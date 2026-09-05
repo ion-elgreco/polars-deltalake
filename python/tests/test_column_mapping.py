@@ -56,7 +56,7 @@ def column_mapped_table(
     return path
 
 
-# The rows the fixture INSERTs, under the logical names.
+# The rows the fixture INSERts, under the logical names.
 _TABLE_DF = pl.DataFrame(
     {
         "id": [1, 2],
