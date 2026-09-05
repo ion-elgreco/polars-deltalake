@@ -59,12 +59,24 @@ struct FileEntry {
 impl PolarsPlanExecutor {
     pub(super) fn execute_query(&self, plan: Plan) -> DeltaResult<PlanResult> {
         let mut states: Vec<NodeState> = Vec::with_capacity(plan.nodes.len());
+        let mut reads_files = false;
         for node in plan.nodes {
+            reads_files |= matches!(node.op, Operator::ScanParquet(_) | Operator::DynamicScan(_));
             states.push(self.eval_node(node, &states)?);
         }
         let terminal = states
             .pop()
             .ok_or_else(|| Error::Generic("execute_query: plan has no nodes".into()))?;
+
+        // JSON inputs are parsed frames already, so a plan without file
+        // scans has nothing to stream; the in-memory engine skips the
+        // streaming engine's per-query start-up.
+        if !reads_files {
+            let mut df = terminal.lf.collect().map_err(to_kernel_err)?;
+            df.rechunk_mut();
+            let batch: DeltaResult<Box<dyn EngineData>> = Ok(Box::new(PolarsEngineData::new(df)));
+            return Ok(PlanResult::Data(Box::new(std::iter::once(batch))));
+        }
 
         let batches =
             crate::engine::collect_streaming_batches(terminal.lf).map_err(to_kernel_err)?;
