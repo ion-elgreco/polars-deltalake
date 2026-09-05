@@ -9,14 +9,58 @@ use delta_kernel::expressions::{ArrayData, ColumnName};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::{
-    BinaryChunked, BooleanChunked, DataFrame, DataType as PlDataType, Float32Chunked,
-    Float64Chunked, Int8Chunked, Int16Chunked, Int32Chunked, Int64Chunked, IntoColumn, ListChunked,
-    NamedFrom, Series, StringChunked,
+    BinaryChunked, BooleanChunked, DataFrame, DataType as PlDataType, Expr, Float32Chunked,
+    Float64Chunked, Int8Chunked, Int16Chunked, Int32Chunked, Int64Chunked, IntoColumn, LazyFrame,
+    ListChunked, NamedFrom, Series, StringChunked, TimeUnit, col, cols,
 };
 use polars_arrow::array::{Array as ArrowArray, Utf8ViewArray};
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::errors::to_kernel_err;
+
+/// One streaming-engine collect returning the single result frame.
+/// `unwrap_single` panics if a collect ever returns `Multiple`; this is the
+/// one place to revisit if the engine choice or that contract changes.
+pub(crate) fn collect_streaming_single(lf: LazyFrame) -> polars::prelude::PolarsResult<DataFrame> {
+    Ok(lf
+        .collect_with_engine(polars_plan::dsl::Engine::Streaming)?
+        .unwrap_single())
+}
+
+/// The same collect, streamed as ordered `COLLECT_CHUNK_ROWS`-sized morsels.
+/// The positional flags are `maintain_order` and `lazy`; `lazy: false`
+/// starts the query inside this call — `read_batch`'s file-after-file
+/// deferral comes from its `flat_map`, not from this flag. Every batch
+/// consumer wants the same pair, so they are decided here.
+pub(crate) fn collect_streaming_batches(
+    lf: LazyFrame,
+) -> polars::prelude::PolarsResult<impl Iterator<Item = polars::prelude::PolarsResult<DataFrame>>> {
+    lf.collect_batches(
+        polars_plan::dsl::Engine::Streaming,
+        true,
+        std::num::NonZeroUsize::new(super::COLLECT_CHUNK_ROWS),
+        false,
+    )
+}
+
+/// Polars sizes a select from its expressions, so a list that names no
+/// column — every entry a broadcast literal — collapses the frame to a
+/// single row. A row index anchors the select to the input height.
+pub(crate) fn select_anchored(lf: LazyFrame, select: &[Expr]) -> LazyFrame {
+    const ANCHOR: &str = "__pldl_rows__";
+    let references_column = select
+        .iter()
+        .any(|e| !polars_plan::utils::expr_to_leaf_column_names(e).is_empty());
+    if references_column {
+        return lf.select(select);
+    }
+    let anchor = polars_utils::pl_str::PlSmallStr::from_static(ANCHOR);
+    let mut exprs = select.to_vec();
+    exprs.push(col(anchor.clone()));
+    lf.with_row_index(anchor.clone(), None)
+        .select(exprs)
+        .drop(cols([anchor]))
+}
 
 pub(crate) struct PolarsEngineData {
     df: DataFrame,
@@ -122,6 +166,12 @@ impl EngineData for PolarsEngineData {
                         height
                     )));
                 }
+                // Untrusted boundary — `build_series` panics on a mismatch.
+                crate::translation::ensure_scalar_types(
+                    scalars.iter().copied(),
+                    field,
+                    "append_columns",
+                )?;
                 let series = crate::translation::build_series(
                     field.name.as_str(),
                     &field.data_type,
@@ -139,7 +189,7 @@ impl EngineData for PolarsEngineData {
 /// is a top-level column; each subsequent segment is a struct field on the
 /// preceding series — kernel only emits named paths through struct nesting
 /// (maps and lists are surfaced by their own getters, not path-walking).
-fn resolve_path(df: &DataFrame, name: &ColumnName) -> anyhow::Result<Series> {
+pub(crate) fn resolve_path(df: &DataFrame, name: &ColumnName) -> anyhow::Result<Series> {
     let mut iter = name.iter();
     let first = iter.next().expect("ColumnName is nonempty by construction");
 
@@ -191,8 +241,16 @@ impl<'a> PolarsGetter<'a> {
             // (Delta wire format); store the physical chunk so `get_date` /
             // `get_timestamp` can read it through `Self::Int` / `Self::Long`.
             PlDataType::Date => Self::Int(series.date().map_err(to_kernel_err)?.physical()),
-            PlDataType::Datetime(_, _) => {
+            PlDataType::Datetime(TimeUnit::Microseconds, _) => {
                 Self::Long(series.datetime().map_err(to_kernel_err)?.physical())
+            }
+            // Any other unit is off by three orders of magnitude once
+            // `get_timestamp` reads the physical chunk as microseconds.
+            PlDataType::Datetime(unit, _) => {
+                return Err(Error::UnexpectedColumnType(format!(
+                    "column {} is Datetime({unit:?}); kernel reads timestamps as microseconds",
+                    series.name(),
+                )));
             }
             PlDataType::Decimal(_, _) => {
                 let chunked = series.decimal().map_err(to_kernel_err)?;
@@ -394,4 +452,59 @@ fn type_mismatch(field: &str, want: &str) -> Error {
     Error::UnexpectedColumnType(format!(
         "{field}: requested {want} but column has a different type"
     ))
+}
+
+#[cfg(test)]
+mod collect_tests {
+    use super::*;
+
+    /// The helper decides `maintain_order` and the morsel size for every
+    /// batch consumer. Pin both: ordered morsels, covering every input row.
+    #[test]
+    fn batches_are_ordered_and_cover_every_row() {
+        use polars::prelude::IntoLazy;
+
+        let expected: Vec<i64> = (0..10).collect();
+        let df = polars::df!("i" => expected.clone()).unwrap();
+        let batches: Vec<DataFrame> = collect_streaming_batches(df.lazy())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let seen: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column("i")
+                    .unwrap()
+                    .i64()
+                    .unwrap()
+                    .into_no_null_iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(seen, expected);
+    }
+}
+
+#[cfg(test)]
+mod getter_dtype_tests {
+    use super::*;
+
+    /// `get_timestamp` reads the physical chunk as microseconds, so a column
+    /// in any other unit would be served 1000x off instead of refused.
+    #[test]
+    fn non_microsecond_datetime_is_rejected() {
+        let base = Series::new("t".into(), [1_700_000_000_000i64]);
+        for unit in [TimeUnit::Milliseconds, TimeUnit::Nanoseconds] {
+            let series = base.cast(&PlDataType::Datetime(unit, None)).unwrap();
+            let err = PolarsGetter::from_series(&series)
+                .err()
+                .unwrap_or_else(|| panic!("Datetime({unit:?}) must be rejected"));
+            assert!(err.to_string().contains("microseconds"), "got: {err}");
+        }
+        let micros = base
+            .cast(&PlDataType::Datetime(TimeUnit::Microseconds, None))
+            .unwrap();
+        assert!(PolarsGetter::from_series(&micros).is_ok());
+    }
 }

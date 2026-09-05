@@ -17,22 +17,60 @@ use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::errors::to_kernel_err;
 use crate::translation::schema::KernelDataTypeExt;
 
+/// `series[row]` as a typed literal aliased to `name` — the shared
+/// row-literal builder. `series` must already carry the output dtype: the
+/// cast belongs on the series once, not on every row's literal, and a bare
+/// literal is what the scan's fast path reads back without a polars round
+/// trip.
+pub(crate) fn series_value_lit(
+    series: &polars::prelude::Series,
+    row: usize,
+    name: &str,
+) -> polars::prelude::PolarsResult<Expr> {
+    let value = series.get(row)?.into_static();
+    let scalar = PolarsScalar::new(series.dtype().clone(), value);
+    Ok(lit(scalar).alias(PlSmallStr::from_str(name)))
+}
+
+/// One aliased literal per (row, field) — the per-file constant scaffold
+/// shared by partition literals and DynamicScan file constants. Each series
+/// must already carry the output dtype (cast once per field, not per row).
+pub(crate) fn per_row_literals(
+    series_per_field: &[polars::prelude::Series],
+    names: &[&str],
+    row_count: usize,
+) -> polars::prelude::PolarsResult<Vec<Vec<Expr>>> {
+    (0..row_count)
+        .map(|row| {
+            series_per_field
+                .iter()
+                .zip(names)
+                .map(|(series, name)| series_value_lit(series, row, name))
+                .collect()
+        })
+        .collect()
+}
+
 /// Compound scalars (Array/Map/Struct/Decimal) round-trip through
 /// `build_series` so an empty list stays `[]` instead of collapsing to null
 /// — non-null typed empties are load-bearing for Delta log replay.
-pub(super) fn scalar_to_lit(scalar: &Scalar) -> Expr {
+pub(crate) fn scalar_to_lit(scalar: &Scalar) -> Expr {
     match scalar {
         Scalar::String(s) => lit(s.as_str()),
         Scalar::Long(v) => lit(*v),
         Scalar::Integer(v) => lit(*v),
-        Scalar::Short(v) => lit(*v as i32),
-        Scalar::Byte(v) => lit(*v as i32),
+        // Typed, not widened: `build_series` derives its list dtype from the
+        // declared element type, so an Int32 literal would disagree with a
+        // `Array<Short>` / `Array<Byte>` column's null rows.
+        Scalar::Short(_) | Scalar::Byte(_) => {
+            lit(try_to_polars_scalar(scalar).expect("integral scalars are always representable"))
+        }
         Scalar::Float(v) => lit(*v),
         Scalar::Double(v) => lit(*v),
         Scalar::Boolean(v) => lit(*v),
         Scalar::Date(v) => lit(polars::prelude::Scalar::new_date(*v)),
-        // Typed literal sidesteps a polars-0.53 cast-folding path that drops
-        // the timezone when this scalar is embedded in `as_struct`.
+        // Typed literal sidesteps a polars cast-folding path that drops the
+        // timezone when this scalar is embedded in `as_struct`.
         Scalar::Timestamp(v) => lit(polars::prelude::Scalar::new_datetime(
             *v,
             polars::prelude::TimeUnit::Microseconds,
@@ -51,6 +89,13 @@ pub(super) fn scalar_to_lit(scalar: &Scalar) -> Expr {
             Ok(polars_dt) => lit(polars::prelude::LiteralValue::untyped_null()).cast(polars_dt),
             Err(_) => lit(polars::prelude::LiteralValue::untyped_null()),
         },
+        // Intervals only occur in kernel-side expression evaluation, never
+        // in Delta data; the dtype decision (day-time µs → Duration,
+        // year-month → typed Int32 month count) lives in
+        // `try_to_polars_scalar`.
+        Scalar::IntervalDayTime(_) | Scalar::IntervalYearMonth(_) => {
+            lit(try_to_polars_scalar(scalar).expect("interval scalars are always representable"))
+        }
         Scalar::Array(_) | Scalar::Map(_) | Scalar::Struct(_) | Scalar::Decimal(_) => {
             build_series("__lit__", &scalar.data_type(), &[scalar])
                 .map(lit)
@@ -81,6 +126,11 @@ pub(crate) fn try_to_polars_scalar(scalar: &Scalar) -> Option<PolarsScalar> {
             PolarsScalar::new_datetime(*v, TimeUnit::Microseconds, Some(TimeZone::UTC))
         }
         Scalar::TimestampNtz(v) => PolarsScalar::new_datetime(*v, TimeUnit::Microseconds, None),
+        Scalar::IntervalDayTime(v) => PolarsScalar::new(
+            PlDataType::Duration(TimeUnit::Microseconds),
+            AnyValue::Duration(*v, TimeUnit::Microseconds),
+        ),
+        Scalar::IntervalYearMonth(v) => PolarsScalar::new(PlDataType::Int32, AnyValue::Int32(*v)),
         Scalar::Decimal(d) => {
             PolarsScalar::new_decimal(d.bits(), d.precision() as usize, d.scale() as usize)
         }
@@ -216,23 +266,28 @@ pub(crate) fn build_series(
                 let s = Series::new(name_pl, v);
                 s.cast(&PlDataType::Date).map_err(to_kernel_err)
             }
+            // Kept apart: the two carry the same i64 but read it against
+            // different clocks, so accepting either variant would republish a
+            // naive wall time as a UTC instant.
             Timestamp | TimestampNtz => {
+                let ntz = matches!(p, TimestampNtz);
                 let v: Vec<Option<i64>> = values
                     .iter()
-                    .map(|s| match s {
-                        Scalar::Timestamp(v) | Scalar::TimestampNtz(v) => Some(*v),
-                        Scalar::Null(_) => None,
-                        other => panic_mismatch(name, "Timestamp", other),
+                    .map(|s| match (s, ntz) {
+                        (Scalar::Timestamp(v), false) | (Scalar::TimestampNtz(v), true) => Some(*v),
+                        (Scalar::Null(_), _) => None,
+                        (other, _) => panic_mismatch(
+                            name,
+                            if ntz { "TimestampNtz" } else { "Timestamp" },
+                            other,
+                        ),
                     })
                     .collect();
                 let s = Series::new(name_pl, v);
-                let target = match p {
-                    Timestamp => PlDataType::Datetime(
-                        polars::prelude::TimeUnit::Microseconds,
-                        Some(polars::prelude::TimeZone::UTC),
-                    ),
-                    _ => PlDataType::Datetime(polars::prelude::TimeUnit::Microseconds, None),
-                };
+                let target = PlDataType::Datetime(
+                    polars::prelude::TimeUnit::Microseconds,
+                    (!ntz).then_some(polars::prelude::TimeZone::UTC),
+                );
                 s.cast(&target).map_err(to_kernel_err)
             }
             Decimal(decimal_type) => {
@@ -252,6 +307,41 @@ pub(crate) fn build_series(
                         decimal_type.scale() as usize,
                     )
                     .into_series())
+            }
+            IntervalDayTime => {
+                let v: Vec<Option<i64>> = values
+                    .iter()
+                    .map(|s| match s {
+                        Scalar::IntervalDayTime(v) => Some(*v),
+                        Scalar::Null(_) => None,
+                        other => panic_mismatch(name, "IntervalDayTime", other),
+                    })
+                    .collect();
+                Series::new(name_pl, v)
+                    .cast(&PlDataType::Duration(TimeUnit::Microseconds))
+                    .map_err(to_kernel_err)
+            }
+            IntervalYearMonth => Ok(Series::new(
+                name_pl,
+                values
+                    .iter()
+                    .map(|s| match s {
+                        Scalar::IntervalYearMonth(v) => Some(*v),
+                        Scalar::Null(_) => None,
+                        other => panic_mismatch(name, "IntervalYearMonth", other),
+                    })
+                    .collect::<Vec<Option<i32>>>(),
+            )),
+            Void => {
+                // Void is inhabited only by NULL, and polars' Null dtype is
+                // the exact match — but a mismatched scalar still panics
+                // like every other arm.
+                for s in values {
+                    if !matches!(s, Scalar::Null(_)) {
+                        panic_mismatch(name, "Void", s);
+                    }
+                }
+                Ok(Series::new_null(name_pl, values.len()))
             }
         },
         KernelDataType::Struct(struct_type) => {
@@ -329,9 +419,14 @@ pub(crate) fn build_series(
                         Scalar::Map(md) => {
                             let pairs = md.pairs();
                             if pairs.is_empty() {
+                                // Typed from the declared key/value types, or
+                                // an empty `Map<String, Long>` row would not
+                                // vstack with its null siblings.
                                 empty_typed_list_expr(polars_as_struct(vec![
-                                    lit("").alias(MAP_KEY_FIELD),
-                                    lit("").alias(MAP_VALUE_FIELD),
+                                    scalar_to_lit(&Scalar::Null(map.key_type.clone()))
+                                        .alias(MAP_KEY_FIELD),
+                                    scalar_to_lit(&Scalar::Null(map.value_type.clone()))
+                                        .alias(MAP_VALUE_FIELD),
                                 ]))
                             } else {
                                 let entries: Vec<Expr> = pairs
@@ -415,8 +510,204 @@ fn materialise_per_row_list_series(
         .clone())
 }
 
+/// `build_series` panics on a scalar/field type mismatch by contract;
+/// callers at untrusted boundaries run [`ensure_scalar_types`] first.
 fn panic_mismatch(name: &str, expected: &str, got: &Scalar) -> ! {
-    panic!(
-        "PolarsEvaluationHandler::create_many: column {name} expected {expected} scalars, got {got:?}",
-    );
+    panic!("build_series: column {name} expected {expected} scalars, got {got:?}");
+}
+
+/// Boundary guard for [`build_series`]'s panic contract: every non-null
+/// scalar must carry the field's declared type.
+///
+/// Nullability is not part of that contract — `build_series` drives the build
+/// off the *declared* type and only matches each scalar's shape — so a
+/// container whose `contains_null` / field nullability disagrees is accepted.
+/// Comparing the raw `DataType` would reject it with an error naming two
+/// identical-looking types.
+pub(crate) fn ensure_scalar_types<'a>(
+    scalars: impl IntoIterator<Item = &'a Scalar>,
+    field: &delta_kernel::schema::StructField,
+    context: &str,
+) -> delta_kernel::DeltaResult<()> {
+    for scalar in scalars {
+        if !matches!(scalar, Scalar::Null(_)) && !same_shape(&scalar.data_type(), &field.data_type)
+        {
+            return Err(delta_kernel::Error::Generic(format!(
+                "{context}: scalar for {} is {}, schema declares {}",
+                field.name,
+                scalar.data_type(),
+                field.data_type
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Structural type equality with every nullability flag erased.
+fn same_shape(a: &KernelDataType, b: &KernelDataType) -> bool {
+    match (a, b) {
+        (KernelDataType::Primitive(x), KernelDataType::Primitive(y)) => x == y,
+        (KernelDataType::Array(x), KernelDataType::Array(y)) => {
+            same_shape(x.element_type(), y.element_type())
+        }
+        (KernelDataType::Map(x), KernelDataType::Map(y)) => {
+            same_shape(x.key_type(), y.key_type()) && same_shape(x.value_type(), y.value_type())
+        }
+        (KernelDataType::Struct(x), KernelDataType::Struct(y)) => {
+            x.num_fields() == y.num_fields()
+                && x.fields()
+                    .zip(y.fields())
+                    .all(|(fx, fy)| fx.name == fy.name && same_shape(&fx.data_type, &fy.data_type))
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+    use delta_kernel::schema::DataType as KernelDataType;
+
+    #[test]
+    fn day_time_interval_builds_duration_series() {
+        let a = Scalar::IntervalDayTime(90_000_000);
+        let null = Scalar::Null(KernelDataType::Primitive(PrimitiveType::IntervalDayTime));
+        let s = build_series(
+            "iv",
+            &KernelDataType::Primitive(PrimitiveType::IntervalDayTime),
+            &[&a, &null],
+        )
+        .unwrap();
+        assert_eq!(s.dtype(), &PlDataType::Duration(TimeUnit::Microseconds));
+        let physical = s.duration().unwrap().physical();
+        assert_eq!(physical.get(0), Some(90_000_000));
+        assert_eq!(physical.get(1), None);
+    }
+
+    #[test]
+    fn year_month_interval_builds_month_count_series() {
+        let a = Scalar::IntervalYearMonth(14);
+        let s = build_series(
+            "iv",
+            &KernelDataType::Primitive(PrimitiveType::IntervalYearMonth),
+            &[&a],
+        )
+        .unwrap();
+        assert_eq!(s.dtype(), &PlDataType::Int32);
+        assert_eq!(s.i32().unwrap().get(0), Some(14));
+    }
+
+    #[test]
+    fn void_builds_null_dtype_series() {
+        let null = Scalar::Null(KernelDataType::Primitive(PrimitiveType::Void));
+        let s = build_series(
+            "v",
+            &KernelDataType::Primitive(PrimitiveType::Void),
+            &[&null, &null],
+        )
+        .unwrap();
+        assert_eq!(s.dtype(), &PlDataType::Null);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.null_count(), 2);
+    }
+
+    #[test]
+    fn interval_scalars_convert_to_typed_polars_scalars() {
+        let day_time = try_to_polars_scalar(&Scalar::IntervalDayTime(5)).unwrap();
+        assert_eq!(
+            day_time.dtype(),
+            &PlDataType::Duration(TimeUnit::Microseconds)
+        );
+        let year_month = try_to_polars_scalar(&Scalar::IntervalYearMonth(7)).unwrap();
+        assert_eq!(year_month.dtype(), &PlDataType::Int32);
+    }
+}
+
+#[cfg(test)]
+mod scalar_lit_width_tests {
+    use super::*;
+    use polars::prelude::LiteralValue;
+
+    /// `build_series` derives an Array's list dtype from the declared
+    /// element type, so a widened literal disagrees with the null rows it
+    /// has to vstack with — and silently retypes the column when there are
+    /// none.
+    #[test]
+    fn short_and_byte_literals_keep_their_width() {
+        for (scalar, expected) in [
+            (Scalar::Short(1), PlDataType::Int16),
+            (Scalar::Byte(1), PlDataType::Int8),
+        ] {
+            let expr = scalar_to_lit(&scalar);
+            let Expr::Literal(LiteralValue::Scalar(s)) = &expr else {
+                panic!("expected a scalar literal, got {expr:?}");
+            };
+            assert_eq!(s.dtype(), &expected, "for {scalar:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_variant_tests {
+    use super::*;
+
+    const US: i64 = 1_700_000_000_000_000;
+
+    /// The two variants carry the same i64 against different clocks, so
+    /// accepting either for either field republishes a naive wall time as a
+    /// UTC instant. Every sibling arm panics on the wrong variant.
+    #[test]
+    #[should_panic(expected = "expected Timestamp scalars")]
+    fn naive_scalar_is_rejected_for_a_utc_field() {
+        let s = Scalar::TimestampNtz(US);
+        let _ = build_series("t", &KernelDataType::TIMESTAMP, &[&s]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected TimestampNtz scalars")]
+    fn utc_scalar_is_rejected_for_a_naive_field() {
+        let s = Scalar::Timestamp(US);
+        let _ = build_series("t", &KernelDataType::TIMESTAMP_NTZ, &[&s]);
+    }
+
+    #[test]
+    fn matching_variants_carry_their_time_zone() {
+        let utc = Scalar::Timestamp(US);
+        let naive = Scalar::TimestampNtz(US);
+        assert_eq!(
+            build_series("t", &KernelDataType::TIMESTAMP, &[&utc])
+                .unwrap()
+                .dtype(),
+            &PlDataType::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC))
+        );
+        assert_eq!(
+            build_series("t", &KernelDataType::TIMESTAMP_NTZ, &[&naive])
+                .unwrap()
+                .dtype(),
+            &PlDataType::Datetime(TimeUnit::Microseconds, None)
+        );
+    }
+}
+
+#[cfg(test)]
+mod map_value_type_tests {
+    use super::*;
+    use delta_kernel::expressions::MapData;
+    use delta_kernel::schema::MapType;
+
+    /// An empty map row was seeded from a hardcoded String/String literal,
+    /// so it would not vstack with a null sibling of the declared type —
+    /// and carried the wrong dtype outright when every row was empty.
+    #[test]
+    fn empty_map_takes_its_declared_value_type() {
+        let map_type = MapType::new(KernelDataType::STRING, KernelDataType::LONG, true);
+        let empty = Scalar::Map(
+            MapData::try_new(map_type.clone(), Vec::<(Scalar, Scalar)>::new()).unwrap(),
+        );
+        let dt = KernelDataType::Map(Box::new(map_type));
+        let null = Scalar::Null(dt.clone());
+
+        let series = build_series("m", &dt, &[&empty, &null]).unwrap();
+        assert_eq!(series.dtype(), &dt.to_polars().unwrap());
+    }
 }

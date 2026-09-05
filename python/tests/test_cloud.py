@@ -10,6 +10,7 @@ import polars as pl
 import pytest
 from azure.storage import blob as azure_blob
 from deltalake import write_deltalake
+from polars.testing import assert_frame_equal
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 
@@ -186,8 +187,7 @@ def test_write_then_read(backend: Backend):
     write_deltalake(uri, df.to_arrow(), storage_options=backend.storage_options)
 
     out = read_delta(uri, storage_options=backend.storage_options).sort("id")
-    assert out["id"].to_list() == [1, 2, 3]
-    assert out["name"].to_list() == ["a", "b", "c"]
+    assert_frame_equal(out, df)
 
 
 def test_append(backend: Backend):
@@ -205,7 +205,7 @@ def test_append(backend: Backend):
     )
 
     out = read_delta(uri, storage_options=backend.storage_options).sort("x")
-    assert out["x"].to_list() == [1, 2, 3, 4]
+    assert_frame_equal(out, pl.DataFrame({"x": [1, 2, 3, 4]}))
 
 
 def test_partitioned(backend: Backend):
@@ -225,8 +225,7 @@ def test_partitioned(backend: Backend):
     )
 
     out = scan_delta(uri, storage_options=backend.storage_options).collect().sort("id")
-    assert out["region"].to_list() == ["eu", "us", "eu", "us"]
-    assert out["value"].to_list() == [10, 20, 30, 40]
+    assert_frame_equal(out, df)
 
 
 def test_predicate_pushdown(backend: Backend):
@@ -242,7 +241,7 @@ def test_predicate_pushdown(backend: Backend):
         .filter(pl.col("g") == "b")
         .collect()
     )
-    assert out["v"].to_list() == [2]
+    assert_frame_equal(out, pl.DataFrame({"g": ["b"], "v": [2]}))
 
 
 def test_time_travel(backend: Backend):
@@ -260,7 +259,7 @@ def test_time_travel(backend: Backend):
     )
 
     v0 = read_delta(uri, version=0, storage_options=backend.storage_options)
-    assert v0["x"].to_list() == [1]
+    assert_frame_equal(v0, pl.DataFrame({"x": [1]}))
 
     latest = read_delta(uri, storage_options=backend.storage_options).sort("x")
-    assert latest["x"].to_list() == [1, 2]
+    assert_frame_equal(latest, pl.DataFrame({"x": [1, 2]}))

@@ -11,13 +11,46 @@ use delta_kernel::schema::{
     ArrayType, DataType as KernelDataType, MapType, PrimitiveType, StructField, StructType,
 };
 use polars::prelude::{
-    ArrowDataType, DataType as PlDataType, Field as PlField, Schema as PlSchema,
+    ArrowDataType, DataFrame, DataType as PlDataType, Field as PlField, Schema as PlSchema,
 };
 use polars_arrow::datatypes::{ArrowSchema, Field as ArrowField};
 use polars_utils::pl_str::PlSmallStr;
 
+/// Descend `segments` through struct nesting and return the leaf's declared
+/// type. `None` when a segment is missing, a non-struct stands mid-path, or
+/// `segments` is empty.
+pub(crate) fn resolve_leaf_dtype<'a, I, S>(
+    schema: &'a StructType,
+    segments: I,
+) -> Option<&'a KernelDataType>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut level = schema;
+    let mut iter = segments.into_iter().peekable();
+    while let Some(segment) = iter.next() {
+        let dt = &level.field(segment.as_ref())?.data_type;
+        if iter.peek().is_none() {
+            return Some(dt);
+        }
+        // Only a struct has children the next segment could name.
+        match dt {
+            KernelDataType::Struct(inner) => level = inner,
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(crate) trait KernelSchemaExt {
     fn to_polars(&self) -> anyhow::Result<Arc<PlSchema>>;
+
+    /// Zero rows, typed to this schema — the shape every "nothing to read"
+    /// arm hands back so downstream concat / vstack still line up.
+    fn empty_frame(&self) -> anyhow::Result<DataFrame> {
+        Ok(DataFrame::empty_with_schema(self.to_polars()?.as_ref()))
+    }
 }
 
 impl KernelSchemaExt for StructType {
@@ -114,6 +147,13 @@ fn primitive_to_polars(p: &PrimitiveType) -> anyhow::Result<PlDataType> {
         ),
         TimestampNtz => PlDataType::Datetime(polars::prelude::TimeUnit::Microseconds, None),
         Decimal(d) => PlDataType::Decimal(d.precision() as usize, d.scale() as usize),
+        Void => PlDataType::Null,
+        // Kernel-side expression-eval types; Delta table schemas can't
+        // contain interval columns. Day-time is µs → Duration(µs); polars
+        // has no year-month dtype, so it stays the Spark-Catalyst physical
+        // representation: a signed month count.
+        IntervalDayTime => PlDataType::Duration(polars::prelude::TimeUnit::Microseconds),
+        IntervalYearMonth => PlDataType::Int32,
     })
 }
 
@@ -205,4 +245,13 @@ fn arrow_to_kernel_dtype(dt: &ArrowDataType) -> anyhow::Result<KernelDataType> {
         }
         other => anyhow::bail!("arrow dtype {other:?} has no kernel equivalent yet"),
     })
+}
+
+/// `col(...)` per kernel schema field, in schema order. Used by the scan
+/// driver and the engine's read paths to shape frames to a kernel schema.
+pub(crate) fn select_exprs_for_schema(schema: &StructType) -> Vec<polars::prelude::Expr> {
+    schema
+        .fields()
+        .map(|f| polars::prelude::col(PlSmallStr::from_str(f.name.as_str())))
+        .collect()
 }

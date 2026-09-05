@@ -7,6 +7,7 @@ kernel-translatable conjuncts in the ``"kernel"`` bucket.
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -14,51 +15,56 @@ from pathlib import Path
 import polars as pl
 import pytest
 from deltalake import write_deltalake
+from polars.testing import assert_frame_equal
 
-from polars_deltalake import TableState, scan_delta
+from polars_deltalake import TableScan, TableState, scan_delta
+
+_RICH_DF = pl.DataFrame(
+    {
+        "id": pl.Series([1, 2, 3], dtype=pl.Int64),
+        "small": pl.Series([1, 2, 3], dtype=pl.Int32),
+        "u": pl.Series([1, 2, 3], dtype=pl.UInt32),
+        "f": pl.Series([0.5, 1.5, 2.5], dtype=pl.Float64),
+        "s": pl.Series(["a", "b", "c"], dtype=pl.String),
+        "b": pl.Series([True, False, True], dtype=pl.Boolean),
+        "d": pl.Series(
+            [date(2024, 1, 1), date(2024, 6, 1), date(2024, 12, 31)],
+            dtype=pl.Date,
+        ),
+        "t": pl.Series(
+            [
+                datetime(2024, 1, 1, tzinfo=timezone.utc),
+                datetime(2024, 6, 1, tzinfo=timezone.utc),
+                datetime(2024, 12, 31, tzinfo=timezone.utc),
+            ],
+            dtype=pl.Datetime("us", time_zone="UTC"),
+        ),
+        "t_ntz": pl.Series(
+            [
+                datetime(2024, 1, 1),
+                datetime(2024, 6, 1),
+                datetime(2024, 12, 31),
+            ],
+            dtype=pl.Datetime("us"),
+        ),
+        "dec": pl.Series(
+            [Decimal("1.23"), Decimal("4.56"), Decimal("7.89")],
+            dtype=pl.Decimal(precision=10, scale=2),
+        ),
+    }
+)
+
+# Delta has no unsigned integers, so `u` reads back as Int32.
+_RICH_READ = _RICH_DF.with_columns(pl.col("u").cast(pl.Int32))
 
 
 @pytest.fixture
 def rich_table(tmp_path: Path) -> str:
     """Three rows (`id ∈ {1, 2, 3}`) covering every column type the
     translator can produce a kernel literal for. End-to-end tests assert
-    surviving ids per shape."""
-    df = pl.DataFrame(
-        {
-            "id": pl.Series([1, 2, 3], dtype=pl.Int64),
-            "small": pl.Series([1, 2, 3], dtype=pl.Int32),
-            "u": pl.Series([1, 2, 3], dtype=pl.UInt32),
-            "f": pl.Series([0.5, 1.5, 2.5], dtype=pl.Float64),
-            "s": pl.Series(["a", "b", "c"], dtype=pl.String),
-            "b": pl.Series([True, False, True], dtype=pl.Boolean),
-            "d": pl.Series(
-                [date(2024, 1, 1), date(2024, 6, 1), date(2024, 12, 31)],
-                dtype=pl.Date,
-            ),
-            "t": pl.Series(
-                [
-                    datetime(2024, 1, 1, tzinfo=timezone.utc),
-                    datetime(2024, 6, 1, tzinfo=timezone.utc),
-                    datetime(2024, 12, 31, tzinfo=timezone.utc),
-                ],
-                dtype=pl.Datetime("us", time_zone="UTC"),
-            ),
-            "t_ntz": pl.Series(
-                [
-                    datetime(2024, 1, 1),
-                    datetime(2024, 6, 1),
-                    datetime(2024, 12, 31),
-                ],
-                dtype=pl.Datetime("us"),
-            ),
-            "dec": pl.Series(
-                [Decimal("1.23"), Decimal("4.56"), Decimal("7.89")],
-                dtype=pl.Decimal(precision=10, scale=2),
-            ),
-        }
-    )
+    the surviving rows per shape."""
     path = tmp_path / "rich"
-    write_deltalake(str(path), df.to_arrow())
+    write_deltalake(str(path), _RICH_DF.to_arrow())
     return str(path)
 
 
@@ -134,6 +140,12 @@ class TestIsIn:
     def test_above_cap_falls_back(self, rich_table):
         # Above the expansion cap polars-io handles the predicate row-wise.
         assert _kernel_count(rich_table, pl.col("id").is_in(list(range(513)))) == 0
+
+    def test_cast_around_set_declines(self, rich_table):
+        """A cast on the set literal changes its elements; unwrapping it
+        would push the pre-cast values as the OR-chain."""
+        expr = pl.col("f").is_in(pl.lit(pl.Series([2.5, 2.9])).cast(pl.Int64))
+        assert _kernel_count(rich_table, expr) == 0
 
 
 class TestIsBetween:
@@ -228,13 +240,169 @@ class TestPredicateEqualsBool:
 
 
 class TestCastUnwrap:
-    def test_cast_around_column(self, rich_table):
-        expr = pl.col("id").cast(pl.Int32) == 1
-        assert _kernel_count(rich_table, expr) == 1
+    def test_widening_cast_around_column(self, rich_table):
+        """A widening integer cast cannot change a value, so it unwraps."""
+        assert _kernel_count(rich_table, pl.col("small").cast(pl.Int64) == 1) == 1
+
+    def test_redundant_cast_around_column(self, rich_table):
+        assert _kernel_count(rich_table, pl.col("id").cast(pl.Int64) == 1) == 1
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            pl.col("id").cast(pl.Int32) == 1,
+            pl.col("f").cast(pl.Int32) == 1,
+            pl.col("id").cast(pl.String) == "1",
+        ],
+        ids=["narrowing", "float-truncating", "stringify"],
+    )
+    def test_value_changing_cast_declines(self, rich_table, expr):
+        """Kernel skips a file whose stats falsify the pushed predicate, so a
+        cast that changes values must not be dropped on the way down."""
+        assert _kernel_count(rich_table, expr) == 0
 
     def test_alias_around_predicate(self, rich_table):
         expr = (pl.col("id") == 1).alias("masked")
         assert _kernel_count(rich_table, expr) == 1
+
+    def test_literal_cast_declines(self, rich_table):
+        """A cast over a literal changes the compared value; dropping it
+        would push the pre-cast literal into the skipping predicate."""
+        assert _kernel_count(rich_table, pl.col("f") == pl.lit(2.9).cast(pl.Int64)) == 0
+
+
+class TestCastPruningSoundness:
+    def test_truncating_cast_keeps_matching_rows(self, tmp_path: Path):
+        """`f.cast(Int32) == 1` matches 1.4; pushing the cast-stripped
+        `f == 1` down would skip the file whose stats are [1.4, 1.6]."""
+        table = str(tmp_path / "casts")
+        write_deltalake(
+            table,
+            pl.DataFrame({"id": [1, 2], "f": [1.4, 1.6]}).to_arrow(),
+        )
+        write_deltalake(
+            table,
+            pl.DataFrame({"id": [3, 4], "f": [10.0, 11.0]}).to_arrow(),
+            mode="append",
+        )
+        got = (
+            scan_delta(table)
+            .filter(pl.col("f").cast(pl.Int32) == 1)
+            .collect()
+            .sort("id")
+        )
+        assert_frame_equal(got, pl.DataFrame({"id": [1, 2], "f": [1.4, 1.6]}))
+
+    def test_literal_cast_via_raw_configure(self, tmp_path: Path):
+        """polars folds literal casts before the IO plugin sees them, but the
+        exported ``TableScan.configure`` receives raw exprs. ``f == 2.9`` must
+        not reach kernel: file A's stats [2.0, 2.0] falsify it, pruning the
+        file that holds the rows the evaluated predicate (f == 2.0) matches."""
+        table = str(tmp_path / "casts2")
+        write_deltalake(table, pl.DataFrame({"id": [1, 2], "f": [2.0, 2.0]}).to_arrow())
+        write_deltalake(
+            table,
+            pl.DataFrame({"id": [3], "f": [10.0]}).to_arrow(),
+            mode="append",
+        )
+        scan = TableScan(TableState(table))
+        scan.configure(None, None, pl.col("f") == pl.lit(2.9).cast(pl.Int64))
+        frames = []
+        while (df := scan.next()) is not None:
+            frames.append(df)
+        got = pl.concat(frames).sort("id") if frames else pl.DataFrame()
+        assert_frame_equal(got, pl.DataFrame({"id": [1, 2], "f": [2.0, 2.0]}))
+
+    def test_set_cast_via_raw_configure(self, tmp_path: Path):
+        """The evaluated set is {2} (2.5 and 2.9 truncate); pushing the
+        pre-cast elements as ``f == 2.5 OR f == 2.9`` prunes the file whose
+        stats [1.0, 2.0] falsify both, losing the matching row."""
+        table = str(tmp_path / "casts3")
+        write_deltalake(table, pl.DataFrame({"id": [1, 2], "f": [1.0, 2.0]}).to_arrow())
+        write_deltalake(
+            table,
+            pl.DataFrame({"id": [3], "f": [50.0]}).to_arrow(),
+            mode="append",
+        )
+        scan = TableScan(TableState(table))
+        expr = pl.col("f").is_in(pl.lit(pl.Series([2.5, 2.9])).cast(pl.Int64))
+        scan.configure(None, None, expr)
+        frames = []
+        while (df := scan.next()) is not None:
+            frames.append(df)
+        got = pl.concat(frames).sort("id") if frames else pl.DataFrame()
+        assert_frame_equal(got, pl.DataFrame({"id": [2], "f": [2.0]}))
+
+
+class TestFloat32Pushdown:
+    """polars type-coercion wraps a Float32 column in ``cast(Float64)`` and
+    compares against Float64 literals. Pushdown must unwrap the widening cast
+    and narrow the literal exactly to the column type — kernel compares stats
+    strictly same-type, so an unnarrowed Double literal never skips."""
+
+    @pytest.fixture
+    def f32_table(self, tmp_path: Path) -> str:
+        path = str(tmp_path / "f32")
+        write_deltalake(
+            path,
+            pl.DataFrame(
+                {
+                    "id": pl.Series([1, 2], dtype=pl.Int64),
+                    "g": pl.Series([0.5, 1.5], dtype=pl.Float32),
+                }
+            ).to_arrow(),
+        )
+        write_deltalake(
+            path,
+            pl.DataFrame(
+                {
+                    "id": pl.Series([3, 4], dtype=pl.Int64),
+                    "g": pl.Series([100.0, 200.0], dtype=pl.Float32),
+                }
+            ).to_arrow(),
+            mode="append",
+        )
+        return path
+
+    def test_widening_float_cast_translates(self, f32_table):
+        expr = pl.col("g").cast(pl.Float64) > pl.lit(60.0, dtype=pl.Float64)
+        assert _kernel_count(f32_table, expr) == 1
+
+    def test_widening_cast_around_is_in_translates(self, f32_table):
+        expr = pl.col("g").cast(pl.Float64).is_in([0.5, 1.5])
+        assert _kernel_count(f32_table, expr) == 1
+
+    def test_float32_predicate_skips_a_whole_file(self, f32_table):
+        """Delete the low file: the query only succeeds if kernel skipped it."""
+        adds = [
+            json.loads(line)["add"]
+            for log in sorted(Path(f32_table, "_delta_log").glob("*.json"))
+            for line in log.read_text().splitlines()
+            if "add" in json.loads(line)
+        ]
+        low = next(
+            a["path"] for a in adds if json.loads(a["stats"])["maxValues"]["g"] < 50
+        )
+        Path(f32_table, low).unlink()
+
+        # A typed Float64 literal is kept by polars (a dyn one would shrink
+        # to Float32), so the plugin delivers cast(g, Float64) > Double.
+        out = scan_delta(f32_table).filter(pl.col("g") > pl.lit(60.0, dtype=pl.Float64))
+        assert_frame_equal(
+            out.collect().sort("id"),
+            pl.DataFrame(
+                {"id": [3, 4], "g": [100.0, 200.0]},
+                schema_overrides={"g": pl.Float32},
+            ),
+        )
+
+    def test_inexact_literal_declines(self, f32_table):
+        """2.9 has no exact Float32 form; narrowing it would push a
+        satisfiable predicate for a comparison that is false on every row."""
+        expr = pl.col("g").cast(pl.Float64) == pl.lit(2.9, dtype=pl.Float64)
+        assert _kernel_count(f32_table, expr) == 0
+        got = scan_delta(f32_table).filter(pl.col("g") == 2.9).collect()
+        assert got.height == 0
 
 
 class TestUntranslatable:
@@ -296,6 +464,18 @@ _E2E_CASES = [
     pytest.param(pl.col("id").is_in([1]), [1], id="is-in-single"),
     pytest.param(pl.col("id").is_in([]), [], id="is-in-empty"),
     pytest.param(pl.col("s").is_in(["a", "c"]), [1, 3], id="is-in-strings"),
+    # Float-spelled elements against an integer column: the integral ones
+    # narrow, the fractional ones can match nothing and drop.
+    pytest.param(pl.col("small").is_in([2.0]), [2], id="is-in-float-literals"),
+    pytest.param(
+        pl.col("small").is_in([2.0, 3.0]), [2, 3], id="is-in-float-literalss-multi"
+    ),
+    pytest.param(
+        pl.col("id").is_in([1.0, 2.5]), [1], id="is-in-float-literals-fractional"
+    ),
+    pytest.param(
+        pl.col("id").is_in([2.5]), [], id="is-in-float-literals-all-fractional"
+    ),
     pytest.param(
         pl.col("d").is_in([date(2024, 1, 1), date(2024, 12, 31)]),
         [1, 3],
@@ -365,9 +545,14 @@ _E2E_CASES = [
     ),
     # Cast unwrap
     pytest.param(
-        pl.col("id").cast(pl.Int32) == 1,
+        pl.col("small").cast(pl.Int64) == 1,
         [1],
         id="cast-eq",
+    ),
+    pytest.param(
+        pl.col("id").cast(pl.Int32) == 1,
+        [1],
+        id="cast-eq-narrowing",
     ),
 ]
 
@@ -381,4 +566,109 @@ class TestEndToEndFiltering:
         expected_ids: list[int],
     ):
         out = scan_delta(rich_table).filter(predicate).collect().sort("id")
-        assert out["id"].to_list() == expected_ids
+        assert_frame_equal(out, _RICH_READ.filter(pl.col("id").is_in(expected_ids)))
+
+
+_NESTED_DF = pl.DataFrame(
+    {
+        "id": [1, 2, 3, 4],
+        "person": [{"name": f"n{a}", "age": a} for a in (10, 20, 90, 95)],
+        "tags": [["t"], ["t"], ["t"], ["t"]],
+    }
+)
+
+
+@pytest.fixture
+def nested_table(tmp_path: Path) -> str:
+    """Two files with disjoint `person.age` ranges, plus non-primitive columns.
+
+    `deltalake` writes nested `minValues` / `maxValues`, so kernel can skip a
+    whole file on `person.age` alone.
+    """
+    path = tmp_path / "nested"
+    write_deltalake(str(path), _NESTED_DF.slice(0, 2).to_arrow())
+    write_deltalake(str(path), _NESTED_DF.slice(2, 2).to_arrow(), mode="append")
+    return str(path)
+
+
+class TestNestedColumns:
+    """`struct.field(...)` chains lower to multi-segment kernel column names."""
+
+    def test_nested_comparison(self, nested_table):
+        assert (
+            _kernel_count(nested_table, pl.col("person").struct.field("age") > 50) == 1
+        )
+
+    def test_nested_is_null(self, nested_table):
+        assert (
+            _kernel_count(nested_table, pl.col("person").struct.field("name").is_null())
+            == 1
+        )
+
+    def test_nested_is_in(self, nested_table):
+        assert (
+            _kernel_count(
+                nested_table, pl.col("person").struct.field("age").is_in([10])
+            )
+            == 1
+        )
+
+    def test_nested_filter_returns_expected_ids(self, nested_table):
+        out = scan_delta(nested_table).filter(pl.col("person").struct.field("age") > 50)
+        assert_frame_equal(
+            out.collect().sort("id"), _NESTED_DF.filter(pl.col("id").is_in([3, 4]))
+        )
+
+    def test_nested_stats_skip_a_whole_file(self, nested_table):
+        """Delete the low-age file: the query only succeeds if kernel skipped it."""
+        adds = [
+            json.loads(line)["add"]
+            for log in sorted(Path(nested_table, "_delta_log").glob("*.json"))
+            for line in log.read_text().splitlines()
+            if "add" in json.loads(line)
+        ]
+        low = next(
+            a["path"]
+            for a in adds
+            if json.loads(a["stats"])["maxValues"]["person"]["age"] < 50
+        )
+        Path(nested_table, low).unlink()
+
+        out = scan_delta(nested_table).filter(pl.col("person").struct.field("age") > 50)
+        assert_frame_equal(
+            out.collect().sort("id"), _NESTED_DF.filter(pl.col("id").is_in([3, 4]))
+        )
+
+
+class TestNonPrimitiveReferences:
+    """Kernel fails the whole scan on a predicate column it cannot resolve, and
+    it resolves only primitive leaves — `person` and `tags` are containers, so
+    they would abort the query. The translator must decline them and let polars
+    filter."""
+
+    @pytest.mark.parametrize(
+        ("predicate", "expected_ids"),
+        [
+            pytest.param(pl.col("person").is_null(), [], id="struct-is-null"),
+            pytest.param(
+                pl.col("person").is_not_null(), [1, 2, 3, 4], id="struct-is-not-null"
+            ),
+            pytest.param(pl.col("tags").is_null(), [], id="list-is-null"),
+            pytest.param(
+                pl.col("tags").is_not_null(), [1, 2, 3, 4], id="list-is-not-null"
+            ),
+        ],
+    )
+    def test_declines_and_still_scans(
+        self, nested_table, predicate: pl.Expr, expected_ids: list[int]
+    ):
+        assert _kernel_count(nested_table, predicate) == 0
+        out = scan_delta(nested_table).filter(predicate).collect().sort("id")
+        assert_frame_equal(out, _NESTED_DF.filter(pl.col("id").is_in(expected_ids)))
+
+    def test_struct_path_declines(self, nested_table):
+        """`person` alone is a struct — a path stopping there has no stats."""
+        assert _kernel_count(nested_table, pl.col("person") == pl.col("person")) == 0
+
+    def test_unknown_column_declines(self, nested_table):
+        assert _kernel_count(nested_table, pl.col("nope") == 1) == 0

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use delta_kernel::engine_data::EngineData;
-use delta_kernel::expressions::{Expression, ExpressionRef, Scalar, Transform};
+use delta_kernel::expressions::{Expression, ExpressionRef, ExpressionStructPatch, Scalar};
 use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
 use delta_kernel::{
     DeltaResult, Error, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
@@ -30,13 +30,29 @@ mod predicate;
 mod scalar;
 mod transform;
 
+pub(crate) use expr::{
+    as_struct_checked, column_path_to_expr, null_gated, parse_partition_column, translate_expr,
+};
 pub(crate) use predicate::translate_predicate;
-pub(crate) use scalar::{build_series, empty_typed_list_expr};
+pub(crate) use scalar::{
+    build_series, empty_typed_list_expr, ensure_scalar_types, per_row_literals, scalar_to_lit,
+};
 
-use expr::translate_expr;
 use predicate::PolarsPredicateEvaluator;
 use scalar::try_to_polars_scalar;
 use transform::{TransformSlot, translate_transform, walk_transform_slots};
+
+/// Select-list for evaluating `expression` (with struct `output_type`) over a
+/// frame shaped like `input_schema` — one aliased polars `Expr` per output
+/// field. Shared by the `Project` plan node and the expression evaluator.
+pub(crate) fn projection_exprs(
+    input_schema: &StructType,
+    expression: &Expression,
+    output_type: &KernelDataType,
+) -> DeltaResult<Vec<Expr>> {
+    let ops = build_column_ops(input_schema, expression, output_type)?;
+    Ok(ops.iter().map(op_to_expr).collect())
+}
 
 pub(crate) struct PolarsEvaluationHandler;
 
@@ -54,7 +70,10 @@ impl EvaluationHandler for PolarsEvaluationHandler {
         output_type: KernelDataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         let ops = build_column_ops(input_schema.as_ref(), expression.as_ref(), &output_type)?;
-        Ok(Arc::new(PolarsExpressionEvaluator { ops }))
+        Ok(Arc::new(PolarsExpressionEvaluator::new(
+            ops,
+            input_schema.num_fields(),
+        )))
     }
 
     fn new_predicate_evaluator(
@@ -94,40 +113,45 @@ impl EvaluationHandler for PolarsEvaluationHandler {
         schema: SchemaRef,
         rows: &[&[Scalar]],
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let row_count = rows.len();
-
-        if row_count == 0 {
-            let df =
-                DataFrame::empty_with_schema(schema.to_polars().map_err(to_kernel_err)?.as_ref());
-            return Ok(Box::new(PolarsEngineData::new(df)));
-        }
-
-        let fields: Vec<_> = schema.fields().collect();
-
-        if rows.iter().any(|row| row.len() != fields.len()) {
-            return Err(Error::Generic(format!(
-                "create_many: expected {} scalars per row, got mismatched row widths",
-                fields.len()
-            )));
-        }
-
-        let columns = fields
-            .iter()
-            .enumerate()
-            .map(|(col_idx, field)| {
-                let column_scalars: Vec<&Scalar> = rows.iter().map(|row| &row[col_idx]).collect();
-                build_series(&field.name, &field.data_type, &column_scalars)
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-
-        let df = DataFrame::new(
-            row_count,
-            columns.into_iter().map(IntoColumn::into_column).collect(),
-        )
-        .map_err(to_kernel_err)?;
-
+        let df = scalar_rows_to_frame(&schema, rows, "create_many")?;
         Ok(Box::new(PolarsEngineData::new(df)))
     }
+}
+
+/// Row-major scalars → one column per schema field. Shared by kernel's
+/// `create_many` and the plan executor's `Values` node — both sit on
+/// untrusted boundaries (FFI / proto round-trip) where scalar/schema
+/// agreement is not guaranteed and `build_series` panics on a mismatch.
+pub(crate) fn scalar_rows_to_frame(
+    schema: &delta_kernel::schema::StructType,
+    rows: &[&[Scalar]],
+    context: &str,
+) -> DeltaResult<DataFrame> {
+    let fields: Vec<_> = schema.fields().collect();
+    if let Some(bad) = rows.iter().find(|row| row.len() != fields.len()) {
+        return Err(Error::Generic(format!(
+            "{context}: row has {} scalars, schema has {} fields",
+            bad.len(),
+            fields.len()
+        )));
+    }
+    if rows.is_empty() {
+        return schema.empty_frame().map_err(to_kernel_err);
+    }
+    let columns = fields
+        .iter()
+        .enumerate()
+        .map(|(col_idx, field)| {
+            let column_scalars: Vec<&Scalar> = rows.iter().map(|row| &row[col_idx]).collect();
+            ensure_scalar_types(column_scalars.iter().copied(), field, context)?;
+            build_series(&field.name, &field.data_type, &column_scalars)
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
+    DataFrame::new(
+        rows.len(),
+        columns.into_iter().map(IntoColumn::into_column).collect(),
+    )
+    .map_err(to_kernel_err)
 }
 
 /// One output column's evaluation plan. Real-world Transforms emit only
@@ -155,18 +179,52 @@ enum ColumnOp {
 
 struct PolarsExpressionEvaluator {
     ops: Vec<ColumnOp>,
+    /// Both derived from `ops` at construction: recomputing them per batch
+    /// would re-clone every expr tree on the log-replay hot path.
+    lazy_exprs: Vec<Expr>,
+    all_simple: bool,
+    /// `Passthrough` addresses input columns by position, so the fast path
+    /// only holds for a batch as wide as the schema it was built from.
+    input_width: usize,
+}
+
+impl PolarsExpressionEvaluator {
+    fn new(ops: Vec<ColumnOp>, input_width: usize) -> Self {
+        let lazy_exprs = ops.iter().map(op_to_expr).collect();
+        let all_simple = !ops.iter().any(|op| matches!(op, ColumnOp::Computed { .. }));
+        Self {
+            ops,
+            lazy_exprs,
+            all_simple,
+            input_width,
+        }
+    }
+
+    /// `Passthrough` addresses the batch by ordinal, so a same-width batch in
+    /// another order would return the wrong column under the right output
+    /// name. Confirm each index still carries its declared name.
+    fn positions_match(&self, df: &DataFrame) -> bool {
+        if df.width() != self.input_width {
+            return false;
+        }
+        let cols = df.columns();
+        self.ops.iter().all(|op| match op {
+            ColumnOp::Passthrough {
+                input_idx,
+                input_name,
+                ..
+            } => cols.get(*input_idx).is_some_and(|c| c.name() == input_name),
+            _ => true,
+        })
+    }
 }
 
 impl ExpressionEvaluator for PolarsExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let df = downcast_engine_data(batch)?.dataframe();
         let height = df.height();
-        let all_simple = !self
-            .ops
-            .iter()
-            .any(|op| matches!(op, ColumnOp::Computed { .. }));
 
-        if all_simple {
+        if self.all_simple && self.positions_match(df) {
             let input_cols = df.columns();
             let columns: Vec<Column> = self
                 .ops
@@ -187,11 +245,10 @@ impl ExpressionEvaluator for PolarsExpressionEvaluator {
             return Ok(Box::new(PolarsEngineData::new(result)));
         }
 
-        let exprs: Vec<Expr> = self.ops.iter().map(op_to_expr).collect();
-        let result = df
-            .clone()
-            .lazy()
-            .select(exprs)
+        // Resolves passthroughs by name, so a batch that does not match the
+        // declared input schema errors here instead of silently picking the
+        // column that happens to sit at that position.
+        let result = crate::engine::select_anchored(df.clone().lazy(), &self.lazy_exprs)
             .collect()
             .map_err(to_kernel_err)?;
         Ok(Box::new(PolarsEngineData::new(result)))
@@ -214,10 +271,17 @@ fn build_column_ops(
     output_type: &KernelDataType,
 ) -> DeltaResult<Vec<ColumnOp>> {
     match (output_type, expression) {
-        (KernelDataType::Struct(output_struct), Expression::Transform(t)) => {
+        (KernelDataType::Struct(output_struct), Expression::StructPatch(t)) => {
             build_transform_ops(t, output_struct, input_schema)
         }
-        (KernelDataType::Struct(output_struct), Expression::Struct(children, _)) => {
+        (KernelDataType::Struct(output_struct), Expression::Struct(children, nullability)) => {
+            // A top-level gate would null whole rows — no DataFrame representation.
+            if nullability.is_some() {
+                return Err(Error::Unsupported(
+                    "PolarsExpressionEvaluator: nullability predicate on a top-level output struct"
+                        .into(),
+                ));
+            }
             let n_out = output_struct.num_fields();
             if children.len() != n_out {
                 return Err(Error::Generic(format!(
@@ -247,10 +311,10 @@ fn build_column_ops(
     }
 }
 
-/// Nested `input_path` Transforms (rare) fall back to the lazy path wholesale
+/// Nested `input_path` patches (rare) fall back to the lazy path wholesale
 /// — `ColumnOp::Passthrough` can't address columns inside a struct projection.
 fn build_transform_ops(
-    t: &Transform,
+    t: &ExpressionStructPatch,
     output_struct: &StructType,
     input_schema: &StructType,
 ) -> DeltaResult<Vec<ColumnOp>> {
@@ -335,4 +399,101 @@ pub(super) fn downcast_engine_data(batch: &dyn EngineData) -> DeltaResult<&Polar
                 "PolarsEvaluationHandler received EngineData that is not PolarsEngineData".into(),
             )
         })
+}
+
+#[cfg(test)]
+mod evaluator_height_tests {
+    use delta_kernel::schema::{StructField, StructType};
+
+    use super::*;
+
+    /// Foreign plans arrive via the proto round-trip, so scalar/schema
+    /// agreement is not guaranteed; a mismatch must be an error, not a
+    /// `build_series` panic unwinding through PyO3.
+    #[test]
+    fn create_many_rejects_scalar_type_mismatch() {
+        let handler = PolarsEvaluationHandler::new();
+        let schema = Arc::new(
+            StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap(),
+        );
+        let rows: &[&[Scalar]] = &[&[Scalar::String("x".to_string())]];
+        let result = handler.create_many(schema, rows);
+        assert!(result.is_err(), "type mismatch must error, not panic");
+    }
+
+    /// `Passthrough` addresses input columns by position, so a batch that
+    /// is narrower than the declared input schema must fall back to the
+    /// name-resolving path and error — not index past the column vector.
+    #[test]
+    fn narrow_batch_errors_instead_of_indexing_past_the_end() {
+        let handler = PolarsEvaluationHandler::new();
+        let input_schema = Arc::new(
+            StructType::try_new([
+                StructField::nullable("a", KernelDataType::LONG),
+                StructField::nullable("b", KernelDataType::LONG),
+            ])
+            .unwrap(),
+        );
+        let evaluator = handler
+            .new_expression_evaluator(
+                input_schema,
+                Arc::new(Expression::column(["b"])),
+                KernelDataType::LONG,
+            )
+            .unwrap();
+        let df = polars::df!("a" => [1i64]).unwrap();
+        let out = evaluator.evaluate(&PolarsEngineData::new(df));
+        assert!(
+            out.is_err(),
+            "a batch narrower than the declared schema must error"
+        );
+    }
+
+    /// Same width, different order: position alone cannot tell the two apart,
+    /// so the positional path would hand back `a` under the name `b`.
+    #[test]
+    fn reordered_batch_resolves_passthrough_by_name() {
+        let handler = PolarsEvaluationHandler::new();
+        let input_schema = Arc::new(
+            StructType::try_new([
+                StructField::nullable("a", KernelDataType::LONG),
+                StructField::nullable("b", KernelDataType::LONG),
+            ])
+            .unwrap(),
+        );
+        let evaluator = handler
+            .new_expression_evaluator(
+                input_schema,
+                Arc::new(Expression::column(["b"])),
+                KernelDataType::LONG,
+            )
+            .unwrap();
+        let df = polars::df!("b" => [7i64], "a" => [1i64]).unwrap();
+        let out = evaluator
+            .evaluate(&PolarsEngineData::new(df))
+            .expect("a reordered batch still resolves by name");
+        let got = downcast_engine_data(out.as_ref()).unwrap().dataframe();
+        let col = got.columns().first().expect("one output column");
+        assert_eq!(
+            col.i64().unwrap().get(0),
+            Some(7),
+            "must read 'b', not the column that sits at b's declared index"
+        );
+    }
+
+    /// Kernel contract: one value per input row. A `Computed` op that
+    /// references no column (a struct/array/binary literal falls through
+    /// `classify_single` to `Computed`) must not collapse the lazy path.
+    #[test]
+    fn column_free_computed_op_keeps_batch_height() {
+        let evaluator = PolarsExpressionEvaluator::new(
+            vec![ColumnOp::Computed {
+                expr: lit(7i64).alias("v"),
+            }],
+            1,
+        );
+        let df = polars::df!("x" => [1i64, 2, 3]).unwrap();
+        let out = evaluator.evaluate(&PolarsEngineData::new(df)).unwrap();
+        assert_eq!(out.len(), 3, "one output row per input row");
+    }
 }

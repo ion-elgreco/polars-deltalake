@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use delta_kernel::plans::PlanExecutor;
 use delta_kernel::{
     DeltaResult, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
@@ -12,12 +13,21 @@ use tokio::runtime::Runtime;
 use url::Url;
 
 mod data;
+mod executor;
 mod handlers;
+mod log_cache;
 
 pub(crate) use data::PolarsEngineData;
+pub(crate) use data::resolve_path as resolve_series_path;
+pub(crate) use data::{collect_streaming_batches, collect_streaming_single, select_anchored};
+pub(crate) use executor::PolarsPlanExecutor;
 
+#[cfg(test)]
+pub(crate) use handlers::parse_ndjson_inferred;
 use handlers::{ObjectStoreStorageHandler, PolarsJsonHandler, PolarsParquetHandler};
-pub(crate) use handlers::{parquet_options, path_for_polars_io, unified_scan_args};
+pub(crate) use handlers::{
+    dsl_parquet_scan, fetch_parquet_metadata, path_for_polars_io, unified_scan_args,
+};
 
 use crate::translation::PolarsEvaluationHandler;
 
@@ -56,6 +66,7 @@ pub(crate) struct PolarsEngine {
     json: Arc<PolarsJsonHandler>,
     parquet: Arc<PolarsParquetHandler>,
     evaluation: Arc<PolarsEvaluationHandler>,
+    executor: Arc<PolarsPlanExecutor>,
 }
 
 impl PolarsEngine {
@@ -71,14 +82,19 @@ impl PolarsEngine {
         let storage = Arc::new(ObjectStoreStorageHandler::new(table_url, opts.clone(), rt)?);
 
         let json = Arc::new(PolarsJsonHandler::new(storage.clone()));
-        let parquet = Arc::new(PolarsParquetHandler::new(storage.clone(), opts, rt)?);
+        let parquet = Arc::new(PolarsParquetHandler::new(storage.clone(), opts)?);
         let evaluation = Arc::new(PolarsEvaluationHandler::new());
+        let executor = Arc::new(PolarsPlanExecutor::new(
+            storage.clone(),
+            parquet.cloud_options().cloned(),
+        ));
 
         Ok(Self {
             storage,
             json,
             parquet,
             evaluation,
+            executor,
         })
     }
 
@@ -87,6 +103,12 @@ impl PolarsEngine {
     /// `storage_options`.
     pub(crate) fn cloud_options(&self) -> Option<&polars::io::cloud::CloudOptions> {
         self.parquet.cloud_options()
+    }
+
+    /// Concrete accessor — the `Engine::plan_executor` trait method returns
+    /// an `Option` only for kernel's boundary; here it always exists.
+    pub(crate) fn executor(&self) -> &Arc<PolarsPlanExecutor> {
+        &self.executor
     }
 }
 
@@ -105,5 +127,12 @@ impl Engine for PolarsEngine {
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
+    }
+
+    /// Opts kernel into declarative-plan execution: snapshot P&M replay and
+    /// (via `declarative_metadata_scan_plan`) scan-file log replay run as
+    /// polars queries instead of per-file handler calls.
+    fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
+        Some(self.executor.clone())
     }
 }

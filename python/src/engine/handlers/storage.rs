@@ -1,6 +1,6 @@
 //! `delta_kernel::StorageHandler` over `object_store`. Kernel is sync and
 //! `object_store` is async, so every method `block_on`s the engine's
-//! shared tokio runtime. Mirrors kernel 0.23's `default-engine`
+//! shared tokio runtime. Mirrors kernel's `default-engine`
 //! `ObjectStoreStorageHandler` so behaviour stays aligned.
 
 use std::sync::Arc;
@@ -201,6 +201,19 @@ impl StorageHandler for ObjectStoreStorageHandler {
         ))
     }
 
+    fn delete(&self, path: &Url) -> DeltaResult<()> {
+        let p = self.url_to_path(path)?;
+        let store = self.store.clone();
+        self.rt.block_on(async move {
+            match store.delete(&p).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(other) => Err(Error::Generic(format!(
+                    "object_store delete failed: {other}"
+                ))),
+            }
+        })
+    }
+
     fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
         let p = self.url_to_path(path)?;
         let store = self.store.clone();
@@ -287,10 +300,50 @@ async fn fetch_presigned(url: Url, range: Option<std::ops::Range<u64>>) -> Delta
 
 /// Kernel-aligned: `true` iff `object_store::list` is guaranteed to return
 /// lexicographically-ordered results for this URL. False for local fs
-/// (`LocalFileSystem` lists in filesystem order) and S3 directory buckets
-/// (`*--x-s3`, `*-xa-s3`); true for general-purpose S3 / GCS / Azure.
+/// (`LocalFileSystem` lists in filesystem order), for HTTP/WebDAV
+/// (`HttpStore` streams PROPFIND entries in server order), and for S3
+/// directory buckets (`*--x-s3`, `*-xa-s3`); true for general-purpose
+/// S3 / GCS / Azure.
 fn supports_ordered_listing(url: &Url) -> bool {
-    !((url.scheme() == "file")
+    !(matches!(url.scheme(), "file" | "http" | "https")
         || url.domain().map(|d| d.contains("--x-s3")).unwrap_or(false)
         || url.domain().map(|d| d.contains("-xa-s3")).unwrap_or(false))
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+
+    /// The trait documents delete as idempotent: a missing path is `Ok`.
+    #[test]
+    fn delete_missing_path_is_ok() {
+        use delta_kernel::StorageHandler;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Url::from_directory_path(dir.path()).unwrap();
+        let storage =
+            ObjectStoreStorageHandler::new(&base, std::iter::empty(), crate::engine::rt()).unwrap();
+        let missing = base.join("nope.json").unwrap();
+        storage.delete(&missing).expect("idempotent delete");
+    }
+}
+
+#[cfg(test)]
+mod listing_order_tests {
+    use super::*;
+
+    /// Kernel relies on the ordering claim for log-segment discovery, so a
+    /// store that lists in server order must report `false` and get sorted.
+    #[test]
+    fn unordered_schemes_report_false() {
+        let claims = |u: &str| supports_ordered_listing(&Url::parse(u).unwrap());
+        // HttpStore streams PROPFIND entries in server order.
+        assert!(!claims("http://host/tbl"));
+        assert!(!claims("https://host/tbl"));
+        assert!(!claims("file:///tmp/tbl"));
+        assert!(!claims("s3://bucket--x-s3/tbl"));
+        // General-purpose object stores do list lexicographically.
+        assert!(claims("s3://bucket/tbl"));
+        assert!(claims("gs://bucket/tbl"));
+    }
 }

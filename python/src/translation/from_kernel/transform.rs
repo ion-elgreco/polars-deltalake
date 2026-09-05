@@ -1,16 +1,17 @@
-//! Kernel `Transform` → polars `as_struct(...)`. A `Transform` is a sparse
-//! schema rewrite: prepend new fields, then walk the input fields applying
-//! per-field replace/insert directives. Output ordering must match the
-//! declared output struct position-by-position — see [`translate_transform`].
+//! Kernel `ExpressionStructPatch` → polars `as_struct(...)`. A struct patch
+//! is a sparse schema rewrite: prepend new fields, walk the input fields
+//! applying per-field replace/insert directives, then append trailing
+//! fields. Output ordering must match the declared output struct
+//! position-by-position — see [`translate_transform`].
 
-use delta_kernel::expressions::{ColumnName, Expression, ExpressionRef, FieldTransform, Transform};
+use delta_kernel::expressions::{ColumnName, Expression, ExpressionRef, ExpressionStructPatch};
 use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 use delta_kernel::{DeltaResult, Error};
-use polars::prelude::as_struct as polars_as_struct;
+
 use polars::prelude::{Expr, col};
 use polars_utils::pl_str::PlSmallStr;
 
-use super::expr::{column_path_to_expr, translate_expr};
+use super::expr::{as_struct_checked, column_path_to_expr, null_gated, translate_expr};
 
 /// Per-output-slot intent produced by [`walk_transform_slots`]. Shared by
 /// the lazy [`translate_transform`] walker and the eager `build_transform_ops`
@@ -32,13 +33,31 @@ pub(super) enum TransformSlot<'a> {
     },
 }
 
-/// Walk a Transform position-by-position over `input_fields` and emit one
+/// Walk a struct patch position-by-position over `input_fields` and emit one
 /// [`TransformSlot`] per output slot.
 pub(super) fn walk_transform_slots<'a>(
-    t: &'a Transform,
+    t: &'a ExpressionStructPatch,
     output_struct: &'a StructType,
     input_fields: &[&'a StructField],
 ) -> DeltaResult<Vec<TransformSlot<'a>>> {
+    // A non-optional patch naming a field the input doesn't have is an error
+    // per the kernel contract; optional ones are silently skipped.
+    let mut missing: Vec<&str> = t
+        .field_patches
+        .iter()
+        .filter(|(name, patch)| {
+            !patch.optional && !input_fields.iter().any(|f| f.name.as_str() == *name)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !missing.is_empty() {
+        // `field_patches` is a HashMap, so sort for a reproducible message.
+        missing.sort_unstable();
+        return Err(Error::Generic(format!(
+            "StructPatch: patched field(s) {missing:?} not found in input schema"
+        )));
+    }
+
     let mut slots: Vec<TransformSlot<'a>> = Vec::with_capacity(output_struct.num_fields());
     let mut output_iter = output_struct.fields();
 
@@ -50,13 +69,14 @@ pub(super) fn walk_transform_slots<'a>(
     }
 
     for (input_idx, input_field) in input_fields.iter().enumerate() {
-        let op = classify_input_op(t.field_transforms.get(input_field.name.as_str()));
-        let (passes_through, inserts) = match op {
-            InputFieldOp::Keep => (true, &[][..]),
-            InputFieldOp::KeepThenInsert(exprs) => (true, exprs),
-            InputFieldOp::Drop => (false, &[][..]),
-            InputFieldOp::ReplaceWith(exprs) => (false, exprs),
-        };
+        // No entry keeps the field; an entry keeps it only when `keep_input`,
+        // and its insertions land after the field's output position. Keeping
+        // nothing and inserting nothing drops the field.
+        let (passes_through, inserts): (bool, &[ExpressionRef]) =
+            match t.field_patches.get(input_field.name.as_str()) {
+                None => (true, &[]),
+                Some(p) => (p.keep_input, &p.insertions),
+            };
         if passes_through {
             slots.push(TransformSlot::Passthrough {
                 input_idx,
@@ -69,6 +89,13 @@ pub(super) fn walk_transform_slots<'a>(
                 output: next_output(&mut output_iter)?,
             });
         }
+    }
+
+    for app in &t.appended_fields {
+        slots.push(TransformSlot::Translated {
+            expr: app.as_ref(),
+            output: next_output(&mut output_iter)?,
+        });
     }
 
     if output_iter.next().is_some() {
@@ -88,11 +115,12 @@ fn next_output<'a>(
 }
 
 /// Prepend computed fields, then walk input fields applying per-field
-/// replace/insert directives from `field_transforms`. Output ordering must
+/// replace/insert directives from `field_patches`, then append
+/// `appended_fields`. Output ordering must
 /// match `output_struct` position-by-position — kernel consumes the output
 /// schema in lockstep with prepends, pass-throughs, and inserts.
 pub(super) fn translate_transform(
-    t: &Transform,
+    t: &ExpressionStructPatch,
     output_struct: &StructType,
     input_schema: &StructType,
 ) -> DeltaResult<Expr> {
@@ -123,23 +151,14 @@ pub(super) fn translate_transform(
             Ok(raw.alias(PlSmallStr::from_str(output.name.as_str())))
         })
         .collect::<DeltaResult<Vec<_>>>()?;
-    Ok(polars_as_struct(entries))
-}
-
-enum InputFieldOp<'a> {
-    Keep,
-    KeepThenInsert(&'a [ExpressionRef]),
-    Drop,
-    ReplaceWith(&'a [ExpressionRef]),
-}
-
-fn classify_input_op(ft: Option<&FieldTransform>) -> InputFieldOp<'_> {
-    match ft {
-        None => InputFieldOp::Keep,
-        Some(ft) if !ft.is_replace => InputFieldOp::KeepThenInsert(&ft.exprs),
-        Some(ft) if ft.exprs.is_empty() => InputFieldOp::Drop,
-        Some(ft) => InputFieldOp::ReplaceWith(&ft.exprs),
-    }
+    let rebuilt = as_struct_checked(entries, "StructPatch")?;
+    // A nested patch rewrites a struct-typed column; `as_struct` alone would
+    // make every row valid, and plan filters (`add IS NOT NULL`) select rows
+    // by exactly that outer validity.
+    Ok(match &root_expr {
+        Some(root) => null_gated(root.clone().is_not_null(), rebuilt),
+        None => rebuilt,
+    })
 }
 
 fn descend_struct_path<'a>(root: &'a StructType, path: &ColumnName) -> DeltaResult<&'a StructType> {
@@ -160,4 +179,45 @@ fn descend_struct_path<'a>(root: &'a StructType, path: &ColumnName) -> DeltaResu
         }
     }
     Ok(current)
+}
+
+#[cfg(test)]
+mod missing_patch_tests {
+    use delta_kernel::expressions::{ExpressionFieldPatch, ExpressionStructPatch};
+
+    use super::*;
+
+    /// `field_patches` is a HashMap, so naming only the first field found
+    /// makes the error depend on iteration order.
+    #[test]
+    fn missing_fields_are_all_named_in_sorted_order() {
+        let drop = || ExpressionFieldPatch {
+            keep_input: false,
+            insertions: vec![],
+            optional: false,
+        };
+        let patch = ExpressionStructPatch {
+            input_path: None,
+            field_patches: [("zz".to_string(), drop()), ("aa".to_string(), drop())]
+                .into_iter()
+                .collect(),
+            prepended_fields: vec![],
+            appended_fields: vec![],
+        };
+        let output =
+            StructType::try_new([StructField::nullable("keep", KernelDataType::LONG)]).unwrap();
+        let kept = StructField::nullable("keep", KernelDataType::LONG);
+
+        let err = match walk_transform_slots(&patch, &output, &[&kept]) {
+            Err(e) => e,
+            Ok(_) => panic!("non-optional patches naming absent fields must error"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("\"aa\""), "got: {msg}");
+        assert!(msg.contains("\"zz\""), "got: {msg}");
+        assert!(
+            msg.find("aa") < msg.find("zz"),
+            "names must be sorted, got: {msg}"
+        );
+    }
 }

@@ -3,16 +3,14 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use delta_kernel::schema::{MetadataValue, StructField, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::table_properties::TableProperties;
 use polars::prelude::{Column, DataFrame, Expr, IntoLazy};
 use polars_plan::dsl::Operator;
 use polars_utils::pl_str::PlSmallStr;
 use pyo3::prelude::*;
 
 use crate::scan::plan::ScanFileMeta;
-use crate::translation::schema::KernelDataTypeExt;
 
 /// A single conjunct of the user predicate, with its kernel-translatability
 /// cached so `build_iter` doesn't re-translate every scan.
@@ -34,9 +32,11 @@ pub(crate) struct ConjunctClassification {
     /// row-group skipping + row-level filter. Rewritten to physical names
     /// for column-mapped tables.
     pub(crate) parquet_filter: Vec<Expr>,
-    /// Option-2 file pruning via polars eval on partition values.
+    /// Exact file pruning via polars eval on partition values — the only
+    /// layer that evaluates a partition-only conjunct, since kernel's
+    /// stats-based skipping keeps every file it cannot decide.
     pub(crate) partition_prune: Vec<Expr>,
-    /// Applied inside `LogicalScanIter` after `transform_to_logical`
+    /// Applied inside `LogicalScanIter` after the physical→logical select
     /// materializes partition columns.
     pub(crate) post_transform: Vec<Expr>,
 }
@@ -44,32 +44,39 @@ pub(crate) struct ConjunctClassification {
 /// Route each conjunct to the layer(s) that will evaluate it.
 pub(crate) fn classify_conjuncts(
     conjuncts: &[Conjunct],
-    column_mapped: bool,
+    mode: ColumnMappingMode,
     logical_schema: &StructType,
     physical_schema: &StructType,
+    partition_cols: &[String],
 ) -> ConjunctClassification {
+    let column_mapped = mode != ColumnMappingMode::None;
     let mut out = ConjunctClassification::default();
     for c in conjuncts {
         if c.kernel_translatable {
             out.kernel.push(c.expr.clone());
         }
-        let partition_only = touches_partition_only(&c.expr, logical_schema, physical_schema);
+        let partition_only = touches_partition_only(&c.expr, partition_cols);
         let for_parquet = if column_mapped {
-            rewrite_predicate_to_physical(&c.expr, logical_schema, physical_schema)
+            rewrite_predicate_to_physical(&c.expr, logical_schema, physical_schema, mode)
         } else {
             predicate_only_touches_data_columns(&c.expr, physical_schema).then(|| c.expr.clone())
         };
         if let Some(e) = for_parquet {
             out.parquet_filter.push(e);
-        } else if !c.kernel_translatable && partition_only {
+        } else if partition_only {
+            // Every partition-only conjunct, translatable or not. Kernel's
+            // file skipping is conservative — a NULL verdict (a NULL partition
+            // value) and an expression its evaluator has no rule for both
+            // *keep* the file — while polars deletes its own filter node once
+            // we accept the predicate, so an unevaluated conjunct returns rows
+            // it excludes.
             out.partition_prune.push(c.expr.clone());
-        } else if !partition_only {
+        } else {
             // Mixed atomic (touches partition + data) — kernel may best-effort
             // file-skip, but rows in surviving files still need row-level eval
             // once partition cols are materialized.
             out.post_transform.push(c.expr.clone());
         }
-        // Translatable + partition-only: kernel exact-skips, no further work.
     }
     out
 }
@@ -116,22 +123,33 @@ pub(crate) fn conjunction(mut conjuncts: Vec<Expr>) -> Option<Expr> {
     Some(conjuncts.into_iter().fold(first, |acc, e| acc.and(e)))
 }
 
-/// Kernel's `StructField::physical_name(mode)` is `pub(crate)`, so read the
-/// underlying metadata key ourselves.
-const PHYSICAL_NAME_KEY: &str = "delta.columnMapping.physicalName";
-
-fn physical_name(field: &StructField) -> &str {
-    match field.metadata.get(PHYSICAL_NAME_KEY) {
-        Some(MetadataValue::String(s)) => s.as_str(),
-        _ => field.name.as_str(),
+/// True when column mapping renames anything below the top level of `dtype`.
+pub(crate) fn renames_nested_fields(dtype: &KernelDataType, mode: ColumnMappingMode) -> bool {
+    match dtype {
+        KernelDataType::Struct(fields) => fields.fields().any(|f| {
+            f.physical_name(mode) != f.name.as_str() || renames_nested_fields(&f.data_type, mode)
+        }),
+        KernelDataType::Array(array) => renames_nested_fields(array.element_type(), mode),
+        KernelDataType::Map(map) => {
+            renames_nested_fields(map.key_type(), mode)
+                || renames_nested_fields(map.value_type(), mode)
+        }
+        _ => false,
     }
 }
 
-pub(crate) fn has_column_mapping(props: &TableProperties) -> bool {
-    matches!(
-        props.column_mapping_mode,
-        Some(ColumnMappingMode::Id | ColumnMappingMode::Name)
-    )
+/// Leaf column names `exprs` reference that `schema` does not declare.
+/// `BTreeSet` for one-pass dedup with sorted iteration order.
+pub(crate) fn columns_outside_schema<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr>,
+    schema: &StructType,
+) -> BTreeSet<String> {
+    exprs
+        .into_iter()
+        .flat_map(polars_plan::utils::expr_to_leaf_column_names)
+        .filter(|n| !schema.contains(n.as_str()))
+        .map(|n| n.to_string())
+        .collect()
 }
 
 /// Used to drop predicates touching partition columns — kernel adds those
@@ -140,41 +158,58 @@ pub(crate) fn predicate_only_touches_data_columns(
     expr: &Expr,
     physical_schema: &StructType,
 ) -> bool {
-    let phys_names: std::collections::HashSet<&str> =
-        physical_schema.fields().map(|f| f.name.as_str()).collect();
-    polars_plan::utils::expr_to_leaf_column_names(expr)
-        .iter()
-        .all(|n| phys_names.contains(n.as_str()))
+    columns_outside_schema([expr], physical_schema).is_empty()
 }
 
 /// Polars-driven partition pruning for predicates kernel can't translate
 /// (e.g. `partition_col.dt.year() == 2024`). Returns the indices of files
 /// whose partition values satisfy `partition_conjuncts`.
+///
+/// `add.partitionValues` is keyed by *physical* name, while the conjuncts
+/// name logical columns, so the frame is built physical-keyed and emitted
+/// under logical names.
 pub(crate) fn file_skip_via_partition_eval(
     partition_conjuncts: &[Expr],
     files: &[ScanFileMeta],
     logical_schema: &StructType,
+    mode: ColumnMappingMode,
 ) -> anyhow::Result<HashSet<usize>> {
     const FILE_IDX_COL: &str = "__pldl_file_idx__";
+    let by_logical: HashMap<&str, &StructField> = logical_schema
+        .fields()
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+    // Only the columns the conjuncts name: an unreferenced partition key —
+    // a stale one a foreign writer left behind, or one whose type polars
+    // cannot build — must not fail or slow down a skip that never reads it.
     // BTreeSet for one-pass dedup with sorted iteration order.
-    let partition_cols: BTreeSet<&str> = files
+    let referenced: BTreeSet<&str> = partition_conjuncts
         .iter()
-        .flat_map(|f| f.partition_values.keys().map(String::as_str))
+        .flat_map(polars_plan::utils::expr_to_leaf_column_names)
+        .filter_map(|n| by_logical.get_key_value(n.as_str()).map(|(k, _)| *k))
         .collect();
 
-    let mut columns: Vec<Column> = partition_cols
+    let mut columns: Vec<Column> = referenced
         .iter()
-        .map(|name| -> anyhow::Result<Column> {
-            let field = logical_schema
-                .field(name)
-                .ok_or_else(|| anyhow::anyhow!("partition column not in logical schema: {name}"))?;
+        .map(|logical| -> anyhow::Result<Column> {
+            let field = by_logical[logical];
+            let physical = field.physical_name(mode);
+            // An absent key is a NULL partition value, not a missing column:
+            // kernel's `MapItem::materialize` drops null-valued entries, so a
+            // partition whose value is NULL in every add action carries no key
+            // at all. The caller already gated on the snapshot's partition
+            // list, so `None` here means NULL.
             let vals: Vec<Option<&str>> = files
                 .iter()
-                .map(|f| f.partition_values.get(*name).map(String::as_str))
+                .map(|f| f.partition_values.get(physical).map(String::as_str))
                 .collect();
-            Column::new(PlSmallStr::from_str(name), vals.as_slice())
-                .cast(&field.data_type.to_polars()?)
-                .map_err(|e| anyhow::anyhow!("cast partition col {name}: {e:#}"))
+            let raw = Column::new(PlSmallStr::from_str(field.name.as_str()), vals.as_slice());
+            // Kernel's `parse_scalar`, the same grammar the select list uses
+            // to materialize these values: a polars cast rejects spellings
+            // Delta mandates (`2024-01-15 10:30:00`) and would prune away
+            // every file it nulls.
+            crate::translation::parse_partition_column(&raw, &field.data_type)
+                .map_err(|e| anyhow::anyhow!("parse partition col {}: {e:#}", field.name))
         })
         .collect::<anyhow::Result<_>>()?;
     let idx_vals: Vec<u32> = (0..files.len() as u32).collect();
@@ -196,40 +231,43 @@ pub(crate) fn file_skip_via_partition_eval(
         .column(FILE_IDX_COL)
         .and_then(|c| c.u32())
         .map_err(|e| anyhow::anyhow!("read file-idx col: {e:#}"))?;
-    Ok(chunked.into_iter().flatten().map(|x| x as usize).collect())
+    Ok(chunked.iter().flatten().map(|x| x as usize).collect())
 }
 
-/// Returns true iff `expr` references any column that is in `logical_schema`
-/// but not in `physical_schema` (i.e. a partition column). Used to gate
-/// untranslatable conjuncts for [`file_skip_via_partition_eval`].
-pub(crate) fn touches_partition_only(
-    expr: &Expr,
-    logical_schema: &StructType,
-    physical_schema: &StructType,
-) -> bool {
-    let phys_names: HashSet<&str> = physical_schema.fields().map(|f| f.name.as_str()).collect();
-    let logical_names: HashSet<&str> = logical_schema.fields().map(|f| f.name.as_str()).collect();
+/// Returns true iff every column `expr` references is a partition column.
+/// Used to gate conjuncts for [`file_skip_via_partition_eval`].
+///
+/// `partition_cols` is the snapshot's own list (kernel's
+/// `logical_partition_columns`), the same authority `resolve_scan` uses.
+/// Deriving partitionhood as "logical minus physical" instead would
+/// misread any other logical-only name — a projected-away data column, a
+/// future rev's row-tracking field — as a partition column and route it to
+/// a layer that cannot evaluate it.
+pub(crate) fn touches_partition_only(expr: &Expr, partition_cols: &[String]) -> bool {
     let referenced = polars_plan::utils::expr_to_leaf_column_names(expr);
     !referenced.is_empty()
-        && referenced.iter().all(|n| {
-            let s = n.as_str();
-            logical_names.contains(s) && !phys_names.contains(s)
-        })
+        && referenced
+            .iter()
+            .all(|n| partition_cols.iter().any(|p| p == n.as_str()))
 }
 
-/// Only meaningful when column mapping is active — see [`has_column_mapping`].
+/// Only meaningful when column mapping is active (`mode` is `Id` or `Name`).
 /// `None` if the predicate references a partition column or an unknown name.
 pub(crate) fn rewrite_predicate_to_physical(
     expr: &Expr,
     logical_schema: &StructType,
     physical_schema: &StructType,
+    mode: ColumnMappingMode,
 ) -> Option<Expr> {
     let phys_names: std::collections::HashSet<&str> =
         physical_schema.fields().map(|f| f.name.as_str()).collect();
     let mut logical_to_phys: HashMap<String, PlSmallStr> = HashMap::new();
     for field in logical_schema.fields() {
-        let phys = physical_name(field);
-        if phys_names.contains(phys) {
+        let phys = field.physical_name(mode);
+        // A flat name rewrite fixes only the root, so nested-renamed columns
+        // stay out: the check below then declines the whole predicate, which
+        // runs after the physical→logical select on logical names instead.
+        if phys_names.contains(phys) && !renames_nested_fields(&field.data_type, mode) {
             logical_to_phys.insert(field.name.to_string(), PlSmallStr::from_str(phys));
         }
     }
@@ -248,4 +286,109 @@ pub(crate) fn rewrite_predicate_to_physical(
         other => other,
     });
     Some(rewritten)
+}
+
+#[cfg(test)]
+mod partition_prune_tests {
+    use polars::prelude::{col, lit};
+    use polars_utils::pl_path::PlRefPath;
+
+    use super::*;
+    use crate::scan::plan::LogicalRewrite;
+
+    /// Kernel writes `add.partitionValues` keyed by *physical* name.
+    fn file(region: &str) -> ScanFileMeta {
+        ScanFileMeta {
+            file: delta_kernel::FileMeta {
+                location: url::Url::parse(&format!("file:///t/{region}.parquet")).unwrap(),
+                last_modified: 0,
+                size: 0,
+            },
+            path: PlRefPath::new(format!("/t/{region}.parquet")),
+            rewrite: LogicalRewrite {
+                select: None,
+                dv: None,
+            },
+            partition_values: [("col-3".to_string(), region.to_string())]
+                .into_iter()
+                .collect(),
+            num_records: None,
+        }
+    }
+
+    /// The conjunct names logical columns, so the pruning frame has to be
+    /// emitted under logical names even though its keys arrive physical.
+    #[test]
+    fn column_mapped_keys_resolve_to_logical_names() {
+        let logical =
+            StructType::try_new([StructField::nullable("region", KernelDataType::STRING)
+                .with_metadata([("delta.columnMapping.physicalName", "col-3")])])
+            .unwrap();
+        let files = [file("EU"), file("US")];
+
+        let surviving = file_skip_via_partition_eval(
+            &[col("region").eq(lit("EU"))],
+            &files,
+            &logical,
+            ColumnMappingMode::Name,
+        )
+        .unwrap();
+        assert_eq!(surviving, HashSet::from([0usize]));
+    }
+
+    /// Kernel's `MapItem::materialize` drops null-valued entries, so a
+    /// partition that is NULL in every add action carries no key at all.
+    /// That is a legal log, not a missing column: prune on NULL, don't fail.
+    #[test]
+    fn absent_partition_key_reads_as_null() {
+        let logical =
+            StructType::try_new([StructField::nullable("region", KernelDataType::STRING)]).unwrap();
+        let files = [no_partition_values(), no_partition_values()];
+
+        let surviving = file_skip_via_partition_eval(
+            &[col("region").is_null()],
+            &files,
+            &logical,
+            ColumnMappingMode::None,
+        )
+        .unwrap();
+        assert_eq!(surviving, HashSet::from([0usize, 1usize]));
+
+        let none_match = file_skip_via_partition_eval(
+            &[col("region").eq(lit("EU"))],
+            &files,
+            &logical,
+            ColumnMappingMode::None,
+        )
+        .unwrap();
+        assert!(none_match.is_empty());
+    }
+
+    fn no_partition_values() -> ScanFileMeta {
+        ScanFileMeta {
+            partition_values: HashMap::new(),
+            ..file("EU")
+        }
+    }
+
+    /// A projected-away data column is logical-only too, so inferring
+    /// partitionhood from "logical minus physical" would route it to the
+    /// partition pruner, which cannot evaluate it.
+    #[test]
+    fn projected_away_data_column_is_not_partition_only() {
+        let partition_cols = ["region".to_string()];
+        assert!(touches_partition_only(
+            &col("region").eq(lit("EU")),
+            &partition_cols
+        ));
+        assert!(!touches_partition_only(
+            &col("b").gt(lit(15)),
+            &partition_cols
+        ));
+        // Mixed atomic: one partition column is not enough.
+        assert!(!touches_partition_only(
+            &col("region").eq(lit("EU")).and(col("b").gt(lit(15))),
+            &partition_cols
+        ));
+    }
 }

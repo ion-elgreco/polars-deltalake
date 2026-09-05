@@ -9,6 +9,13 @@ mod parquet;
 mod storage;
 
 pub(super) use json::PolarsJsonHandler;
+#[cfg(test)]
+pub(crate) use json::parse_ndjson_inferred;
+pub(crate) use json::{align_lazy, parse_commit_files};
 pub(super) use parquet::PolarsParquetHandler;
-pub(crate) use parquet::{parquet_options, path_for_polars_io, unified_scan_args};
-pub(super) use storage::ObjectStoreStorageHandler;
+pub(crate) use parquet::{
+    MetadataColumns, dsl_parquet_scan, ensure_no_field_id_matching, fetch_parquet_metadata,
+    kernel_parquet_footer, path_for_polars_io, row_index_as_long, split_metadata_columns,
+    unified_scan_args,
+};
+pub(crate) use storage::ObjectStoreStorageHandler;

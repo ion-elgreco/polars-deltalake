@@ -5,16 +5,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::expressions::{Predicate, PredicateRef};
-use delta_kernel::scan::Scan;
+use delta_kernel::scan::{PartitionValuesOptions, Scan};
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
-use polars::prelude::{DataFrame, Expr, Schema as PlSchema};
-use polars_plan::dsl::Engine as PolarsEngineMode;
+use polars::prelude::{DataFrame, Expr, IdxSize, Schema as PlSchema};
 use pyo3::prelude::*;
 use pyo3_polars::PySchema;
-use tokio::runtime::Runtime;
 use url::Url;
 
-use crate::engine::{COLLECT_CHUNK_ROWS, PolarsEngine};
+use crate::engine::PolarsEngine;
 use crate::errors::py_err;
 use crate::translation::schema::KernelSchemaExt;
 use crate::translation::to_kernel::polars_expr_to_kernel_predicate;
@@ -25,17 +23,19 @@ mod logical;
 mod plan;
 mod predicate;
 mod read;
+mod row_offsets;
 
 pub(crate) use cdf::{CdfTableScan, CdfTableState};
-pub(crate) use read::{build_lazy_scan, select_exprs_for_schema};
 
 use ffi::{MorselState, SendExport, morsel_to_py, next_morsel};
 use logical::LogicalScanIter;
 use plan::{ResolvedScan, resolve_scan};
 use predicate::{
-    Conjunct, classify_conjuncts, conjunction, extract_expr_via_json, file_skip_via_partition_eval,
-    flatten_and_conjuncts, has_column_mapping,
+    Conjunct, ConjunctClassification, classify_conjuncts, columns_outside_schema, conjunction,
+    extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
 };
+use read::build_lazy_scan;
+use row_offsets::{footer_row_count, physical_prefix, place_dvs};
 
 type BatchIter = Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>;
 
@@ -68,11 +68,12 @@ impl TableState {
     /// would be routed, without running a scan.
     fn _classify_predicate(&self, predicate: Bound<'_, PyAny>) -> PyResult<HashMap<String, usize>> {
         let expr = extract_expr_via_json(&predicate)?;
+        let schema = self.snapshot.schema();
         let conjuncts: Vec<Conjunct> = flatten_and_conjuncts(&expr)
             .into_iter()
             .map(|c| Conjunct {
                 expr: c.clone(),
-                kernel_translatable: polars_expr_to_kernel_predicate(c).is_some(),
+                kernel_translatable: polars_expr_to_kernel_predicate(c, &schema).is_some(),
             })
             .collect();
         let scan = self
@@ -82,11 +83,13 @@ impl TableState {
             .build()
             .map_err(|e| py_err(anyhow::anyhow!("failed to build scan: {e:#}")))?;
         let logical_schema = self.snapshot.schema();
+        let config = self.snapshot.table_configuration();
         let routing = classify_conjuncts(
             &conjuncts,
-            has_column_mapping(self.snapshot.table_properties()),
+            config.column_mapping_mode(),
             &logical_schema,
             scan.physical_schema(),
+            config.logical_partition_columns(),
         );
         Ok(HashMap::from([
             ("kernel".to_string(), routing.kernel.len()),
@@ -174,12 +177,13 @@ impl TableScan {
             }
             Some(p) => {
                 let expr = extract_expr_via_json(&p)?;
+                let schema = self.snapshot.schema();
                 // Per-conjunct so one untranslatable term doesn't disable
                 // file-skipping for its siblings.
                 let mut translated: Vec<Predicate> = Vec::new();
                 let mut conjuncts: Vec<Conjunct> = Vec::new();
                 for c in flatten_and_conjuncts(&expr) {
-                    let kernel_translatable = match polars_expr_to_kernel_predicate(c) {
+                    let kernel_translatable = match polars_expr_to_kernel_predicate(c, &schema) {
                         Some(kp) => {
                             translated.push(kp);
                             true
@@ -219,10 +223,20 @@ impl TableScan {
 }
 
 impl TableScan {
-    fn build_scan(&self, state: &ScanState) -> anyhow::Result<Scan> {
-        let mut sb = self.snapshot.clone().scan_builder();
+    /// `extra` widens the read past the caller's projection. Appended, since
+    /// `project_as_struct` keeps the order it is given — the caller's columns
+    /// hold their positions and the extras land after them.
+    fn build_scan(&self, state: &ScanState, extra: &[String]) -> anyhow::Result<Scan> {
+        let mut sb = self
+            .snapshot
+            .clone()
+            .scan_builder()
+            // The metadata plan parses partition values into a typed struct
+            // (`add.partitionValues_parsed`) the resolver turns into per-file
+            // literals.
+            .with_partition_values(PartitionValuesOptions::with_struct());
         if let Some(cols) = &state.projection {
-            let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+            let refs: Vec<&str> = cols.iter().chain(extra).map(String::as_str).collect();
             let projected = self
                 .snapshot
                 .schema()
@@ -237,11 +251,51 @@ impl TableScan {
             .map_err(|e| anyhow::anyhow!("failed to build scan: {e:#}"))
     }
 
-    fn build_iter(&self, state: &mut ScanState) -> anyhow::Result<()> {
-        let scan = self.build_scan(state)?;
-        let engine: Arc<dyn Engine> = self.engine.clone();
+    fn route(&self, state: &ScanState, scan: &Scan) -> ConjunctClassification {
+        let config = self.snapshot.table_configuration();
+        classify_conjuncts(
+            &state.original_predicate,
+            config.column_mapping_mode(),
+            &self.snapshot.schema(),
+            scan.physical_schema(),
+            config.logical_partition_columns(),
+        )
+    }
 
-        let resolved = resolve_scan(&scan, engine.as_ref())?;
+    fn build_iter(&self, state: &mut ScanState) -> anyhow::Result<()> {
+        let mut scan = self.build_scan(state, &[])?;
+        let mut routing = self.route(state, &scan);
+
+        // A post-transform conjunct runs on the logical frame, so the read has
+        // to cover every column it names even when the caller did not ask for
+        // one. Widen and let `LogicalScanIter` project back down after the
+        // filter. Near-free: a conjunct only lands in `post_transform` by
+        // touching a partition column, which kernel synthesizes from the log.
+        // Decided before any listing so it never depends on file pruning.
+        let widen = columns_outside_schema(&routing.post_transform, scan.logical_schema());
+        let output_projection = if widen.is_empty() {
+            None
+        } else {
+            let table_schema = self.snapshot.schema();
+            let absent = columns_outside_schema(&routing.post_transform, &table_schema);
+            if !absent.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "predicate references {} which the table does not have",
+                    absent.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            let extra: Vec<String> = widen.into_iter().collect();
+            scan = self.build_scan(state, &extra)?;
+            routing = self.route(state, &scan);
+            state.projection.clone()
+        };
+
+        let physical_schema = scan.physical_schema().clone();
+        let config = self.snapshot.table_configuration();
+        let mode = config.column_mapping_mode();
+        let table_logical_schema = self.snapshot.schema();
+
+        let resolved = resolve_scan(&scan, self.engine.as_ref())?;
         if resolved.files.is_empty() {
             state.iter = Some(Box::new(std::iter::empty()));
             state.morsel.reset();
@@ -252,25 +306,14 @@ impl TableScan {
             mut path_index,
         } = resolved;
 
-        let physical_schema = scan.physical_schema().clone();
-        let logical_schema = scan.logical_schema().clone();
-        let select_exprs = select_exprs_for_schema(&physical_schema);
-
-        let column_mapped = has_column_mapping(self.snapshot.table_properties());
-        let table_logical_schema = self.snapshot.schema();
-
-        let routing = classify_conjuncts(
-            &state.original_predicate,
-            column_mapped,
-            &table_logical_schema,
-            &physical_schema,
-        );
+        let select_exprs = crate::translation::schema::select_exprs_for_schema(&physical_schema);
 
         if !routing.partition_prune.is_empty() {
             let surviving = file_skip_via_partition_eval(
                 &routing.partition_prune,
                 &files,
                 &table_logical_schema,
+                mode,
             )?;
             if surviving.is_empty() {
                 state.iter = Some(Box::new(std::iter::empty()));
@@ -293,14 +336,27 @@ impl TableScan {
 
         let polars_predicate: Option<Expr> = conjunction(routing.parquet_filter);
 
-        let (paths, rewrites): (Vec<_>, Vec<_>) =
-            files.into_iter().map(|f| (f.path, f.rewrite)).unzip();
-
         // Skip the file-id column + `LogicalScanIter` when no file needs
-        // DV/Transform — the common case (non-partitioned, non-DV, non-CM).
-        let needs_rewrite = rewrites
-            .iter()
-            .any(|r| r.transform.is_some() || r.dv.is_some());
+        // DV/select — the common case (non-partitioned, non-DV, non-CM). A
+        // DV file also needs `ROW_INDEX_COL` (see its doc).
+        let storage = self.engine.storage_handler();
+        let spans = place_dvs(&files, |file| footer_row_count(storage.as_ref(), file))?;
+        let has_dv = spans.iter().any(Option::is_some);
+        let needs_rewrite = has_dv || files.iter().any(|f| f.rewrite.select.is_some());
+        let paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
+
+        // A row limit counts logical rows, so the scan reads the physical
+        // prefix that holds `n` of them; `next_morsel` trims to `n`. A
+        // post-transform conjunct filters after the scan, so no prefix is
+        // safe then.
+        let table_root = scan.table_root().clone();
+        let physical_limit = match state.morsel.n_rows {
+            Some(n) if routing.post_transform.is_empty() => {
+                physical_prefix(&files, &spans, n, |dv| dv.rows(&storage, &table_root))?
+                    .and_then(|p| IdxSize::try_from(p).ok())
+            }
+            _ => None,
+        };
 
         let lazy = build_lazy_scan(
             paths,
@@ -309,15 +365,13 @@ impl TableScan {
             polars_predicate.as_ref(),
             &physical_schema,
             needs_rewrite,
+            has_dv,
+            physical_limit,
         )?;
 
-        let rt: &'static Runtime = crate::engine::rt();
-        let _enter = rt.enter();
-        let chunk_size = std::num::NonZeroUsize::new(COLLECT_CHUNK_ROWS);
-        let batches = lazy
-            .collect_batches(PolarsEngineMode::Streaming, true, chunk_size, false)
+        let batches = crate::engine::collect_streaming_batches(lazy)
             .map_err(|e| anyhow::anyhow!("collect_batches failed: {e:#}"))?;
-        let source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send> =
+        let source: BatchIter =
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
 
         let new_iter: BatchIter = if needs_rewrite {
@@ -325,20 +379,27 @@ impl TableScan {
                 LogicalScanIter::new(
                     source,
                     path_index,
-                    rewrites,
-                    engine,
-                    physical_schema,
-                    logical_schema,
+                    files,
+                    spans,
+                    storage,
+                    table_root,
                     conjunction(routing.post_transform),
+                    output_projection,
                 )
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
             )
-        } else {
-            debug_assert!(
-                routing.post_transform.is_empty(),
-                "post_transform requires Transform to materialize partition cols",
-            );
+        } else if routing.post_transform.is_empty() {
             source
+        } else {
+            // `LogicalScanIter` is the only layer that applies these, so
+            // without it the conjuncts would drop and return unfiltered rows.
+            // Every column a `post_transform` conjunct names is now read, and
+            // its partition column forces a select — so this arm is
+            // unreachable rather than merely unexercised.
+            return Err(anyhow::anyhow!(
+                "internal: {} post-transform conjunct(s) with no logical rewrite to apply them",
+                routing.post_transform.len()
+            ));
         };
         state.iter = Some(new_iter);
         state.morsel.reset();

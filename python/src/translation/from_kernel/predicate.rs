@@ -10,11 +10,10 @@ use delta_kernel::expressions::{
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error, PredicateEvaluator};
 use polars::prelude::{Expr, IntoLazy, lit};
-use polars_plan::dsl::Engine as PolarsEngineMode;
 use polars_utils::pl_str::PlSmallStr;
 
 use crate::consts::KERNEL_OUTPUT_COL;
-use crate::engine::PolarsEngineData;
+use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 
 use super::downcast_engine_data;
@@ -28,15 +27,12 @@ impl PredicateEvaluator for PolarsPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let df = downcast_engine_data(batch)?.dataframe().clone();
         // Per kernel contract the result is a single nullable boolean column
-        // named "output".
-        let result = df
-            .lazy()
-            .select(vec![
-                self.predicate_expr
-                    .clone()
-                    .alias(PlSmallStr::from_static(KERNEL_OUTPUT_COL)),
-            ])
-            .collect_with_engine(PolarsEngineMode::Streaming)
+        // named "output", one value per input row.
+        let select = [self
+            .predicate_expr
+            .clone()
+            .alias(PlSmallStr::from_static(KERNEL_OUTPUT_COL))];
+        let result = crate::engine::collect_streaming_single(select_anchored(df.lazy(), &select))
             .map_err(to_kernel_err)?;
         Ok(Box::new(PolarsEngineData::new(result)))
     }
@@ -86,7 +82,8 @@ fn translate_binary_predicate(
         BinaryPredicateOp::Equal => lhs.eq(rhs),
         // Direct null-aware inequality — matches kernel's Distinct semantics 1:1.
         BinaryPredicateOp::Distinct => lhs.neq_missing(rhs),
-        BinaryPredicateOp::In => lhs.is_in(rhs, false),
+        // Kernel defines IN as false for a NULL probe, not SQL's NULL.
+        BinaryPredicateOp::In => lhs.is_in(rhs, false).fill_null(lit(false)),
     })
 }
 
@@ -109,4 +106,61 @@ fn translate_junction_predicate(
             JunctionPredicateOp::Or => acc.or(n),
         })
     })
+}
+
+#[cfg(test)]
+mod evaluate_height_tests {
+    use super::*;
+
+    /// Kernel contract: one boolean per input row. A column-free predicate —
+    /// an empty AND junction translates to `lit(true)` — must not let the
+    /// select collapse the mask to a single row.
+    #[test]
+    fn column_free_predicate_keeps_batch_height() {
+        let df = polars::df!("x" => [1i64, 2, 3]).unwrap();
+        let evaluator = PolarsPredicateEvaluator {
+            predicate_expr: lit(true),
+        };
+        let out = evaluator.evaluate(&PolarsEngineData::new(df)).unwrap();
+        assert_eq!(out.len(), 3, "selection vector must cover every row");
+    }
+}
+
+#[cfg(test)]
+mod in_null_tests {
+    use delta_kernel::expressions::ColumnName;
+    use polars::prelude::{AnyValue, IntoLazy};
+
+    use super::*;
+
+    /// Kernel defines IN as false for a NULL probe; SQL-style NULL would
+    /// flip `NOT(x IN ...)` from keep to drop.
+    #[test]
+    fn null_probe_evaluates_false() {
+        let lines = concat!(
+            "{\"x\":1,\"r\":[1,2]}\n",
+            "{\"x\":null,\"r\":[1,2]}\n",
+            "{\"x\":5,\"r\":[1,2]}\n",
+        );
+        let df = crate::engine::parse_ndjson_inferred(lines.as_bytes()).unwrap();
+        let pred = Predicate::Binary(BinaryPredicate {
+            op: BinaryPredicateOp::In,
+            left: Box::new(delta_kernel::expressions::Expression::from(
+                ColumnName::new(["x"]),
+            )),
+            right: Box::new(delta_kernel::expressions::Expression::from(
+                ColumnName::new(["r"]),
+            )),
+        });
+        let expr = translate_predicate(&pred, None).unwrap();
+        let out = df.lazy().select([expr.alias("out")]).collect().unwrap();
+        let col = out.column("out").unwrap();
+        assert_eq!(col.get(0).unwrap(), AnyValue::Boolean(true));
+        assert_eq!(
+            col.get(1).unwrap(),
+            AnyValue::Boolean(false),
+            "NULL probe must be false, not NULL"
+        );
+        assert_eq!(col.get(2).unwrap(), AnyValue::Boolean(false));
+    }
 }
