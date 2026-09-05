@@ -24,6 +24,7 @@ use polars_utils::pl_str::PlSmallStr;
 use url::Url;
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
+use crate::engine::log_cache::{LogFileCache, ParsedLog};
 use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{as_struct_checked, empty_typed_list_expr, null_gated};
@@ -88,27 +89,45 @@ impl JsonHandler for PolarsJsonHandler {
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        // Eagerly fetch bytes (drops the borrow on `self`); parse lazily
-        // inside the returned iterator so kernel can stream commit replay.
+        // Cached parses skip the fetch. The misses are fetched eagerly
+        // (drops the borrow on `self`) and parsed lazily inside the returned
+        // iterator so kernel can stream commit replay.
+        let cache = LogFileCache::global();
+        let cached: Vec<Option<Arc<ParsedLog>>> = files.iter().map(|f| cache.get(&[f])).collect();
         let slices = files
             .iter()
-            .map(|f| (f.location.clone(), None))
+            .zip(&cached)
+            .filter(|(_, hit)| hit.is_none())
+            .map(|(f, _)| (f.location.clone(), None))
             .collect::<Vec<_>>();
         let payloads: Vec<bytes::Bytes> = self
             .storage
             .read_files(slices)?
             .collect::<DeltaResult<_>>()?;
+        let mut payloads = payloads.into_iter();
+        let metas: Vec<FileMeta> = files.to_vec();
         let schema: SchemaRef = physical_schema;
 
-        let iter = payloads
-            .into_iter()
-            .map(move |bytes| -> DeltaResult<Box<dyn EngineData>> {
-                let df = parse_ndjson_inferred(&bytes)?;
-                let aligned = align_lazy(df, schema.as_ref())?
+        let iter = metas.into_iter().zip(cached).map(
+            move |(meta, hit)| -> DeltaResult<Box<dyn EngineData>> {
+                let df = match hit {
+                    Some(df) => df,
+                    None => {
+                        let bytes = payloads.next().ok_or_else(|| {
+                            Error::Generic(format!(
+                                "read_files returned no payload for {}",
+                                meta.location
+                            ))
+                        })?;
+                        cache.insert(&[&meta], ParsedLog::single(parse_ndjson_inferred(&bytes)?))
+                    }
+                };
+                let aligned = align_lazy(DataFrame::clone(&df.df), schema.as_ref())?
                     .collect()
                     .map_err(to_kernel_err)?;
                 Ok(Box::new(PolarsEngineData::new(aligned)))
-            });
+            },
+        );
         Ok(Box::new(iter))
     }
 
@@ -141,13 +160,6 @@ pub(crate) fn parse_ndjson_inferred(bytes: &[u8]) -> DeltaResult<DataFrame> {
         .map_err(to_kernel_err)?;
     df.rechunk_mut();
     Ok(df)
-}
-
-/// One or more commit files parsed as a single NDJSON document, in file
-/// order. `rows_per_file` recovers per-file columns after the parse.
-pub(crate) struct ParsedLog {
-    pub(crate) df: DataFrame,
-    pub(crate) rows_per_file: Vec<usize>,
 }
 
 /// Parse commit files as one NDJSON document, in order. Each file's row

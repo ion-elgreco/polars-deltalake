@@ -15,6 +15,7 @@ use url::Url;
 mod data;
 mod executor;
 mod handlers;
+mod log_cache;
 
 pub(crate) use data::PolarsEngineData;
 pub(crate) use data::resolve_path as resolve_series_path;

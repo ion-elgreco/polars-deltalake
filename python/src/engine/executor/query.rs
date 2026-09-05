@@ -14,7 +14,7 @@ use delta_kernel::plans::ir::nodes::{
 };
 use delta_kernel::plans::ir::plan::{Plan, PlanNode};
 use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, Error, FileMeta};
 use polars::prelude::{
     BooleanChunked, DataFrame, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType,
     LazyFrame, MaintainOrderJoin, NULL, NamedFrom, PolarsError, PolarsResult, Schema as PlSchema,
@@ -22,7 +22,6 @@ use polars::prelude::{
 };
 use polars_utils::pl_path::PlRefPath;
 use polars_utils::pl_str::PlSmallStr;
-use url::Url;
 
 use crate::engine::data::resolve_path;
 use crate::engine::handlers::parse_commit_files;
@@ -30,6 +29,7 @@ use crate::engine::handlers::{
     MetadataColumns, align_lazy, dsl_parquet_scan, ensure_no_field_id_matching, path_for_polars_io,
     row_index_as_long, split_metadata_columns, unified_scan_args,
 };
+use crate::engine::log_cache::LogFileCache;
 use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{
@@ -97,7 +97,7 @@ struct NodeState {
 /// One file to read plus the pre-built literal exprs for its
 /// file-constant columns (typed + aliased).
 struct FileEntry {
-    location: Url,
+    meta: FileMeta,
     literals: Vec<Expr>,
 }
 
@@ -210,7 +210,7 @@ impl PolarsPlanExecutor {
                 }
                 let literals = kernel_constant_literals(&f.file_constants, &const_cols)?;
                 Ok(FileEntry {
-                    location: f.meta.location,
+                    meta: f.meta,
                     literals,
                 })
             })
@@ -264,7 +264,7 @@ impl PolarsPlanExecutor {
                 let literals = first.literals.clone();
                 let paths: Vec<PlRefPath> = entries
                     .iter()
-                    .map(|e| path_for_polars_io(&e.location))
+                    .map(|e| path_for_polars_io(&e.meta.location))
                     .collect::<DeltaResult<_>>()?;
                 let lf = self.scan_parquet_lazy(paths, read_schema, None)?;
                 vec![shape(lf, literals)]
@@ -272,11 +272,11 @@ impl PolarsPlanExecutor {
             FileType::Parquet => entries
                 .into_iter()
                 .map(|e| {
-                    let path = path_for_polars_io(&e.location)?;
+                    let path = path_for_polars_io(&e.meta.location)?;
                     let mut lf =
                         self.scan_parquet_lazy(vec![path], read_schema, row_index.clone())?;
                     if let Some(name) = &file_path {
-                        lf = lf.with_columns([lit(e.location.as_str()).alias(name.clone())]);
+                        lf = lf.with_columns([lit(e.meta.location.as_str()).alias(name.clone())]);
                     }
                     Ok(shape(lf, e.literals))
                 })
@@ -290,12 +290,19 @@ impl PolarsPlanExecutor {
                 // pipeline (restoring kernel's P&M early-out) needs
                 // AnonymousScan under the streaming engine; polars-stream
                 // `todo!()`s on `FileScanIR::Anonymous` through 0.55.2.
-                let slices = entries.iter().map(|e| (e.location.clone(), None)).collect();
-                let payloads: Vec<bytes::Bytes> = self
-                    .storage
-                    .read_files(slices)?
-                    .collect::<DeltaResult<_>>()?;
-                let parsed = parse_commit_files(&payloads)?;
+                let metas: Vec<&FileMeta> = entries.iter().map(|e| &e.meta).collect();
+                let cache = LogFileCache::global();
+                let parsed = match cache.get(&metas) {
+                    Some(parsed) => parsed,
+                    None => {
+                        let slices = metas.iter().map(|m| (m.location.clone(), None)).collect();
+                        let payloads: Vec<bytes::Bytes> = self
+                            .storage
+                            .read_files(slices)?
+                            .collect::<DeltaResult<_>>()?;
+                        cache.insert(&metas, parse_commit_files(&payloads)?)
+                    }
+                };
                 let rows = &parsed.rows_per_file;
                 let mut per_file: Vec<Expr> = constant_columns(&entries, rows)?;
                 if let Some(name) = &row_index {
@@ -306,11 +313,11 @@ impl PolarsPlanExecutor {
                     let paths: Vec<&str> = entries
                         .iter()
                         .zip(rows)
-                        .flat_map(|(e, &n)| std::iter::repeat_n(e.location.as_str(), n))
+                        .flat_map(|(e, &n)| std::iter::repeat_n(e.meta.location.as_str(), n))
                         .collect();
                     per_file.push(lit(Series::new(name.clone(), paths)));
                 }
-                let mut lf = align_lazy(parsed.df, read_schema)?;
+                let mut lf = align_lazy(DataFrame::clone(&parsed.df), read_schema)?;
                 if !per_file.is_empty() {
                     lf = lf.with_columns(per_file);
                 }
@@ -391,15 +398,22 @@ impl PolarsPlanExecutor {
             // Kernel's contract requires the column to be a non-null LONG and
             // nothing more; a zero-byte commit reads as an empty batch on the
             // ScanJson path, so it must not abort here either.
-            match size.get(row) {
-                Some(s) if s >= 0 => {}
+            let size = match size.get(row) {
+                Some(s) if s >= 0 => s as u64,
                 _ => {
                     return Err(Error::Generic(
                         "DynamicScan file size must be a non-negative long".into(),
                     ));
                 }
-            }
-            entries.push(FileEntry { location, literals });
+            };
+            entries.push(FileEntry {
+                meta: FileMeta {
+                    location,
+                    last_modified: 0,
+                    size,
+                },
+                literals,
+            });
         }
 
         let (read_schema, meta_cols) = split_scan_schema(&ds.schema, &ds.file_constant_columns)?;
@@ -721,6 +735,8 @@ mod scan_entries_tests {
     use delta_kernel::schema::DataType;
     use polars::prelude::{DataType as PlDataType, ParquetWriter, lit};
 
+    use url::Url;
+
     use super::*;
     use crate::engine::handlers::ObjectStoreStorageHandler;
 
@@ -744,7 +760,11 @@ mod scan_entries_tests {
             .into_iter()
             .enumerate()
             .map(|(i, literals)| FileEntry {
-                location: Url::parse(&format!("file:///t/{i}.parquet")).unwrap(),
+                meta: FileMeta {
+                    location: Url::parse(&format!("file:///t/{i}.parquet")).unwrap(),
+                    last_modified: 0,
+                    size: 0,
+                },
                 literals,
             })
             .collect();
@@ -780,7 +800,11 @@ mod scan_entries_tests {
         let read_schema = StructType::try_new(Vec::<StructField>::new()).unwrap();
         let output_schema = Arc::new(StructType::try_new([long_field("v")]).unwrap());
         let entries = vec![FileEntry {
-            location: Url::parse("file:///t/0.parquet").unwrap(),
+            meta: FileMeta {
+                location: Url::parse("file:///t/0.parquet").unwrap(),
+                last_modified: 0,
+                size: 0,
+            },
             literals: vec![lit(7i64).alias("v")],
         }];
         let err = executor()
@@ -880,7 +904,11 @@ mod scan_entries_tests {
         .unwrap();
         let output_schema = Arc::new(StructType::try_new([long_field("id")]).unwrap());
         let entries = vec![FileEntry {
-            location: Url::parse("file:///t/0.parquet").unwrap(),
+            meta: FileMeta {
+                location: Url::parse("file:///t/0.parquet").unwrap(),
+                last_modified: 0,
+                size: 0,
+            },
             literals: vec![],
         }];
         let err = match executor().scan_entries(
@@ -928,7 +956,11 @@ mod scan_entries_tests {
             split_scan_schema(&schema, &[]).expect("the plan path supports FilePath");
         let entries = ["a.parquet", "b.parquet"]
             .map(|n| FileEntry {
-                location: Url::from_file_path(dir.path().join(n)).unwrap(),
+                meta: FileMeta {
+                    location: Url::from_file_path(dir.path().join(n)).unwrap(),
+                    last_modified: 0,
+                    size: 0,
+                },
                 literals: vec![],
             })
             .into_iter()
@@ -982,7 +1014,11 @@ mod scan_entries_tests {
 
         for (file_type, path) in [(FileType::Parquet, &pq), (FileType::Json, &json)] {
             let entries = vec![FileEntry {
-                location: Url::from_file_path(path).unwrap(),
+                meta: FileMeta {
+                    location: Url::from_file_path(path).unwrap(),
+                    last_modified: 0,
+                    size: 0,
+                },
                 literals: vec![],
             }];
             let df = executor
@@ -1036,7 +1072,11 @@ mod scan_entries_tests {
         .unwrap();
         let output_schema = Arc::new(read_schema.clone());
         let entries = vec![FileEntry {
-            location: Url::from_file_path(&pq).unwrap(),
+            meta: FileMeta {
+                location: Url::from_file_path(&pq).unwrap(),
+                last_modified: 0,
+                size: 0,
+            },
             literals: vec![],
         }];
         let out = executor()
@@ -1083,7 +1123,11 @@ mod scan_entries_tests {
         .unwrap();
         let output_schema = Arc::new(read_schema.clone());
         let entries = vec![FileEntry {
-            location: Url::from_file_path(&pq).unwrap(),
+            meta: FileMeta {
+                location: Url::from_file_path(&pq).unwrap(),
+                last_modified: 0,
+                size: 0,
+            },
             literals: vec![],
         }];
         let out = executor()
@@ -1125,7 +1169,11 @@ mod scan_entries_tests {
         .unwrap();
         let output_schema = Arc::new(read_schema.clone());
         let entries = vec![FileEntry {
-            location: Url::from_file_path(&pq).unwrap(),
+            meta: FileMeta {
+                location: Url::from_file_path(&pq).unwrap(),
+                last_modified: 0,
+                size: 0,
+            },
             literals: vec![],
         }];
         let out = executor()
@@ -1168,6 +1216,8 @@ mod dynamic_scan_size_tests {
     use delta_kernel::expressions::ColumnName;
     use delta_kernel::schema::DataType;
     use polars::prelude::IntoLazy;
+
+    use url::Url;
 
     use super::*;
     use crate::engine::handlers::ObjectStoreStorageHandler;
