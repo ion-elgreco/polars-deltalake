@@ -8,17 +8,19 @@ use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, ColumnName, Expression, ExpressionRef, UnaryExpression,
     UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
-use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, SchemaRef, StructType};
 use delta_kernel::transform_output_type;
 use delta_kernel::transforms::SchemaTransform;
 use delta_kernel::{DeltaResult, Error};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{
-    Column, DataType as PlDataType, Expr, Field, LiteralValue, NamedFrom, Schema, Series,
-    StringChunked, Utf8JsonPathImpl, coalesce, col, lit, when,
+    Column, DataType as PlDataType, Expr, Field, IntoSeries, LiteralValue, NamedFrom, Schema,
+    Series, StringChunked, Utf8JsonPathImpl, coalesce, col, lit, when,
 };
 use polars_utils::pl_str::PlSmallStr;
+use serde_json::value::RawValue;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
 use crate::errors::to_kernel_err;
@@ -79,12 +81,16 @@ pub(crate) fn translate_expr(
             // polars's `json_decode` requires the JSON value type to already
             // match the target; delta-rs writes Date/Timestamp stats as ISO
             // strings, so decode them as String first and let the struct-wide
-            // cast lift each temporal field.
-            let raw = translate_expr(&p.json_expr, None, input_schema)?;
+            // cast lift each temporal field. Decimals take the same route
+            // because `json_decode` reads every number through f64.
+            let mut raw = translate_expr(&p.json_expr, None, input_schema)?;
+            if has_decimal_leaf(&p.output_schema) {
+                raw = quote_decimal_numbers(raw, p.output_schema.clone());
+            }
             let final_dt = KernelDataType::Struct(Box::new((*p.output_schema).clone()))
                 .to_polars()
                 .map_err(to_kernel_err)?;
-            Ok(match StringifyTemporal.transform_struct(&p.output_schema) {
+            Ok(match StringifyLeaves.transform_struct(&p.output_schema) {
                 Cow::Borrowed(_) => json_decode_lenient(raw, final_dt),
                 Cow::Owned(decode_schema) => {
                     let decode_dt = KernelDataType::Struct(Box::new(decode_schema))
@@ -162,21 +168,145 @@ fn json_decode_lenient(raw: Expr, dtype: PlDataType) -> Expr {
     )
 }
 
-/// Schema rewrite that turns `Date` / `Timestamp` / `TimestampNtz` primitives
-/// into `String`. Used to relax the `json_decode` target so ISO-string stats
-/// from delta-rs decode cleanly; a follow-up struct-wide cast lifts them.
-struct StringifyTemporal;
+/// Schema rewrite that turns `Date` / `Timestamp` / `TimestampNtz` / `Decimal`
+/// primitives into `String`. Used to relax the `json_decode` target so
+/// ISO-string stats from delta-rs and quoted decimals decode cleanly; a
+/// follow-up struct-wide cast lifts them.
+struct StringifyLeaves;
 
-impl<'a> SchemaTransform<'a> for StringifyTemporal {
+impl<'a> SchemaTransform<'a> for StringifyLeaves {
     transform_output_type!(|'a, T| Cow<'a, T>);
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Cow<'a, PrimitiveType> {
         match ptype {
-            PrimitiveType::Date | PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => {
-                Cow::Owned(PrimitiveType::String)
-            }
+            PrimitiveType::Date
+            | PrimitiveType::Timestamp
+            | PrimitiveType::TimestampNtz
+            | PrimitiveType::Decimal(_) => Cow::Owned(PrimitiveType::String),
             _ => Cow::Borrowed(ptype),
         }
+    }
+}
+
+fn has_decimal_leaf(schema: &StructType) -> bool {
+    schema.fields().any(|f| match &f.data_type {
+        KernelDataType::Primitive(PrimitiveType::Decimal(_)) => true,
+        KernelDataType::Struct(inner) => has_decimal_leaf(inner),
+        _ => false,
+    })
+}
+
+/// `json_decode` parses every number as f64 before it looks at the target,
+/// so a decimal stat loses digits past 15 and a wide scale overflows
+/// (`1234567890.5` at scale 10 lands as `…4999999488`). Quoting the number
+/// tokens of decimal leaves lets the struct-wide cast parse them as strings
+/// instead. A value that does not parse passes through untouched for
+/// `json_decode_lenient` to null.
+fn quote_decimal_numbers(raw: Expr, schema: SchemaRef) -> Expr {
+    raw.map(
+        move |column| {
+            let ca = column.str()?;
+            let quoted: StringChunked = ca
+                .iter()
+                .map(|v| v.map(|s| quote_decimals(s, &schema).unwrap_or_else(|| s.to_string())))
+                .collect();
+            Ok(Column::from(
+                quoted.into_series().with_name(column.name().clone()),
+            ))
+        },
+        |_: &Schema, field: &Field| Ok(field.clone()),
+    )
+}
+
+fn quote_decimals(json: &str, schema: &StructType) -> Option<String> {
+    let mut out = String::with_capacity(json.len() + 16);
+    quote_object(json, schema, &mut out)?;
+    Some(out)
+}
+
+fn quote_object(raw: &str, schema: &StructType, out: &mut String) -> Option<()> {
+    let object: BTreeMap<String, &RawValue> = serde_json::from_str(raw).ok()?;
+    out.push('{');
+    for (i, (key, value)) in object.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&serde_json::to_string(key).ok()?);
+        out.push(':');
+        let text = value.get().trim();
+        match schema.field(key).map(|f| &f.data_type) {
+            Some(KernelDataType::Struct(inner)) if text.starts_with('{') => {
+                quote_object(text, inner, out)?;
+            }
+            Some(KernelDataType::Primitive(PrimitiveType::Decimal(_)))
+                if !text.starts_with('"') && text != "null" =>
+            {
+                out.push('"');
+                out.push_str(text);
+                out.push('"');
+            }
+            _ => out.push_str(text),
+        }
+    }
+    out.push('}');
+    Some(())
+}
+
+#[cfg(test)]
+mod quote_decimal_tests {
+    use super::*;
+    use delta_kernel::schema::{DecimalType, StructField};
+
+    fn stats_schema() -> StructType {
+        let leaves = StructType::try_new([
+            StructField::nullable("d", KernelDataType::decimal(38, 10).unwrap()),
+            StructField::nullable("n", KernelDataType::LONG),
+            StructField::nullable(
+                "s",
+                KernelDataType::Struct(Box::new(
+                    StructType::try_new([StructField::nullable(
+                        "inner",
+                        KernelDataType::Primitive(PrimitiveType::Decimal(
+                            DecimalType::try_new(18, 4).unwrap(),
+                        )),
+                    )])
+                    .unwrap(),
+                )),
+            ),
+        ])
+        .unwrap();
+        StructType::try_new([
+            StructField::nullable("numRecords", KernelDataType::LONG),
+            StructField::nullable("minValues", KernelDataType::Struct(Box::new(leaves))),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn decimal_numbers_are_quoted_at_every_depth() {
+        let json = r#"{"numRecords": 2, "minValues": {"d": 1234567890.0123456789, "n": 7, "s": {"inner": -1E-4}, "extra": 1.5}}"#;
+        let quoted = quote_decimals(json, &stats_schema()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&quoted).unwrap();
+        assert_eq!(parsed["numRecords"], 2);
+        assert_eq!(parsed["minValues"]["d"], "1234567890.0123456789");
+        assert_eq!(parsed["minValues"]["n"], 7);
+        assert_eq!(parsed["minValues"]["s"]["inner"], "-1E-4");
+        assert_eq!(parsed["minValues"]["extra"], 1.5);
+    }
+
+    #[test]
+    fn quoted_and_null_decimals_pass_through() {
+        let json = r#"{"minValues": {"d": "1.5", "s": null}}"#;
+        let quoted = quote_decimals(json, &stats_schema()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&quoted).unwrap();
+        assert_eq!(parsed["minValues"]["d"], "1.5");
+        assert!(parsed["minValues"]["s"].is_null());
+    }
+
+    #[test]
+    fn unparsable_input_is_left_to_the_lenient_decoder() {
+        assert_eq!(quote_decimals("not json", &stats_schema()), None);
+        assert_eq!(quote_decimals("", &stats_schema()), None);
     }
 }
 
