@@ -97,7 +97,10 @@ class TestComparisons:
     )
     def test_binary_comparison(self, rich_table, col, value, op):
         expr = getattr(pl.col(col), op)(value)
-        assert _kernel_count(rich_table, expr) == 1, f"{col} {op} {value!r}"
+        # A float column only pushes shapes NaN cannot satisfy: polars orders
+        # NaN above every number, but file stats leave it out.
+        expected = 0 if col == "f" and op in {"ne", "gt", "ge"} else 1
+        assert _kernel_count(rich_table, expr) == expected, f"{col} {op} {value!r}"
 
     def test_null_aware_equality(self, rich_table):
         """`eq_missing` / `ne_missing` lower to kernel's null-aware
@@ -365,33 +368,38 @@ class TestFloat32Pushdown:
         return path
 
     def test_widening_float_cast_translates(self, f32_table):
-        expr = pl.col("g").cast(pl.Float64) > pl.lit(60.0, dtype=pl.Float64)
+        expr = pl.col("g").cast(pl.Float64) < pl.lit(60.0, dtype=pl.Float64)
         assert _kernel_count(f32_table, expr) == 1
+
+    def test_lower_bound_declines_for_nan(self, f32_table):
+        """`g > 60` would also match a NaN row that no stat bounds."""
+        expr = pl.col("g").cast(pl.Float64) > pl.lit(60.0, dtype=pl.Float64)
+        assert _kernel_count(f32_table, expr) == 0
 
     def test_widening_cast_around_is_in_translates(self, f32_table):
         expr = pl.col("g").cast(pl.Float64).is_in([0.5, 1.5])
         assert _kernel_count(f32_table, expr) == 1
 
     def test_float32_predicate_skips_a_whole_file(self, f32_table):
-        """Delete the low file: the query only succeeds if kernel skipped it."""
+        """Delete the high file: the query only succeeds if kernel skipped it."""
         adds = [
             json.loads(line)["add"]
             for log in sorted(Path(f32_table, "_delta_log").glob("*.json"))
             for line in log.read_text().splitlines()
             if "add" in json.loads(line)
         ]
-        low = next(
-            a["path"] for a in adds if json.loads(a["stats"])["maxValues"]["g"] < 50
+        high = next(
+            a["path"] for a in adds if json.loads(a["stats"])["minValues"]["g"] > 50
         )
-        Path(f32_table, low).unlink()
+        Path(f32_table, high).unlink()
 
         # A typed Float64 literal is kept by polars (a dyn one would shrink
-        # to Float32), so the plugin delivers cast(g, Float64) > Double.
-        out = scan_delta(f32_table).filter(pl.col("g") > pl.lit(60.0, dtype=pl.Float64))
+        # to Float32), so the plugin delivers cast(g, Float64) < Double.
+        out = scan_delta(f32_table).filter(pl.col("g") < pl.lit(60.0, dtype=pl.Float64))
         assert_frame_equal(
             out.collect().sort("id"),
             pl.DataFrame(
-                {"id": [3, 4], "g": [100.0, 200.0]},
+                {"id": [1, 2], "g": [0.5, 1.5]},
                 schema_overrides={"g": pl.Float32},
             ),
         )
