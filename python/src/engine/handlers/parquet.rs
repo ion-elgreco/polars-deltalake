@@ -421,6 +421,11 @@ pub(crate) fn unified_scan_args(
             // the microsecond Delta type.
             datetime_nanoseconds_downcast: true,
             datetime_milliseconds_upcast: true,
+            // Type widening: files written before an ALTER COLUMN keep the
+            // narrower type. Decimal and date widenings are not covered.
+            integer_upcast: true,
+            integer_to_float_cast: true,
+            float_upcast: true,
             ..CastColumnsPolicy::ERROR_ON_MISMATCH
         },
         missing_columns_policy: MissingColumnsPolicy::Insert,
