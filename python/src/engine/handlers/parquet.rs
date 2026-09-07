@@ -417,8 +417,15 @@ pub(crate) fn unified_scan_args(
         cast_columns_policy: CastColumnsPolicy {
             missing_struct_fields: MissingColumnsPolicy::Insert,
             extra_struct_fields: ExtraColumnsPolicy::Ignore,
-            // INT96 downcast
+            // INT96 lands as nanoseconds; TIMESTAMP_MILLIS files predate
+            // the microsecond Delta type.
             datetime_nanoseconds_downcast: true,
+            datetime_milliseconds_upcast: true,
+            // Type widening: files written before an ALTER COLUMN keep the
+            // narrower type. Decimal and date widenings are not covered.
+            integer_upcast: true,
+            integer_to_float_cast: true,
+            float_upcast: true,
             ..CastColumnsPolicy::ERROR_ON_MISMATCH
         },
         missing_columns_policy: MissingColumnsPolicy::Insert,

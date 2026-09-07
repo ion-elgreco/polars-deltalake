@@ -187,7 +187,7 @@ rayon = "1"
 # variants shift discriminants and the round-trip miscompiles silently. The
 # JSON form is variant-name keyed and survives feature mismatches.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # Weighted in-memory cache for parsed Delta log files (`engine/log_cache.rs`).
 foyer-memory = "0.22"
 

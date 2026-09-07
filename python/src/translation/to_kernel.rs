@@ -328,11 +328,13 @@ fn fold_boolean_equality(
         _ => return None,
     };
     let inner = polars_expr_to_kernel_predicate(other, schema)?;
-    Some(if is_ne ^ lit_val {
-        inner
+    if is_ne ^ lit_val {
+        Some(inner)
+    } else if mentions_float_column(other, schema) {
+        None
     } else {
-        Predicate::not(inner)
-    })
+        Some(Predicate::not(inner))
+    }
 }
 
 fn translate_binary(
@@ -367,6 +369,9 @@ fn translate_binary(
     let l = polars_expr_to_kernel_expression(left, schema)?;
     let r = polars_expr_to_kernel_expression(right, schema)?;
     let (l, r) = align_numeric_literal(l, r, schema)?;
+    if !nan_safe(&l, op, &r, schema) {
+        return None;
+    }
     Some(match op {
         Operator::Eq => Predicate::eq(l, r),
         Operator::NotEq => Predicate::ne(l, r),
@@ -379,6 +384,72 @@ fn translate_binary(
         Operator::EqValidity => Predicate::not(Predicate::distinct(l, r)),
         _ => return None,
     })
+}
+
+/// polars orders NaN above every number, but stats leave NaN out of
+/// `maxValues` (delta-rs) or spell it unparsably (Spark), so a pushed
+/// comparison that a NaN row satisfies can skip the file holding it. On a
+/// float column only the shapes NaN never satisfies translate: equality, and
+/// an upper bound on the column (`col < v`, `col <= v`, `v > col`, `v >= col`).
+fn nan_safe(l: &Expression, op: Operator, r: &Expression, schema: &StructType) -> bool {
+    if is_nan_literal(l) || is_nan_literal(r) {
+        return false;
+    }
+    let (left_float, right_float) = (is_float_column(l, schema), is_float_column(r, schema));
+    if !left_float && !right_float {
+        return true;
+    }
+    match op {
+        Operator::Eq | Operator::EqValidity => true,
+        Operator::Lt | Operator::LtEq => !right_float,
+        Operator::Gt | Operator::GtEq => !left_float,
+        _ => false,
+    }
+}
+
+fn is_float_column(e: &Expression, schema: &StructType) -> bool {
+    match e {
+        Expression::Column(name) => matches!(
+            column_leaf_prim(name, schema),
+            Some(PrimitiveType::Float | PrimitiveType::Double)
+        ),
+        _ => false,
+    }
+}
+
+fn scalar_is_nan(s: &Scalar) -> bool {
+    match s {
+        Scalar::Float(v) => v.is_nan(),
+        Scalar::Double(v) => v.is_nan(),
+        _ => false,
+    }
+}
+
+fn is_nan_literal(e: &Expression) -> bool {
+    matches!(e, Expression::Literal(s) if scalar_is_nan(s))
+}
+
+/// Whether `expr` references a float column anywhere the translator walks.
+/// A negation flips every comparison on it into one NaN satisfies.
+fn mentions_float_column(expr: &Expr, schema: &StructType) -> bool {
+    if let Some(path) = column_path(expr) {
+        return matches!(
+            column_leaf_type(&path, schema),
+            Some(PrimitiveType::Float | PrimitiveType::Double)
+        );
+    }
+    match expr {
+        Expr::BinaryExpr { left, right, .. } => {
+            mentions_float_column(left, schema) || mentions_float_column(right, schema)
+        }
+        Expr::Function { input, .. } => input.iter().any(|e| mentions_float_column(e, schema)),
+        Expr::Cast { expr: inner, .. } | Expr::Alias(inner, _) => {
+            mentions_float_column(inner, schema)
+        }
+        Expr::Literal(_) => false,
+        // Anything else does not translate anyway.
+        _ => true,
+    }
 }
 
 fn translate_function(
@@ -432,6 +503,10 @@ fn translate_function(
                 }
                 _ => elements,
             };
+            // A NaN element would match NaN rows the stats cannot see.
+            if elements.iter().any(scalar_is_nan) {
+                return None;
+            }
             // `x IN []` — including a set with no representable element —
             // is vacuously false.
             if elements.is_empty() {
@@ -453,6 +528,11 @@ fn translate_function(
             let high = polars_expr_to_kernel_expression(input.get(2)?, schema)?;
             let (value, low) = align_numeric_literal(value, low, schema)?;
             let (value, high) = align_numeric_literal(value, high, schema)?;
+            // NaN never lies inside an interval, so the bounds are safe on
+            // a float column; only a NaN bound is not.
+            if is_nan_literal(&low) || is_nan_literal(&high) {
+                return None;
+            }
             let (lo, hi) = match closed {
                 ClosedInterval::Both => (
                     Predicate::ge(value.clone(), low),
@@ -475,9 +555,15 @@ fn translate_function(
         }
         // `Negate` is arithmetic unary minus, not logical NOT, and has no
         // kernel predicate form.
-        FunctionExpr::Boolean(BooleanFunction::Not) => Some(Predicate::not(
-            polars_expr_to_kernel_predicate(input.first()?, schema)?,
-        )),
+        FunctionExpr::Boolean(BooleanFunction::Not) => {
+            let inner = input.first()?;
+            if mentions_float_column(inner, schema) {
+                return None;
+            }
+            Some(Predicate::not(polars_expr_to_kernel_predicate(
+                inner, schema,
+            )?))
+        }
         FunctionExpr::Boolean(BooleanFunction::AllHorizontal) => {
             translate_junction(input, JunctionPredicateOp::And, schema)
         }
@@ -770,6 +856,65 @@ mod is_in_narrowing_tests {
             None,
             "an undecidable element must decline, not prune"
         );
+    }
+}
+
+#[cfg(test)]
+mod float_nan_tests {
+    use super::*;
+    use delta_kernel::schema::StructField;
+    use polars::prelude::{ClosedInterval, NamedFrom, col, lit};
+
+    fn schema() -> StructType {
+        StructType::try_new([
+            StructField::nullable("f", KernelDataType::DOUBLE),
+            StructField::nullable("n", KernelDataType::LONG),
+        ])
+        .unwrap()
+    }
+
+    fn translate(expr: Expr) -> Option<Predicate> {
+        polars_expr_to_kernel_predicate(&expr, &schema())
+    }
+
+    #[test]
+    fn lower_bounds_on_a_float_column_decline() {
+        assert_eq!(translate(col("f").gt(lit(1.5))), None);
+        assert_eq!(translate(col("f").gt_eq(lit(1.5))), None);
+        assert_eq!(translate(lit(1.5).lt(col("f"))), None);
+        assert_eq!(translate(col("f").neq(lit(1.5))), None);
+        assert_eq!(translate(col("f").neq_missing(lit(1.5))), None);
+    }
+
+    #[test]
+    fn upper_bounds_and_equality_on_a_float_column_translate() {
+        assert!(translate(col("f").lt(lit(1.5))).is_some());
+        assert!(translate(col("f").lt_eq(lit(1.5))).is_some());
+        assert!(translate(lit(1.5).gt(col("f"))).is_some());
+        assert!(translate(col("f").eq(lit(1.5))).is_some());
+        assert!(translate(col("f").is_between(lit(1.0), lit(2.0), ClosedInterval::Both)).is_some());
+    }
+
+    #[test]
+    fn integer_columns_are_untouched() {
+        assert!(translate(col("n").gt(lit(1))).is_some());
+        assert!(translate(col("n").neq(lit(1))).is_some());
+        assert!(translate(col("n").lt(lit(1)).not()).is_some());
+    }
+
+    #[test]
+    fn nan_literals_decline() {
+        assert_eq!(translate(col("f").eq(lit(f64::NAN))), None);
+        assert_eq!(translate(col("f").lt(lit(f64::NAN))), None);
+        let set = Series::new(PlSmallStr::from_static("set"), &[1.5, f64::NAN]);
+        assert_eq!(translate(col("f").is_in(lit(set), false)), None);
+    }
+
+    #[test]
+    fn negated_float_comparisons_decline() {
+        assert_eq!(translate(col("f").lt(lit(1.5)).not()), None);
+        assert_eq!(translate(col("f").lt(lit(1.5)).eq(lit(false))), None);
+        assert_eq!(translate(col("f").eq(lit(1.5)).neq(lit(true))), None);
     }
 }
 

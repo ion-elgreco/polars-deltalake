@@ -79,7 +79,9 @@ impl KernelDataTypeExt for KernelDataType {
                 let ArrayType { element_type, .. } = arr.as_ref();
                 PlDataType::List(Box::new(element_type.to_polars()?))
             }
-            KernelDataType::Struct(s) => PlDataType::Struct(
+            // A variant reads as its physical struct: unshredded, the
+            // `metadata` and `value` binaries. Nothing decodes it yet.
+            KernelDataType::Struct(s) | KernelDataType::Variant(s) => PlDataType::Struct(
                 s.fields()
                     .map(|f| {
                         Ok::<_, anyhow::Error>(PlField::new(
@@ -105,9 +107,6 @@ impl KernelDataTypeExt for KernelDataType {
                         value_type.to_polars()?,
                     ),
                 ])))
-            }
-            KernelDataType::Variant(_) => {
-                anyhow::bail!("Variant data type is not supported by polars-deltalake yet");
             }
         })
     }

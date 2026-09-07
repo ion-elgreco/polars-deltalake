@@ -17,10 +17,7 @@ from polars.testing import assert_frame_equal
 from _dat_helper import reader_cases
 from polars_deltalake import read_delta
 
-_XFAIL_REASONS: dict[str, str] = {
-    "cdf": "Change Data Feed reads are not exposed by read_delta",
-    "iceberg_compat_v1": "iceberg_compat_v1 reader-feature support pending",
-}
+_XFAIL_REASONS: dict[str, str] = {}
 
 
 _CASES = reader_cases()
