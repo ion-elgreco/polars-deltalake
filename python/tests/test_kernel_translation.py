@@ -14,6 +14,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+from _log_helpers import read_log_actions
 from deltalake import write_deltalake
 from polars.testing import assert_frame_equal
 
@@ -680,3 +681,79 @@ class TestNonPrimitiveReferences:
 
     def test_unknown_column_declines(self, nested_table):
         assert _kernel_count(nested_table, pl.col("nope") == 1) == 0
+
+
+_TEMPORAL_DF = pl.DataFrame(
+    {
+        "id": pl.Series([1, 2, 3, 4], dtype=pl.Int64),
+        "d": pl.Series(
+            [date(2024, 1, 1), date(2024, 1, 2), date(2025, 6, 1), date(2025, 6, 2)],
+            dtype=pl.Date,
+        ),
+        "t": pl.Series(
+            [
+                datetime(2024, 1, 1, tzinfo=timezone.utc),
+                datetime(2024, 1, 2, 3, 4, 5, 678000, tzinfo=timezone.utc),
+                datetime(2025, 6, 1, tzinfo=timezone.utc),
+                datetime(2025, 6, 2, tzinfo=timezone.utc),
+            ],
+            dtype=pl.Datetime("us", time_zone="UTC"),
+        ),
+        "t_ntz": pl.Series(
+            [
+                datetime(2024, 1, 1),
+                datetime(2024, 1, 2, 3, 4, 5, 678000),
+                datetime(2025, 6, 1),
+                datetime(2025, 6, 2),
+            ],
+            dtype=pl.Datetime("us"),
+        ),
+    }
+)
+
+
+@pytest.fixture
+def temporal_table(tmp_path: Path) -> str:
+    """Two files with disjoint temporal ranges — 2024 rows, then 2025 ones."""
+    path = tmp_path / "temporal"
+    write_deltalake(str(path), _TEMPORAL_DF.slice(0, 2).to_arrow())
+    write_deltalake(str(path), _TEMPORAL_DF.slice(2, 2).to_arrow(), mode="append")
+    return str(path)
+
+
+def _drop_files_added_in(table: str, version: int) -> None:
+    """Any scan that opens one of them now fails, so the query only survives
+    if kernel skipped the whole file on its stats."""
+    for action in read_log_actions(table, version):
+        if add := action.get("add"):
+            Path(table, add["path"]).unlink()
+
+
+class TestTemporalStats:
+    """File stats serialize a temporal as ISO-8601 with a `Z` suffix, not in
+    the space-separated partition-value grammar. A reader that misparses that
+    spelling sees a NULL min/max and keeps every file (issue #25)."""
+
+    @pytest.mark.parametrize(
+        "predicate",
+        [
+            pytest.param(
+                pl.col("t") < datetime(2025, 1, 1, tzinfo=timezone.utc), id="timestamp"
+            ),
+            pytest.param(pl.col("t_ntz") < datetime(2025, 1, 1), id="timestamp-ntz"),
+            pytest.param(pl.col("d") < date(2025, 1, 1), id="date"),
+        ],
+    )
+    def test_predicate_skips_a_whole_file(self, temporal_table, predicate: pl.Expr):
+        assert _kernel_count(temporal_table, predicate) == 1
+        _drop_files_added_in(temporal_table, 1)
+        out = scan_delta(temporal_table).filter(predicate).collect().sort("id")
+        assert_frame_equal(out, _TEMPORAL_DF.slice(0, 2))
+
+    def test_scan_writes_nothing_to_stderr(self, temporal_table, capfd):
+        """The cast that used to lift these leaves printed a polars
+        deprecation straight to stderr, past every `warnings` filter."""
+        scan_delta(temporal_table).filter(
+            pl.col("t") >= datetime(2025, 1, 1, tzinfo=timezone.utc)
+        ).collect()
+        assert capfd.readouterr().err == ""

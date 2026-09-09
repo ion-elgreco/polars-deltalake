@@ -78,25 +78,20 @@ pub(crate) fn translate_expr(
             "translate_expr: Unknown expression {s}"
         ))),
         Expression::ParseJson(p) => {
-            // polars's `json_decode` requires the JSON value type to already
-            // match the target; delta-rs writes Date/Timestamp stats as ISO
-            // strings, so decode them as String first and let the struct-wide
-            // cast lift each temporal field. Decimals take the same route
-            // because `json_decode` reads every number through f64.
-            let mut raw = translate_expr(&p.json_expr, None, input_schema)?;
-            if has_decimal_leaf(&p.output_schema) {
-                raw = quote_decimal_numbers(raw, p.output_schema.clone());
-            }
+            let raw = translate_expr(&p.json_expr, None, input_schema)?;
             let final_dt = KernelDataType::Struct(Box::new((*p.output_schema).clone()))
                 .to_polars()
                 .map_err(to_kernel_err)?;
-            Ok(match StringifyLeaves.transform_struct(&p.output_schema) {
+            Ok(match StringifyDecimals.transform_struct(&p.output_schema) {
+                // `json_decode` parses an ISO string straight into a Date or
+                // Datetime leaf, so only decimals need the detour below.
                 Cow::Borrowed(_) => json_decode_lenient(raw, final_dt),
                 Cow::Owned(decode_schema) => {
                     let decode_dt = KernelDataType::Struct(Box::new(decode_schema))
                         .to_polars()
                         .map_err(to_kernel_err)?;
-                    json_decode_lenient(raw, decode_dt).cast(final_dt)
+                    let quoted = quote_decimal_numbers(raw, p.output_schema.clone());
+                    json_decode_lenient(quoted, decode_dt).cast(final_dt)
                 }
             })
         }
@@ -168,39 +163,28 @@ fn json_decode_lenient(raw: Expr, dtype: PlDataType) -> Expr {
     )
 }
 
-/// Schema rewrite that turns `Date` / `Timestamp` / `TimestampNtz` / `Decimal`
-/// primitives into `String`. Used to relax the `json_decode` target so
-/// ISO-string stats from delta-rs and quoted decimals decode cleanly; a
-/// follow-up struct-wide cast lifts them.
-struct StringifyLeaves;
+/// Schema rewrite that relaxes `Decimal` leaves to `String`, at any depth.
+/// A `Cow::Borrowed` result means the schema has none, which is the whole
+/// test — [`quote_decimal_numbers`] and the struct-wide cast that lifts the
+/// quoted values back are needed exactly when it borrows.
+struct StringifyDecimals;
 
-impl<'a> SchemaTransform<'a> for StringifyLeaves {
+impl<'a> SchemaTransform<'a> for StringifyDecimals {
     transform_output_type!(|'a, T| Cow<'a, T>);
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Cow<'a, PrimitiveType> {
         match ptype {
-            PrimitiveType::Date
-            | PrimitiveType::Timestamp
-            | PrimitiveType::TimestampNtz
-            | PrimitiveType::Decimal(_) => Cow::Owned(PrimitiveType::String),
+            PrimitiveType::Decimal(_) => Cow::Owned(PrimitiveType::String),
             _ => Cow::Borrowed(ptype),
         }
     }
 }
 
-fn has_decimal_leaf(schema: &StructType) -> bool {
-    schema.fields().any(|f| match &f.data_type {
-        KernelDataType::Primitive(PrimitiveType::Decimal(_)) => true,
-        KernelDataType::Struct(inner) => has_decimal_leaf(inner),
-        _ => false,
-    })
-}
-
 /// `json_decode` parses every number as f64 before it looks at the target,
 /// so a decimal stat loses digits past 15 and a wide scale overflows
 /// (`1234567890.5` at scale 10 lands as `…4999999488`). Quoting the number
-/// tokens of decimal leaves lets the struct-wide cast parse them as strings
-/// instead. A value that does not parse passes through untouched for
+/// tokens of decimal leaves lets the cast parse them as strings instead. A
+/// value that does not parse passes through untouched for
 /// `json_decode_lenient` to null.
 fn quote_decimal_numbers(raw: Expr, schema: SchemaRef) -> Expr {
     raw.map(
@@ -789,7 +773,7 @@ mod parse_json_tests {
     use std::sync::Arc;
 
     use delta_kernel::schema::StructField;
-    use polars::prelude::{AnyValue, IntoLazy, df};
+    use polars::prelude::{AnyValue, IntoLazy, TimeUnit, TimeZone, df};
 
     use super::*;
 
@@ -877,6 +861,92 @@ mod parse_json_tests {
         assert!(matches!(col.get(0).unwrap(), AnyValue::Null));
         assert!(matches!(col.get(1).unwrap(), AnyValue::Null));
         assert!(!matches!(col.get(2).unwrap(), AnyValue::Null));
+    }
+
+    /// Stats serialize a temporal as ISO-8601 with a `Z` suffix, which the
+    /// deprecated String cast could not read: it landed NULL, and a NULL
+    /// min/max silently disables file skipping on that column. Spellings vary
+    /// per writer and a stats column spans every file, so they mix in one
+    /// column.
+    #[test]
+    fn iso8601_temporal_stats_keep_their_values() {
+        let leaves = StructType::try_new([
+            StructField::nullable("ts", KernelDataType::TIMESTAMP),
+            StructField::nullable("ntz", KernelDataType::TIMESTAMP_NTZ),
+            StructField::nullable("d", KernelDataType::DATE),
+        ])
+        .unwrap();
+        let schema = Arc::new(
+            StructType::try_new([
+                StructField::nullable("numRecords", KernelDataType::LONG),
+                StructField::nullable("minValues", KernelDataType::Struct(Box::new(leaves))),
+            ])
+            .unwrap(),
+        );
+        let expr = Expression::parse_json(ColumnName::new(["stats"]), schema.clone());
+        let output_type = KernelDataType::Struct(Box::new((*schema).clone()));
+        let translated = translate_expr(&expr, Some(&output_type), None).unwrap();
+        let leaf = |name: &str| {
+            translated
+                .clone()
+                .struct_()
+                .field_by_name("minValues")
+                .struct_()
+                .field_by_name(name)
+        };
+        // Row per writer: delta-rs (no subseconds, `Z` on the ntz value too),
+        // Spark (millis, no zone on the ntz value), then an explicit offset
+        // and the space separator.
+        let frame = df!("stats" => [
+            r#"{"numRecords":1,"minValues":{"ts":"2024-01-01T00:00:00Z","ntz":"2024-01-01T00:00:00Z","d":"2024-01-01"}}"#,
+            r#"{"numRecords":1,"minValues":{"ts":"2024-01-02T03:04:05.678Z","ntz":"2024-01-02T03:04:05.678","d":"2024-01-02"}}"#,
+            r#"{"numRecords":1,"minValues":{"ts":"2024-01-03T01:00:00+01:00","ntz":"2024-01-03 01:00:00","d":"2024-01-03"}}"#,
+        ])
+        .unwrap();
+
+        let out = frame
+            .lazy()
+            .select([leaf("ts"), leaf("ntz"), leaf("d")])
+            .collect()
+            .unwrap();
+
+        let us = TimeUnit::Microseconds;
+        assert_eq!(
+            out.dtypes(),
+            [
+                PlDataType::Datetime(us, Some(TimeZone::UTC)),
+                PlDataType::Datetime(us, None),
+                PlDataType::Date,
+            ]
+        );
+        let physical = |name: &str| {
+            out.column(name)
+                .unwrap()
+                .as_materialized_series()
+                .to_physical_repr()
+                .cast(&PlDataType::Int64)
+                .unwrap()
+                .i64()
+                .unwrap()
+                .to_vec()
+        };
+        assert_eq!(
+            physical("ts"),
+            [
+                Some(1_704_067_200_000_000),
+                Some(1_704_164_645_678_000),
+                Some(1_704_240_000_000_000)
+            ]
+        );
+        assert_eq!(
+            physical("ntz"),
+            [
+                Some(1_704_067_200_000_000),
+                Some(1_704_164_645_678_000),
+                Some(1_704_243_600_000_000)
+            ]
+        );
+        assert_eq!(physical("d"), [Some(19723), Some(19724), Some(19725)]);
     }
 }
 
