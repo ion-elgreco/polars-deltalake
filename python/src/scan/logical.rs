@@ -127,8 +127,12 @@ pub(crate) struct LogicalScanIter {
     /// `FILE_ID_COL` value → index in `files`.
     path_index: HashMap<String, usize>,
     files: Vec<FileRewrite>,
-    /// The read also carries `ROW_INDEX_COL`: on whenever a file has a DV.
+    /// The read also carries `ROW_INDEX_COL`: on whenever a file has a DV
+    /// or `file_spans` routes by it.
     row_index: bool,
+    /// Every file's physical row range when the row index routes rows to
+    /// files; `None` when the read carries `FILE_ID_COL` instead.
+    file_spans: Option<Arc<[Range<u64>]>>,
     /// For reading a file's DV the first time one of its batches arrives.
     storage: Arc<dyn StorageHandler>,
     table_root: Url,
@@ -152,12 +156,14 @@ impl LogicalScanIter {
         path_index: HashMap<String, usize>,
         files: Vec<ScanFileMeta>,
         spans: Vec<Option<Range<u64>>>,
+        file_spans: Option<Vec<Range<u64>>>,
         storage: Arc<dyn StorageHandler>,
         table_root: Url,
         orphan_predicate: Option<Expr>,
         output_projection: Option<Vec<String>>,
     ) -> Self {
-        let row_index = spans.iter().any(Option::is_some);
+        let row_index = spans.iter().any(Option::is_some) || file_spans.is_some();
+        let file_spans = file_spans.map(Arc::from);
         let files = files
             .into_iter()
             .zip(spans)
@@ -175,6 +181,7 @@ impl LogicalScanIter {
             path_index,
             files,
             row_index,
+            file_spans,
             storage,
             table_root,
             orphan_predicate,
@@ -192,6 +199,9 @@ impl LogicalScanIter {
         let n = df.height();
         if n == 0 {
             return Ok(());
+        }
+        if let Some(spans) = self.file_spans.clone() {
+            return self.split_by_row_index(df, &spans);
         }
         let file_col = df
             .column(FILE_ID_COL)
@@ -230,24 +240,85 @@ impl LogicalScanIter {
         Ok(())
     }
 
-    /// Drop the file-id and row-index columns, apply the DV keep-mask and
-    /// the physical→logical select, return the logical frame.
+    /// Slice on file boundaries read off the scan-wide row index: each file
+    /// owns one contiguous index range and the index ascends within a
+    /// morsel, so a binary search finds where the next file starts.
+    fn split_by_row_index(
+        &mut self,
+        df: DataFrame,
+        spans: &[Range<u64>],
+    ) -> Result<(), delta_kernel::Error> {
+        let n = df.height();
+        let rows = df
+            .column(ROW_INDEX_COL)
+            .and_then(|c| c.idx().cloned())
+            .map_err(|e| delta_kernel::Error::Generic(format!("{ROW_INDEX_COL}: {e}")))?;
+        let file_of = |global: IdxSize| -> Result<usize, delta_kernel::Error> {
+            let global = global as u64;
+            let i = spans.partition_point(|s| s.end <= global);
+            if spans.get(i).is_some_and(|s| s.contains(&global)) {
+                Ok(i)
+            } else {
+                Err(delta_kernel::Error::Generic(format!(
+                    "row index {global} falls outside every file's rows"
+                )))
+            }
+        };
+        let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+            return Err(delta_kernel::Error::Generic(format!(
+                "{ROW_INDEX_COL} has nulls"
+            )));
+        };
+        let (first_file, last_file) = (file_of(first)?, file_of(last)?);
+        if first_file == last_file {
+            let out = self.apply_rewrite_at(first_file, df);
+            self.pending.push_back(out);
+            return Ok(());
+        }
+        let mut start = 0usize;
+        for file in first_file..=last_file {
+            let end = if file == last_file {
+                n
+            } else {
+                run_end_by_index(&rows, start, n, spans[file].end)
+            };
+            if end > start {
+                let out = self.apply_rewrite_at(file, df.slice(start as i64, end - start));
+                self.pending.push_back(out);
+            }
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// `apply_rewrite_at` for a `FILE_ID_COL` value.
     fn apply_rewrite(
         &self,
         file_id: &str,
+        df: DataFrame,
+    ) -> Result<DataFrame, delta_kernel::Error> {
+        let idx = *self.path_index.get(file_id).ok_or_else(|| {
+            delta_kernel::Error::Generic(format!("unknown file_id from polars-io scan: {file_id}"))
+        })?;
+        self.apply_rewrite_at(idx, df)
+    }
+
+    /// Drop the routing columns, apply the DV keep-mask and the
+    /// physical→logical select of file `idx`, return the logical frame.
+    fn apply_rewrite_at(
+        &self,
+        idx: usize,
         mut df: DataFrame,
     ) -> Result<DataFrame, delta_kernel::Error> {
-        df.drop_in_place(FILE_ID_COL)
-            .map_err(|e| delta_kernel::Error::Generic(format!("drop {FILE_ID_COL}: {e}")))?;
+        if self.file_spans.is_none() {
+            df.drop_in_place(FILE_ID_COL)
+                .map_err(|e| delta_kernel::Error::Generic(format!("drop {FILE_ID_COL}: {e}")))?;
+        }
         let row_index = self
             .row_index
             .then(|| df.drop_in_place(ROW_INDEX_COL))
             .transpose()
             .map_err(|e| delta_kernel::Error::Generic(format!("drop {ROW_INDEX_COL}: {e}")))?;
-
-        let idx = *self.path_index.get(file_id).ok_or_else(|| {
-            delta_kernel::Error::Generic(format!("unknown file_id from polars-io scan: {file_id}"))
-        })?;
         let entry = &self.files[idx];
 
         if let Some(dv) = &entry.dv {
@@ -320,6 +391,21 @@ fn find_run_end<'a>(
             lo = mid + 1;
         } else {
             hi = mid;
+        }
+    }
+    lo
+}
+
+/// First position in `start..end` whose row index is at least `bound`, or
+/// `end`. Requires the index ascending over the range.
+fn run_end_by_index(rows: &IdxCa, start: usize, end: usize, bound: u64) -> usize {
+    let mut lo = start;
+    let mut hi = end;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match rows.get(mid) {
+            Some(value) if (value as u64) < bound => lo = mid + 1,
+            _ => hi = mid,
         }
     }
     lo
