@@ -35,10 +35,18 @@ pub(crate) fn collect_streaming_single(lf: LazyFrame) -> polars::prelude::Polars
 pub(crate) fn collect_streaming_batches(
     lf: LazyFrame,
 ) -> polars::prelude::PolarsResult<impl Iterator<Item = polars::prelude::PolarsResult<DataFrame>>> {
+    collect_streaming_batches_sized(lf, super::COLLECT_CHUNK_ROWS)
+}
+
+/// `collect_streaming_batches` with an explicit morsel size.
+pub(crate) fn collect_streaming_batches_sized(
+    lf: LazyFrame,
+    chunk_rows: usize,
+) -> polars::prelude::PolarsResult<impl Iterator<Item = polars::prelude::PolarsResult<DataFrame>>> {
     lf.collect_batches(
         polars_plan::dsl::Engine::Streaming,
         true,
-        std::num::NonZeroUsize::new(super::COLLECT_CHUNK_ROWS),
+        std::num::NonZeroUsize::new(chunk_rows),
         false,
     )
 }

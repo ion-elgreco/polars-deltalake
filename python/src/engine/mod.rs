@@ -19,7 +19,10 @@ mod log_cache;
 
 pub(crate) use data::PolarsEngineData;
 pub(crate) use data::resolve_path as resolve_series_path;
-pub(crate) use data::{collect_streaming_batches, collect_streaming_single, select_anchored};
+pub(crate) use data::{
+    collect_streaming_batches, collect_streaming_batches_sized, collect_streaming_single,
+    select_anchored,
+};
 pub(crate) use executor::PolarsPlanExecutor;
 
 #[cfg(test)]
@@ -36,6 +39,13 @@ use crate::translation::PolarsEvaluationHandler;
 /// gives polars-stream more parallelism + keeps `split_and_buffer`'s
 /// single-file big wins on many-file scans.
 pub(crate) const COLLECT_CHUNK_ROWS: usize = 100_000;
+
+/// Morsel size for the data scan: every morsel pays a per-column FFI
+/// crossing, so narrow frames get more rows per morsel. Never below
+/// `COLLECT_CHUNK_ROWS`; at most ten times it.
+pub(crate) fn scan_chunk_rows(n_cols: usize) -> usize {
+    (10_000_000 / n_cols.max(1)).clamp(COLLECT_CHUNK_ROWS, 10 * COLLECT_CHUNK_ROWS)
+}
 
 /// Process-wide tokio runtime shared across every `PolarsEngine` instance.
 pub(crate) fn rt() -> &'static Runtime {
