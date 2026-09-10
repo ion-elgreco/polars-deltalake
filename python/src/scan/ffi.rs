@@ -68,9 +68,11 @@ where
                 df = df.head(Some(remaining));
             }
         }
-        // Rechunk once here saves every downstream consumer (hash joins
-        // especially) from rechunking per batch.
-        df.rechunk_mut_par();
+        // A wide frame crosses the FFI once per chunk per column, so its
+        // chunks are merged first; a narrow one is cheaper to hand over as is.
+        if df.width() >= PAR_EXPORT_THRESHOLD && df.max_n_chunks() > 1 {
+            df.rechunk_mut_par();
+        }
         state.rows_emitted += df.height();
 
         let columns = df.columns();
