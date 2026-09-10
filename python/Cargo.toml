@@ -209,7 +209,7 @@ libpython-rpath = ["dep:pyo3-build-config"]
 lto = true
 strip = true
 codegen-units = 1
-opt-level = "s"
+opt-level = 3
 
 # Release-quality optimisation + frame pointers + symbols so samply can
 # attribute time correctly. Selected via `PROFILE=profiling just develop`.
