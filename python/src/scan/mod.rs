@@ -20,6 +20,7 @@ use crate::translation::to_kernel::polars_expr_to_kernel_predicate;
 mod cdf;
 mod ffi;
 mod logical;
+mod pipeline;
 mod plan;
 mod predicate;
 mod read;
@@ -381,6 +382,17 @@ impl TableScan {
         let source: BatchIter =
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
 
+        // Workers only pay off past one morsel; a small or row-limited scan
+        // rewrites inline instead of spawning threads it barely uses.
+        let physical_rows = row_spans
+            .as_ref()
+            .and_then(|spans| spans.last().map(|span| span.end))
+            .or_else(|| files.iter().map(|f| f.num_records).sum::<Option<u64>>())
+            .unwrap_or(u64::MAX);
+        let expected_rows =
+            physical_limit.map_or(physical_rows, |limit| physical_rows.min(limit as u64));
+        let parallel_rewrite = expected_rows > chunk_rows as u64;
+
         let new_iter: BatchIter = if needs_rewrite {
             Box::new(
                 LogicalScanIter::new(
@@ -393,6 +405,7 @@ impl TableScan {
                     table_root,
                     conjunction(routing.post_transform),
                     output_projection,
+                    parallel_rewrite,
                 )
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
             )

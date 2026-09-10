@@ -1,7 +1,8 @@
-//! `LogicalScanIter` — splits bulk-read frames on file-id boundaries and
-//! applies the per-file DV keep-mask + physical→logical select list.
+//! `LogicalScanIter` — splits bulk-read frames on file boundaries and
+//! applies the per-file DV keep-mask + physical→logical select list, on
+//! worker threads so the consumer only exports.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use polars_utils::pl_str::PlSmallStr;
 use url::Url;
 
 use crate::engine::select_anchored;
+use crate::scan::pipeline::OrderedPipeline;
 use crate::scan::plan::{LazyDv, LogicalRewrite, ScanFileMeta};
 use crate::scan::read::{FILE_ID_COL, ROW_INDEX_COL};
 
@@ -118,12 +120,30 @@ struct FileRewrite {
     dv: Option<PlacedDv>,
 }
 
-/// Splits each bulk-read frame on `FILE_ID_COL` runs and applies the
-/// per-file `LogicalRewrite`, yielding logical-schema frames in scan order.
+/// Yields logical-schema frames in scan order: each raw morsel goes
+/// through the `Rewriter` on a worker thread, one merged frame per morsel.
 pub(crate) struct LogicalScanIter {
-    /// Raw bulk-read frames carrying `FILE_ID_COL`. One frame on the eager
-    /// path; many on a streaming follow-up.
-    source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>,
+    inner: Inner,
+}
+
+/// A scan of more than one morsel rewrites on worker threads; a small or
+/// row-limited one rewrites inline, since spawning the workers costs more
+/// than the rewrite of one morsel.
+enum Inner {
+    Direct {
+        source: Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>,
+        rewriter: Arc<Rewriter>,
+    },
+    Parallel(OrderedPipeline<Option<DataFrame>>),
+}
+
+/// Two workers keep the rewrite off the consumer thread; more do not help,
+/// and the in-flight bound keeps a row limit from reading far past its rows.
+const REWRITE_WORKERS: usize = 2;
+const REWRITE_IN_FLIGHT: usize = 2;
+
+/// The per-morsel rewrite. Shared read-only between the workers.
+struct Rewriter {
     /// `FILE_ID_COL` value → index in `files`.
     path_index: HashMap<String, usize>,
     files: Vec<FileRewrite>,
@@ -143,9 +163,6 @@ pub(crate) struct LogicalScanIter {
     /// `orphan_predicate` its columns. Drops the extras again once the
     /// filter has run.
     output_projection: Option<Vec<Expr>>,
-    /// One inner frame may span multiple files; we slice into per-file
-    /// frames here and drain before pulling the next inner frame.
-    pending: VecDeque<Result<DataFrame, delta_kernel::Error>>,
 }
 
 impl LogicalScanIter {
@@ -161,6 +178,7 @@ impl LogicalScanIter {
         table_root: Url,
         orphan_predicate: Option<Expr>,
         output_projection: Option<Vec<String>>,
+        parallel: bool,
     ) -> Self {
         let row_index = spans.iter().any(Option::is_some) || file_spans.is_some();
         let file_spans = file_spans.map(Arc::from);
@@ -176,8 +194,7 @@ impl LogicalScanIter {
                 }
             })
             .collect();
-        Self {
-            source,
+        let rewriter = Arc::new(Rewriter {
             path_index,
             files,
             row_index,
@@ -187,21 +204,52 @@ impl LogicalScanIter {
             orphan_predicate,
             output_projection: output_projection
                 .map(|cols| cols.iter().map(|c| col(c.as_str())).collect()),
-            pending: VecDeque::new(),
+        });
+        let inner = if parallel {
+            Inner::Parallel(OrderedPipeline::new(
+                source,
+                REWRITE_WORKERS,
+                REWRITE_IN_FLIGHT,
+                move |df| rewriter.rewrite(df).map_err(anyhow::Error::from),
+            ))
+        } else {
+            Inner::Direct { source, rewriter }
+        };
+        Self { inner }
+    }
+}
+
+impl Rewriter {
+    /// One raw morsel to one logical frame, `None` when the morsel is empty.
+    /// A morsel that straddles files is split, each part rewritten, and the
+    /// parts stacked back, so every per-column cost downstream — the FFI
+    /// export above all — is paid once per morsel.
+    fn rewrite(&self, df: DataFrame) -> Result<Option<DataFrame>, delta_kernel::Error> {
+        let mut parts = Vec::new();
+        self.split(df, &mut parts)?;
+        let mut parts = parts.into_iter();
+        let Some(mut merged) = parts.next() else {
+            return Ok(None);
+        };
+        for part in parts {
+            merged.vstack_mut(&part).map_err(|e| {
+                delta_kernel::Error::Generic(format!("stacking per-file frames: {e}"))
+            })?;
         }
+        Ok(Some(merged))
     }
 
     /// Slice on file-id boundaries, push each per-file logical frame onto
-    /// `pending`. With `maintain_order=true` the file-id column is composed
+    /// `out`. With `maintain_order=true` the file-id column is composed
     /// of contiguous runs, so we binary-search the end of each run rather
     /// than scanning row-by-row
-    fn split_and_buffer(&mut self, df: DataFrame) -> Result<(), delta_kernel::Error> {
+    fn split(&self, df: DataFrame, out: &mut Vec<DataFrame>) -> Result<(), delta_kernel::Error> {
         let n = df.height();
         if n == 0 {
             return Ok(());
         }
         if let Some(spans) = self.file_spans.clone() {
-            return self.split_by_row_index(df, &spans);
+            return self.split_by_row_index(df, &spans, out);
         }
         let file_col = df
             .column(FILE_ID_COL)
@@ -214,8 +262,7 @@ impl LogicalScanIter {
             && Some(first) == file_str.get(n - 1)
         {
             let file_id = first.to_owned();
-            let out = self.apply_rewrite(&file_id, df);
-            self.pending.push_back(out);
+            out.push(self.apply_rewrite(&file_id, df)?);
             return Ok(());
         }
 
@@ -233,8 +280,7 @@ impl LogicalScanIter {
             };
             let file_id = file_id.to_owned();
             let sub = df.slice(start as i64, end - start);
-            let out = self.apply_rewrite(&file_id, sub);
-            self.pending.push_back(out);
+            out.push(self.apply_rewrite(&file_id, sub)?);
             start = end;
         }
         Ok(())
@@ -244,9 +290,10 @@ impl LogicalScanIter {
     /// owns one contiguous index range and the index ascends within a
     /// morsel, so a binary search finds where the next file starts.
     fn split_by_row_index(
-        &mut self,
+        &self,
         df: DataFrame,
         spans: &[Range<u64>],
+        out: &mut Vec<DataFrame>,
     ) -> Result<(), delta_kernel::Error> {
         let n = df.height();
         let rows = df
@@ -271,8 +318,7 @@ impl LogicalScanIter {
         };
         let (first_file, last_file) = (file_of(first)?, file_of(last)?);
         if first_file == last_file {
-            let out = self.apply_rewrite_at(first_file, df);
-            self.pending.push_back(out);
+            out.push(self.apply_rewrite_at(first_file, df)?);
             return Ok(());
         }
         let mut start = 0usize;
@@ -283,8 +329,7 @@ impl LogicalScanIter {
                 run_end_by_index(&rows, start, n, spans[file].end)
             };
             if end > start {
-                let out = self.apply_rewrite_at(file, df.slice(start as i64, end - start));
-                self.pending.push_back(out);
+                out.push(self.apply_rewrite_at(file, df.slice(start as i64, end - start))?);
             }
             start = end;
         }
@@ -484,44 +529,24 @@ fn keep_mask(
     Ok((dropped > 0).then(|| BooleanChunked::from_bitmap(NAME.into(), keep.into())))
 }
 
-impl LogicalScanIter {
-    /// Everything `split_and_buffer` produced from one raw morsel, stacked
-    /// back into one frame. A morsel that straddles files would otherwise
-    /// leave as one frame per file, and every per-column cost downstream —
-    /// the FFI export above all — is paid per frame.
-    fn take_merged(&mut self) -> Result<DataFrame, delta_kernel::Error> {
-        let mut merged: Option<DataFrame> = None;
-        while let Some(item) = self.pending.pop_front() {
-            let frame = item?;
-            match &mut merged {
-                None => merged = Some(frame),
-                Some(acc) => {
-                    acc.vstack_mut(&frame).map_err(|e| {
-                        delta_kernel::Error::Generic(format!("stacking per-file frames: {e}"))
-                    })?;
-                }
-            }
-        }
-        Ok(merged.expect("take_merged needs a non-empty pending queue"))
-    }
-}
-
 impl Iterator for LogicalScanIter {
     type Item = Result<DataFrame, delta_kernel::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if !self.pending.is_empty() {
-                return Some(self.take_merged());
-            }
-            let raw = self.source.next()?;
-            match raw {
-                Err(e) => return Some(Err(delta_kernel::Error::Generic(format!("{e:#}")))),
-                Ok(df) => {
-                    if let Err(e) = self.split_and_buffer(df) {
-                        return Some(Err(e));
-                    }
-                }
+            let item = match &mut self.inner {
+                Inner::Parallel(pipeline) => pipeline
+                    .next()?
+                    .map_err(|e| delta_kernel::Error::Generic(format!("{e:#}"))),
+                Inner::Direct { source, rewriter } => match source.next()? {
+                    Ok(df) => rewriter.rewrite(df),
+                    Err(e) => Err(delta_kernel::Error::Generic(format!("{e:#}"))),
+                },
+            };
+            match item {
+                Ok(Some(frame)) => return Some(Ok(frame)),
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
             }
         }
     }
