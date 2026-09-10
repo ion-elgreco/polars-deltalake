@@ -369,7 +369,8 @@ impl TableScan {
             physical_limit,
         )?;
 
-        let batches = crate::engine::collect_streaming_batches(lazy)
+        let chunk_rows = crate::engine::scan_chunk_rows(physical_schema.fields().len());
+        let batches = crate::engine::collect_streaming_batches_sized(lazy, chunk_rows)
             .map_err(|e| anyhow::anyhow!("collect_batches failed: {e:#}"))?;
         let source: BatchIter =
             Box::new(batches.map(|r| r.map_err(|e| anyhow::anyhow!("scan batch failed: {e:#}"))));
