@@ -484,13 +484,35 @@ fn keep_mask(
     Ok((dropped > 0).then(|| BooleanChunked::from_bitmap(NAME.into(), keep.into())))
 }
 
+impl LogicalScanIter {
+    /// Everything `split_and_buffer` produced from one raw morsel, stacked
+    /// back into one frame. A morsel that straddles files would otherwise
+    /// leave as one frame per file, and every per-column cost downstream —
+    /// the FFI export above all — is paid per frame.
+    fn take_merged(&mut self) -> Result<DataFrame, delta_kernel::Error> {
+        let mut merged: Option<DataFrame> = None;
+        while let Some(item) = self.pending.pop_front() {
+            let frame = item?;
+            match &mut merged {
+                None => merged = Some(frame),
+                Some(acc) => {
+                    acc.vstack_mut(&frame).map_err(|e| {
+                        delta_kernel::Error::Generic(format!("stacking per-file frames: {e}"))
+                    })?;
+                }
+            }
+        }
+        Ok(merged.expect("take_merged needs a non-empty pending queue"))
+    }
+}
+
 impl Iterator for LogicalScanIter {
     type Item = Result<DataFrame, delta_kernel::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(item) = self.pending.pop_front() {
-                return Some(item);
+            if !self.pending.is_empty() {
+                return Some(self.take_merged());
             }
             let raw = self.source.next()?;
             match raw {
