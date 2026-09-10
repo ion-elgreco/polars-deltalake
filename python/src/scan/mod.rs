@@ -30,7 +30,7 @@ pub(crate) use cdf::{CdfTableScan, CdfTableState};
 
 use ffi::{MorselState, SendExport, morsel_to_py, next_morsel};
 use logical::LogicalScanIter;
-use plan::{ResolvedScan, resolve_scan_cached};
+use plan::{ResolvedScan, ResolvedScanCache};
 use predicate::{
     Conjunct, ConjunctClassification, classify_conjuncts, columns_outside_schema, conjunction,
     extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
@@ -45,6 +45,7 @@ pub struct TableState {
     engine: Arc<PolarsEngine>,
     snapshot: SnapshotRef,
     schema: Arc<PlSchema>,
+    resolved: Arc<ResolvedScanCache>,
 }
 
 #[pymethods]
@@ -127,6 +128,7 @@ impl TableState {
             engine,
             snapshot,
             schema,
+            resolved: Arc::default(),
         })
     }
 }
@@ -135,6 +137,7 @@ impl TableState {
 pub struct TableScan {
     engine: Arc<PolarsEngine>,
     snapshot: SnapshotRef,
+    resolved: Arc<ResolvedScanCache>,
     state: Mutex<ScanState>,
 }
 
@@ -157,6 +160,7 @@ impl TableScan {
         Self {
             engine: state.engine.clone(),
             snapshot: state.snapshot.clone(),
+            resolved: state.resolved.clone(),
             state: Mutex::new(ScanState::default()),
         }
     }
@@ -296,7 +300,7 @@ impl TableScan {
         let mode = config.column_mapping_mode();
         let table_logical_schema = self.snapshot.schema();
 
-        let resolved = resolve_scan_cached(&scan, self.engine.as_ref())?;
+        let resolved = self.resolved.resolve(&scan, self.engine.as_ref())?;
         if resolved.files.is_empty() {
             state.iter = Some(Box::new(std::iter::empty()));
             state.morsel.reset();

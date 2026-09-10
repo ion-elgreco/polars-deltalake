@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::engine_data::{GetData, RowVisitor};
@@ -19,7 +19,6 @@ use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, StructType};
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::{DeltaResult, Engine, FileMeta, StorageHandler};
-use foyer_memory::{Cache, CacheBuilder};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{DataFrame, Expr, col};
 use polars_utils::pl_path::PlRefPath;
@@ -51,8 +50,8 @@ pub(crate) struct LogicalRewrite {
 #[derive(Clone)]
 pub(crate) struct LazyDv {
     descriptor: DeletionVectorDescriptor,
-    /// Shared between every scan that resolves to the same file, so a DV
-    /// is read once per process rather than once per scan.
+    /// Shared by every collect of the `TableState` that resolved the file,
+    /// so a DV is read once per LazyFrame rather than once per collect.
     rows: Arc<OnceLock<Vec<u64>>>,
 }
 
@@ -158,41 +157,46 @@ enum FieldSource {
     Partition { physical: String },
 }
 
-/// A snapshot is immutable at a version, so the file list for one
-/// (table, version, projection, predicate) never changes. Every scan after
-/// the first is a lookup instead of a metadata plan execution.
-static RESOLVED_SCANS: LazyLock<Cache<String, Arc<ResolvedScan>>> = LazyLock::new(|| {
-    CacheBuilder::new(64)
-        .with_weighter(|_: &String, _: &Arc<ResolvedScan>| 1)
-        .build()
-});
+/// The resolution a `TableState` reuses across the collects of its
+/// LazyFrame. A snapshot is immutable at a version, so the file list for one
+/// (projection, predicate) never changes while the state lives. One slot,
+/// replaced when the shape differs, so a state holds at most one file list
+/// and one set of loaded deletion vectors.
+#[derive(Default)]
+pub(crate) struct ResolvedScanCache {
+    slot: Mutex<Option<(String, Arc<ResolvedScan>)>>,
+}
 
+impl ResolvedScanCache {
+    /// The lock is held across the resolve, so concurrent collects of one
+    /// LazyFrame resolve once and the others wait for that result.
+    pub(crate) fn resolve(
+        &self,
+        scan: &Scan,
+        engine: &PolarsEngine,
+    ) -> anyhow::Result<ResolvedScan> {
+        let key = resolve_key(scan);
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, resolved)) = slot.as_ref()
+            && *cached == key
+        {
+            return Ok((**resolved).clone());
+        }
+        let resolved = Arc::new(resolve_scan(scan, engine)?);
+        *slot = Some((key, resolved.clone()));
+        Ok((*resolved).clone())
+    }
+}
+
+/// Root and version are fixed for the state that owns the cache; only the
+/// projection and the kernel predicate shape the file list.
 fn resolve_key(scan: &Scan) -> String {
     let fields: Vec<&str> = scan
         .logical_schema()
         .fields()
         .map(|f| f.name.as_str())
         .collect();
-    format!(
-        "{}@{}|{}|{:?}",
-        scan.table_root(),
-        scan.snapshot().version(),
-        fields.join(","),
-        scan.physical_predicate()
-    )
-}
-
-pub(crate) fn resolve_scan_cached(
-    scan: &Scan,
-    engine: &PolarsEngine,
-) -> anyhow::Result<ResolvedScan> {
-    let key = resolve_key(scan);
-    if let Some(entry) = RESOLVED_SCANS.get(&key) {
-        return Ok((**entry.value()).clone());
-    }
-    let resolved = Arc::new(resolve_scan(scan, engine)?);
-    RESOLVED_SCANS.insert(key, resolved.clone());
-    Ok((*resolved).clone())
+    format!("{}|{:?}", fields.join(","), scan.physical_predicate())
 }
 
 pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result<ResolvedScan> {
