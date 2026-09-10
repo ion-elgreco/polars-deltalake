@@ -234,8 +234,9 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
     });
 
     let select_template = needs_select.then(|| data_expr_template(&sources, mode));
-    // Without the reader feature no file can carry a DV, so nothing needs
-    // the row counts and the stats JSON stays unparsed.
+    // Row counts place each file in the scan-wide row index, which the
+    // rewrite pass needs for a DV or a select. On a table needing neither
+    // the stats JSON stays unparsed.
     let dv_tables = config
         .protocol()
         .reader_features()
@@ -245,7 +246,7 @@ pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result
 
     for batch in batches {
         let batch = batch.map_err(|e| anyhow::anyhow!("metadata plan batch failed: {e:#}"))?;
-        let rows = visit_add_rows(batch.as_ref(), dv_tables)?;
+        let rows = visit_add_rows(batch.as_ref(), dv_tables || needs_select)?;
         let polars_batch = batch
             .any_ref()
             .downcast_ref::<PolarsEngineData>()

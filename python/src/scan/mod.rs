@@ -35,7 +35,7 @@ use predicate::{
     extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
 };
 use read::build_lazy_scan;
-use row_offsets::{footer_row_count, physical_prefix, place_dvs};
+use row_offsets::{file_spans, footer_row_count, physical_prefix, place_dvs};
 
 type BatchIter = Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>;
 
@@ -343,6 +343,12 @@ impl TableScan {
         let spans = place_dvs(&files, |file| footer_row_count(storage.as_ref(), file))?;
         let has_dv = spans.iter().any(Option::is_some);
         let needs_rewrite = has_dv || files.iter().any(|f| f.rewrite.select.is_some());
+        // With a row count for every file the scan-wide row index alone says
+        // which file a row came from. The file-path column is a string per
+        // row that polars materializes and the rewrite only reads back.
+        let row_spans = needs_rewrite.then(|| file_spans(&files)).flatten();
+        let include_file_id = needs_rewrite && row_spans.is_none();
+        let include_row_index = has_dv || row_spans.is_some();
         let paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
 
         // A row limit counts logical rows, so the scan reads the physical
@@ -364,8 +370,8 @@ impl TableScan {
             &select_exprs,
             polars_predicate.as_ref(),
             &physical_schema,
-            needs_rewrite,
-            has_dv,
+            include_file_id,
+            include_row_index,
             physical_limit,
         )?;
 
@@ -382,6 +388,7 @@ impl TableScan {
                     path_index,
                     files,
                     spans,
+                    row_spans,
                     storage,
                     table_root,
                     conjunction(routing.post_transform),

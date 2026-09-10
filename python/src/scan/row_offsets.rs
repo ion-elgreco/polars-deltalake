@@ -46,6 +46,21 @@ pub(crate) fn place_dvs(
     Ok(spans)
 }
 
+/// Every file's physical row range in scan order, from the add actions'
+/// `numRecords`. `None` when any file lacks a count or the scan would
+/// outgrow polars' row index; the caller then falls back to the file-path
+/// column.
+pub(crate) fn file_spans(files: &[ScanFileMeta]) -> Option<Vec<Range<u64>>> {
+    let mut offset = 0u64;
+    let mut spans = Vec::with_capacity(files.len());
+    for file in files {
+        let rows = file.num_records?;
+        spans.push(offset..offset + rows);
+        offset = offset.checked_add(rows)?;
+    }
+    (offset <= IdxSize::MAX as u64).then_some(spans)
+}
+
 /// Physical rows from the start of the scan that hold at least `n` logical
 /// rows: files in scan order, each DV file's deleted rows skipped. Only the
 /// DVs of files the prefix reaches are read. `None` when the whole scan
