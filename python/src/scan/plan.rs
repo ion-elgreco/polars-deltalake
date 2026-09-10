@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::engine_data::{GetData, RowVisitor};
@@ -19,6 +19,7 @@ use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, StructType};
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
 use delta_kernel::{DeltaResult, Engine, FileMeta, StorageHandler};
+use foyer_memory::{Cache, CacheBuilder};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{DataFrame, Expr, col};
 use polars_utils::pl_path::PlRefPath;
@@ -32,6 +33,7 @@ use crate::translation::from_kernel::{null_gated, per_row_literals};
 use crate::translation::schema::KernelDataTypeExt;
 
 /// Per-file work to apply post-read: physical→logical select + DV keep-mask.
+#[derive(Clone)]
 pub(crate) struct LogicalRewrite {
     /// Select list producing the logical frame from the physical read:
     /// `col(physical).alias(logical)` renames plus typed partition-value
@@ -46,16 +48,19 @@ pub(crate) struct LogicalRewrite {
 /// A deletion vector whose row list is read from storage the first time a
 /// scan needs it, so a row limit or a file-skipping predicate never pays
 /// for the DVs of files it does not read.
+#[derive(Clone)]
 pub(crate) struct LazyDv {
     descriptor: DeletionVectorDescriptor,
-    rows: OnceLock<Vec<u64>>,
+    /// Shared between every scan that resolves to the same file, so a DV
+    /// is read once per process rather than once per scan.
+    rows: Arc<OnceLock<Vec<u64>>>,
 }
 
 impl LazyDv {
     pub(crate) fn new(descriptor: DeletionVectorDescriptor) -> Self {
         Self {
             descriptor,
-            rows: OnceLock::new(),
+            rows: Arc::new(OnceLock::new()),
         }
     }
 
@@ -113,6 +118,7 @@ impl LazyDv {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ScanFileMeta {
     /// Location and size, as the kernel storage handler reads files.
     pub(crate) file: FileMeta,
@@ -127,6 +133,7 @@ pub(crate) struct ScanFileMeta {
 }
 
 /// The metadata plan drained into bulk-read inputs.
+#[derive(Clone)]
 pub(crate) struct ResolvedScan {
     pub(crate) files: Vec<ScanFileMeta>,
     /// `FILE_ID_COL` value (= `PlRefPath::as_str()`) → index in `files`.
@@ -149,6 +156,43 @@ struct AddRow {
 enum FieldSource {
     Data { physical: String },
     Partition { physical: String },
+}
+
+/// A snapshot is immutable at a version, so the file list for one
+/// (table, version, projection, predicate) never changes. Every scan after
+/// the first is a lookup instead of a metadata plan execution.
+static RESOLVED_SCANS: LazyLock<Cache<String, Arc<ResolvedScan>>> = LazyLock::new(|| {
+    CacheBuilder::new(64)
+        .with_weighter(|_: &String, _: &Arc<ResolvedScan>| 1)
+        .build()
+});
+
+fn resolve_key(scan: &Scan) -> String {
+    let fields: Vec<&str> = scan
+        .logical_schema()
+        .fields()
+        .map(|f| f.name.as_str())
+        .collect();
+    format!(
+        "{}@{}|{}|{:?}",
+        scan.table_root(),
+        scan.snapshot().version(),
+        fields.join(","),
+        scan.physical_predicate()
+    )
+}
+
+pub(crate) fn resolve_scan_cached(
+    scan: &Scan,
+    engine: &PolarsEngine,
+) -> anyhow::Result<ResolvedScan> {
+    let key = resolve_key(scan);
+    if let Some(entry) = RESOLVED_SCANS.get(&key) {
+        return Ok((**entry.value()).clone());
+    }
+    let resolved = Arc::new(resolve_scan(scan, engine)?);
+    RESOLVED_SCANS.insert(key, resolved.clone());
+    Ok((*resolved).clone())
 }
 
 pub(crate) fn resolve_scan(scan: &Scan, engine: &PolarsEngine) -> anyhow::Result<ResolvedScan> {

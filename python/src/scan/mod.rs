@@ -29,7 +29,7 @@ pub(crate) use cdf::{CdfTableScan, CdfTableState};
 
 use ffi::{MorselState, SendExport, morsel_to_py, next_morsel};
 use logical::LogicalScanIter;
-use plan::{ResolvedScan, resolve_scan};
+use plan::{ResolvedScan, resolve_scan_cached};
 use predicate::{
     Conjunct, ConjunctClassification, classify_conjuncts, columns_outside_schema, conjunction,
     extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
@@ -295,7 +295,7 @@ impl TableScan {
         let mode = config.column_mapping_mode();
         let table_logical_schema = self.snapshot.schema();
 
-        let resolved = resolve_scan(&scan, self.engine.as_ref())?;
+        let resolved = resolve_scan_cached(&scan, self.engine.as_ref())?;
         if resolved.files.is_empty() {
             state.iter = Some(Box::new(std::iter::empty()));
             state.morsel.reset();
