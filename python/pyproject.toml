@@ -41,6 +41,6 @@ module-name = "polars_deltalake._internal"
 
 [tool.pytest.ini_options]
 markers = [
-    "integration: tests that spin up Docker-backed cloud emulators (minio for S3, Azurite for Azure, fake-gcs-server for GCS). Filter with `-m integration` or `-m 'not integration'`; they auto-skip when no Docker daemon is reachable.",
+    "integration: tests that spin up Docker-backed cloud emulators (RustFS for S3, Azurite for Azure, fake-gcs-server for GCS). Filter with `-m integration` or `-m 'not integration'`; they auto-skip when no Docker daemon is reachable.",
     "spark: tests that boot a local PySpark + delta-spark session to create Delta tables `deltalake` can't such as column mapping. Filter with `-m spark` or `-m 'not spark'`; they auto-skip when pyspark / a JDK isn't available.",
 ]

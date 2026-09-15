@@ -45,7 +45,7 @@ recipe drops the feature and points `PYO3_PYTHON` at the venv interpreter.
 
 The integration suites spin up containers via [`testcontainers`](https://github.com/testcontainers/testcontainers-python):
 
-- **S3** → `minio/minio`
+- **S3** → `rustfs/rustfs`
 - **Azure** → `mcr.microsoft.com/azure-storage/azurite`
 - **GCS** → `tustvold/fake-gcs-server` (patched fork with XML-API support; the same image `delta-rs` uses)
 
