@@ -12,7 +12,10 @@ from azure.storage import blob as azure_blob
 from deltalake import write_deltalake
 from polars.testing import assert_frame_equal
 from testcontainers.core.container import DockerContainer
-from testcontainers.core.wait_strategies import LogMessageWaitStrategy
+from testcontainers.core.wait_strategies import (
+    HttpWaitStrategy,
+    LogMessageWaitStrategy,
+)
 
 from _cloud_helpers import docker_available
 from polars_deltalake import read_delta, scan_delta
@@ -36,20 +39,24 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-_S3_IMAGE = "minio/minio:RELEASE.2024-12-18T13-15-44Z"
+_S3_IMAGE = "rustfs/rustfs:1.0.0-rc.6"
 _S3_USER = "test-user"
 _S3_PASS = "test-password-123"
 
 
 @pytest.fixture(scope="module")
 def _s3():
+    # RustFS logs to a file, not stdout, so a log-message wait never fires.
+    # Probe the S3 API instead — an unsigned `GET /` answers 403 once it listens.
     container = (
         DockerContainer(_S3_IMAGE)
-        .with_env("MINIO_ROOT_USER", _S3_USER)
-        .with_env("MINIO_ROOT_PASSWORD", _S3_PASS)
-        .with_command("server /data --address :9000")
+        .with_env("RUSTFS_ACCESS_KEY", _S3_USER)
+        .with_env("RUSTFS_SECRET_KEY", _S3_PASS)
+        .with_env("RUSTFS_CONSOLE_ENABLE", "false")
         .with_exposed_ports(9000)
-        .waiting_for(LogMessageWaitStrategy("API:").with_startup_timeout(30))
+        .waiting_for(
+            HttpWaitStrategy(9000).for_status_code(403).with_startup_timeout(60)
+        )
     )
     with container:
         host = container.get_container_host_ip()
