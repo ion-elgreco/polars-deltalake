@@ -206,7 +206,7 @@ extension-module = ["pyo3/extension-module"]
 libpython-rpath = ["dep:pyo3-build-config"]
 
 [profile.release]
-lto = true
+lto = "thin"
 strip = true
 codegen-units = 1
 opt-level = 3
