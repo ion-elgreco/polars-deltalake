@@ -1,14 +1,14 @@
 //! `PolarsPlanExecutor` — delta-kernel `PlanExecutor` backed by polars.
 //!
-//! I/O operations delegate to the same `ObjectStoreStorageHandler` the
-//! classic handlers use, so there is one real I/O implementation. Query
-//! plans compile to a polars `LazyFrame` pipeline (see [`query`]) and
-//! stream back as `PolarsEngineData` batches.
+//! I/O operations delegate to `ObjectStoreStorageHandler`, the one real I/O
+//! implementation; the engine's kernel-facing handlers are thin wrappers
+//! over this executor. Query plans compile to a polars `LazyFrame` pipeline
+//! (see [`query`]) and stream back as `PolarsEngineData` batches.
 
 use std::sync::Arc;
 
 use delta_kernel::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use delta_kernel::{DeltaResult, FileMeta, StorageHandler};
+use delta_kernel::{FileMeta, KernelResult, StorageHandler};
 use polars::io::cloud::CloudOptions;
 
 use super::handlers::{ObjectStoreStorageHandler, kernel_parquet_footer};
@@ -32,16 +32,20 @@ impl PolarsPlanExecutor {
         }
     }
 
-    fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
+    pub(crate) fn cloud_options(&self) -> Option<&CloudOptions> {
+        self.cloud_opts.as_ref()
+    }
+
+    fn execute_io(&self, op: IoOperation) -> KernelResult<PlanResult> {
         match op {
             IoOperation::FileListing { url } => {
                 // `list_from` materializes before returning, so collecting to
                 // re-box as `Send + 'static` costs nothing extra.
-                let metas: Vec<DeltaResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<KernelResult<FileMeta>> = self.storage.list_from(&url)?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
-                let payloads: Vec<DeltaResult<bytes::Bytes>> =
+                let payloads: Vec<KernelResult<bytes::Bytes>> =
                     self.storage.read_files(files)?.collect();
                 Ok(PlanResult::Bytes(Box::new(payloads.into_iter())))
             }
@@ -73,7 +77,7 @@ impl PolarsPlanExecutor {
 }
 
 impl PlanExecutor for PolarsPlanExecutor {
-    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+    fn execute_op(&self, op: Operation) -> KernelResult<PlanResult> {
         match op {
             Operation::IoOperation(io) => self.execute_io(io),
             Operation::QueryPlan(plan) => self.execute_query(plan),

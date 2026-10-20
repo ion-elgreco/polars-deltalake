@@ -1,13 +1,14 @@
-//! `PolarsEngine` — the four polars-backed handlers tied together as a single
-//! `delta_kernel::Engine`. One per opened table; all engines share a single
-//! process-wide tokio runtime so opening many tables doesn't churn worker
-//! threads.
+//! `PolarsEngine` — a `delta_kernel::Engine` whose storage, JSON and parquet
+//! handlers all route through `PolarsPlanExecutor` (kernel's
+//! `PlanBasedEngine` layout, without its arrow dependency). One per opened
+//! table; all engines share a single process-wide tokio runtime so opening
+//! many tables doesn't churn worker threads.
 
 use std::sync::{Arc, OnceLock};
 
 use delta_kernel::plans::PlanExecutor;
 use delta_kernel::{
-    DeltaResult, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    Engine, EvaluationHandler, JsonHandler, KernelResult, ParquetHandler, StorageHandler,
 };
 use tokio::runtime::Runtime;
 use url::Url;
@@ -16,6 +17,7 @@ mod data;
 mod executor;
 mod handlers;
 mod log_cache;
+mod plan_based;
 
 pub(crate) use data::PolarsEngineData;
 pub(crate) use data::resolve_path as resolve_series_path;
@@ -27,10 +29,11 @@ pub(crate) use executor::PolarsPlanExecutor;
 
 #[cfg(test)]
 pub(crate) use handlers::parse_ndjson_inferred;
-use handlers::{ObjectStoreStorageHandler, PolarsJsonHandler, PolarsParquetHandler};
+use handlers::{ObjectStoreStorageHandler, cloud_options_for};
 pub(crate) use handlers::{
     dsl_parquet_scan, fetch_parquet_metadata, path_for_polars_io, unified_scan_args,
 };
+use plan_based::{PlanBasedJsonHandler, PlanBasedParquetHandler, PlanBasedStorageHandler};
 
 use crate::translation::PolarsEvaluationHandler;
 
@@ -72,11 +75,11 @@ pub(crate) fn rt() -> &'static Runtime {
 }
 
 pub(crate) struct PolarsEngine {
-    storage: Arc<ObjectStoreStorageHandler>,
-    json: Arc<PolarsJsonHandler>,
-    parquet: Arc<PolarsParquetHandler>,
-    evaluation: Arc<PolarsEvaluationHandler>,
     executor: Arc<PolarsPlanExecutor>,
+    evaluation: Arc<PolarsEvaluationHandler>,
+    storage: Arc<PlanBasedStorageHandler>,
+    json: Arc<PlanBasedJsonHandler>,
+    parquet: Arc<PlanBasedParquetHandler>,
 }
 
 impl PolarsEngine {
@@ -85,34 +88,30 @@ impl PolarsEngine {
     pub(crate) fn open(
         table_url: &Url,
         storage_options: impl IntoIterator<Item = (String, String)>,
-    ) -> DeltaResult<Self> {
-        let rt = rt();
+    ) -> KernelResult<Self> {
         let opts: std::collections::HashMap<String, String> = storage_options.into_iter().collect();
-
-        let storage = Arc::new(ObjectStoreStorageHandler::new(table_url, opts.clone(), rt)?);
-
-        let json = Arc::new(PolarsJsonHandler::new(storage.clone()));
-        let parquet = Arc::new(PolarsParquetHandler::new(storage.clone(), opts)?);
-        let evaluation = Arc::new(PolarsEvaluationHandler::new());
-        let executor = Arc::new(PolarsPlanExecutor::new(
-            storage.clone(),
-            parquet.cloud_options().cloned(),
-        ));
+        let storage = Arc::new(ObjectStoreStorageHandler::new(
+            table_url,
+            opts.clone(),
+            rt(),
+        )?);
+        let cloud_opts = cloud_options_for(table_url, opts)?;
+        let executor = Arc::new(PolarsPlanExecutor::new(storage, cloud_opts));
+        let plans: Arc<dyn PlanExecutor> = executor.clone();
 
         Ok(Self {
-            storage,
-            json,
-            parquet,
-            evaluation,
+            evaluation: Arc::new(PolarsEvaluationHandler::new()),
+            storage: Arc::new(PlanBasedStorageHandler::new(plans.clone())),
+            json: Arc::new(PlanBasedJsonHandler::new(plans.clone())),
+            parquet: Arc::new(PlanBasedParquetHandler::new(plans)),
             executor,
         })
     }
 
-    /// Pre-built cloud options the parquet handler holds, exposed so the
-    /// scan-driver's bulk-read path can reuse them without rebuilding from
-    /// `storage_options`.
+    /// Pre-built cloud options, exposed so the scan-driver's bulk-read path
+    /// can reuse them without rebuilding from `storage_options`.
     pub(crate) fn cloud_options(&self) -> Option<&polars::io::cloud::CloudOptions> {
-        self.parquet.cloud_options()
+        self.executor.cloud_options()
     }
 
     /// Concrete accessor — the `Engine::plan_executor` trait method returns

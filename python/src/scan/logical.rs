@@ -224,7 +224,7 @@ impl Rewriter {
     /// A morsel that straddles files is split, each part rewritten, and the
     /// parts stacked back, so every per-column cost downstream — the FFI
     /// export above all — is paid once per morsel.
-    fn rewrite(&self, df: DataFrame) -> Result<Option<DataFrame>, delta_kernel::Error> {
+    fn rewrite(&self, df: DataFrame) -> Result<Option<DataFrame>, delta_kernel::KernelError> {
         let mut parts = Vec::new();
         self.split(df, &mut parts)?;
         let mut parts = parts.into_iter();
@@ -233,7 +233,7 @@ impl Rewriter {
         };
         for part in parts {
             merged.vstack_mut(&part).map_err(|e| {
-                delta_kernel::Error::Generic(format!("stacking per-file frames: {e}"))
+                delta_kernel::KernelError::Generic(format!("stacking per-file frames: {e}"))
             })?;
         }
         Ok(Some(merged))
@@ -243,7 +243,11 @@ impl Rewriter {
     /// `out`. With `maintain_order=true` the file-id column is composed
     /// of contiguous runs, so we binary-search the end of each run rather
     /// than scanning row-by-row
-    fn split(&self, df: DataFrame, out: &mut Vec<DataFrame>) -> Result<(), delta_kernel::Error> {
+    fn split(
+        &self,
+        df: DataFrame,
+        out: &mut Vec<DataFrame>,
+    ) -> Result<(), delta_kernel::KernelError> {
         let n = df.height();
         if n == 0 {
             return Ok(());
@@ -251,12 +255,12 @@ impl Rewriter {
         if let Some(spans) = self.file_spans.clone() {
             return self.split_by_row_index(df, &spans, out);
         }
-        let file_col = df
-            .column(FILE_ID_COL)
-            .map_err(|e| delta_kernel::Error::Generic(format!("file-id column missing: {e}")))?;
-        let file_str = file_col
-            .str()
-            .map_err(|e| delta_kernel::Error::Generic(format!("file-id column not Utf8: {e}")))?;
+        let file_col = df.column(FILE_ID_COL).map_err(|e| {
+            delta_kernel::KernelError::Generic(format!("file-id column missing: {e}"))
+        })?;
+        let file_str = file_col.str().map_err(|e| {
+            delta_kernel::KernelError::Generic(format!("file-id column not Utf8: {e}"))
+        })?;
 
         if let Some(first) = file_str.get(0)
             && Some(first) == file_str.get(n - 1)
@@ -273,7 +277,7 @@ impl Rewriter {
             let Some(file_id) = cur else {
                 // polars-io always populates the column; skipping the run
                 // would drop those rows from the scan without a trace.
-                return Err(delta_kernel::Error::Generic(format!(
+                return Err(delta_kernel::KernelError::Generic(format!(
                     "polars-io scan produced {} row(s) with a null {FILE_ID_COL}",
                     end - start
                 )));
@@ -294,25 +298,25 @@ impl Rewriter {
         df: DataFrame,
         spans: &[Range<u64>],
         out: &mut Vec<DataFrame>,
-    ) -> Result<(), delta_kernel::Error> {
+    ) -> Result<(), delta_kernel::KernelError> {
         let n = df.height();
         let rows = df
             .column(ROW_INDEX_COL)
             .and_then(|c| c.idx().cloned())
-            .map_err(|e| delta_kernel::Error::Generic(format!("{ROW_INDEX_COL}: {e}")))?;
-        let file_of = |global: IdxSize| -> Result<usize, delta_kernel::Error> {
+            .map_err(|e| delta_kernel::KernelError::Generic(format!("{ROW_INDEX_COL}: {e}")))?;
+        let file_of = |global: IdxSize| -> Result<usize, delta_kernel::KernelError> {
             let global = global as u64;
             let i = spans.partition_point(|s| s.end <= global);
             if spans.get(i).is_some_and(|s| s.contains(&global)) {
                 Ok(i)
             } else {
-                Err(delta_kernel::Error::Generic(format!(
+                Err(delta_kernel::KernelError::Generic(format!(
                     "row index {global} falls outside every file's rows"
                 )))
             }
         };
         let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
-            return Err(delta_kernel::Error::Generic(format!(
+            return Err(delta_kernel::KernelError::Generic(format!(
                 "{ROW_INDEX_COL} has nulls"
             )));
         };
@@ -341,9 +345,11 @@ impl Rewriter {
         &self,
         file_id: &str,
         df: DataFrame,
-    ) -> Result<DataFrame, delta_kernel::Error> {
+    ) -> Result<DataFrame, delta_kernel::KernelError> {
         let idx = *self.path_index.get(file_id).ok_or_else(|| {
-            delta_kernel::Error::Generic(format!("unknown file_id from polars-io scan: {file_id}"))
+            delta_kernel::KernelError::Generic(format!(
+                "unknown file_id from polars-io scan: {file_id}"
+            ))
         })?;
         self.apply_rewrite_at(idx, df)
     }
@@ -354,16 +360,19 @@ impl Rewriter {
         &self,
         idx: usize,
         mut df: DataFrame,
-    ) -> Result<DataFrame, delta_kernel::Error> {
+    ) -> Result<DataFrame, delta_kernel::KernelError> {
         if self.file_spans.is_none() {
-            df.drop_in_place(FILE_ID_COL)
-                .map_err(|e| delta_kernel::Error::Generic(format!("drop {FILE_ID_COL}: {e}")))?;
+            df.drop_in_place(FILE_ID_COL).map_err(|e| {
+                delta_kernel::KernelError::Generic(format!("drop {FILE_ID_COL}: {e}"))
+            })?;
         }
         let row_index = self
             .row_index
             .then(|| df.drop_in_place(ROW_INDEX_COL))
             .transpose()
-            .map_err(|e| delta_kernel::Error::Generic(format!("drop {ROW_INDEX_COL}: {e}")))?;
+            .map_err(|e| {
+                delta_kernel::KernelError::Generic(format!("drop {ROW_INDEX_COL}: {e}"))
+            })?;
         let entry = &self.files[idx];
 
         if let Some(dv) = &entry.dv {
@@ -372,18 +381,18 @@ impl Rewriter {
                 .expect("row index requested whenever a file has a DV")
                 .idx()
                 .map_err(|e| {
-                    delta_kernel::Error::Generic(format!(
+                    delta_kernel::KernelError::Generic(format!(
                         "{ROW_INDEX_COL} is not an index column: {e}"
                     ))
                 })?;
             let deleted = dv
                 .dv
                 .rows(&self.storage, &self.table_root)
-                .map_err(|e| delta_kernel::Error::Generic(format!("{e:#}")))?;
+                .map_err(|e| delta_kernel::KernelError::Generic(format!("{e:#}")))?;
             if let Some(mask) = keep_mask(deleted, &dv.rows, rows)? {
                 df = df
                     .filter(&mask)
-                    .map_err(|e| delta_kernel::Error::Generic(format!("DV filter: {e}")))?;
+                    .map_err(|e| delta_kernel::KernelError::Generic(format!("DV filter: {e}")))?;
             }
         }
 
@@ -398,7 +407,7 @@ impl Rewriter {
         if !has_lazy_stage {
             if let Some(fast) = &entry.simple {
                 df = fast.apply(&df).map_err(|e| {
-                    delta_kernel::Error::Generic(format!("logical rewrite eval: {e}"))
+                    delta_kernel::KernelError::Generic(format!("logical rewrite eval: {e}"))
                 })?;
             }
             return Ok(df);
@@ -415,7 +424,7 @@ impl Rewriter {
             lazy = lazy.select(cols.clone());
         }
         crate::engine::collect_streaming_single(lazy)
-            .map_err(|e| delta_kernel::Error::Generic(format!("logical rewrite eval: {e}")))
+            .map_err(|e| delta_kernel::KernelError::Generic(format!("logical rewrite eval: {e}")))
     }
 }
 
@@ -467,10 +476,10 @@ fn keep_mask(
     deleted: &[u64],
     span: &Range<u64>,
     rows: &IdxCa,
-) -> Result<Option<BooleanChunked>, delta_kernel::Error> {
+) -> Result<Option<BooleanChunked>, delta_kernel::KernelError> {
     const NAME: &str = "__pldl_dv__";
     if rows.null_count() > 0 {
-        return Err(delta_kernel::Error::Generic(format!(
+        return Err(delta_kernel::KernelError::Generic(format!(
             "{ROW_INDEX_COL} has nulls"
         )));
     }
@@ -479,7 +488,7 @@ fn keep_mask(
         if span.contains(&global) {
             Ok(global - span.start)
         } else {
-            Err(delta_kernel::Error::Generic(format!(
+            Err(delta_kernel::KernelError::Generic(format!(
                 "row index {global} falls outside its file's rows {span:?}"
             )))
         }
@@ -530,17 +539,17 @@ fn keep_mask(
 }
 
 impl Iterator for LogicalScanIter {
-    type Item = Result<DataFrame, delta_kernel::Error>;
+    type Item = Result<DataFrame, delta_kernel::KernelError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let item = match &mut self.inner {
                 Inner::Parallel(pipeline) => pipeline
                     .next()?
-                    .map_err(|e| delta_kernel::Error::Generic(format!("{e:#}"))),
+                    .map_err(|e| delta_kernel::KernelError::Generic(format!("{e:#}"))),
                 Inner::Direct { source, rewriter } => match source.next()? {
                     Ok(df) => rewriter.rewrite(df),
-                    Err(e) => Err(delta_kernel::Error::Generic(format!("{e:#}"))),
+                    Err(e) => Err(delta_kernel::KernelError::Generic(format!("{e:#}"))),
                 },
             };
             match item {
@@ -626,7 +635,10 @@ mod keep_mask_tests {
         Dv { deleted, rows }
     }
 
-    fn keep_mask(dv: &Dv, rows: &IdxCa) -> Result<Option<BooleanChunked>, delta_kernel::Error> {
+    fn keep_mask(
+        dv: &Dv,
+        rows: &IdxCa,
+    ) -> Result<Option<BooleanChunked>, delta_kernel::KernelError> {
         super::keep_mask(&dv.deleted, &dv.rows, rows)
     }
 
@@ -639,7 +651,7 @@ mod keep_mask_tests {
     }
 
     /// Unflagged, so the merge path.
-    fn mask(dv: &Dv, rows: &[IdxSize]) -> Result<Vec<bool>, delta_kernel::Error> {
+    fn mask(dv: &Dv, rows: &[IdxSize]) -> Result<Vec<bool>, delta_kernel::KernelError> {
         keep_mask(dv, &IdxCa::new("r".into(), rows)).map(|m| bools(m, rows.len()))
     }
 

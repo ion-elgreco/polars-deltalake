@@ -14,7 +14,7 @@ use delta_kernel::plans::ir::nodes::{
 };
 use delta_kernel::plans::ir::plan::{Plan, PlanNode};
 use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
-use delta_kernel::{DeltaResult, Error, FileMeta};
+use delta_kernel::{FileMeta, KernelError, KernelResult};
 use polars::prelude::{
     BooleanChunked, DataFrame, DataType, Expr, Field as PlField, IntoLazy, JoinArgs, JoinType,
     LazyFrame, MaintainOrderJoin, NULL, NamedFrom, PolarsError, PolarsResult, Schema as PlSchema,
@@ -26,8 +26,9 @@ use polars_utils::pl_str::PlSmallStr;
 use crate::engine::data::resolve_path;
 use crate::engine::handlers::parse_commit_files;
 use crate::engine::handlers::{
-    MetadataColumns, align_lazy, dsl_parquet_scan, ensure_no_field_id_matching, path_for_polars_io,
-    row_index_as_long, split_metadata_columns, unified_scan_args,
+    MetadataColumns, align_lazy, dsl_parquet_scan, ensure_no_field_id_matching,
+    fetch_parquet_metadata, metadata_only_frame, path_for_polars_io, row_index_as_long,
+    split_metadata_columns, unified_scan_args,
 };
 use crate::engine::log_cache::LogFileCache;
 use crate::engine::{PolarsEngineData, select_anchored};
@@ -44,7 +45,7 @@ use super::PolarsPlanExecutor;
 
 /// Each file's constant literals repeated over that file's rows, one column
 /// per constant. The literals are evaluated in a single select.
-fn constant_columns(entries: &[FileEntry], rows_per_file: &[usize]) -> DeltaResult<Vec<Expr>> {
+fn constant_columns(entries: &[FileEntry], rows_per_file: &[usize]) -> KernelResult<Vec<Expr>> {
     let n_cols = entries.first().map_or(0, |e| e.literals.len());
     if n_cols == 0 {
         return Ok(Vec::new());
@@ -102,7 +103,7 @@ struct FileEntry {
 }
 
 impl PolarsPlanExecutor {
-    pub(super) fn execute_query(&self, plan: Plan) -> DeltaResult<PlanResult> {
+    pub(super) fn execute_query(&self, plan: Plan) -> KernelResult<PlanResult> {
         let mut states: Vec<NodeState> = Vec::with_capacity(plan.nodes.len());
         let mut reads_files = false;
         for node in plan.nodes {
@@ -111,7 +112,7 @@ impl PolarsPlanExecutor {
         }
         let terminal = states
             .pop()
-            .ok_or_else(|| Error::Generic("execute_query: plan has no nodes".into()))?;
+            .ok_or_else(|| KernelError::Generic("execute_query: plan has no nodes".into()))?;
 
         // JSON inputs are parsed frames already, so a plan without file
         // scans has nothing to stream; the in-memory engine skips the
@@ -119,13 +120,13 @@ impl PolarsPlanExecutor {
         if !reads_files {
             let mut df = terminal.lf.collect().map_err(to_kernel_err)?;
             df.rechunk_mut();
-            let batch: DeltaResult<Box<dyn EngineData>> = Ok(Box::new(PolarsEngineData::new(df)));
+            let batch: KernelResult<Box<dyn EngineData>> = Ok(Box::new(PolarsEngineData::new(df)));
             return Ok(PlanResult::Data(Box::new(std::iter::once(batch))));
         }
 
         let batches =
             crate::engine::collect_streaming_batches(terminal.lf).map_err(to_kernel_err)?;
-        let iter = batches.map(|r| -> DeltaResult<Box<dyn EngineData>> {
+        let iter = batches.map(|r| -> KernelResult<Box<dyn EngineData>> {
             let mut df = r.map_err(to_kernel_err)?;
             df.rechunk_mut();
             Ok(Box::new(PolarsEngineData::new(df)))
@@ -133,13 +134,13 @@ impl PolarsPlanExecutor {
         Ok(PlanResult::Data(Box::new(iter)))
     }
 
-    fn eval_node(&self, node: PlanNode, states: &[NodeState]) -> DeltaResult<NodeState> {
+    fn eval_node(&self, node: PlanNode, states: &[NodeState]) -> KernelResult<NodeState> {
         let PlanNode { op, inputs } = node;
-        let input = |i: usize| -> DeltaResult<&NodeState> {
+        let input = |i: usize| -> KernelResult<&NodeState> {
             inputs
                 .get(i)
                 .and_then(|&idx| states.get(idx))
-                .ok_or_else(|| Error::Generic(format!("plan node is missing input {i}")))
+                .ok_or_else(|| KernelError::Generic(format!("plan node is missing input {i}")))
         };
         match op {
             Operator::ScanJson(ScanJson {
@@ -171,7 +172,7 @@ impl PolarsPlanExecutor {
             Operator::UnionAll(_) => {
                 let frames: Vec<LazyFrame> = (0..inputs.len())
                     .map(|i| Ok(input(i)?.lf.clone()))
-                    .collect::<DeltaResult<_>>()?;
+                    .collect::<KernelResult<_>>()?;
                 let schema = input(0)?.schema.clone();
                 Ok(NodeState {
                     lf: concat_frames(frames, &schema)?,
@@ -179,6 +180,14 @@ impl PolarsPlanExecutor {
                 })
             }
             Operator::Aggregate(agg) => eval_aggregate(agg, input(0)?),
+            // Needs `ScopedPlanExecutor`, which this executor does not
+            // implement; kernel only emits it against one.
+            Operator::RelationSource(_) => Err(KernelError::Unsupported(
+                "plan executor: RelationSource is not supported".into(),
+            )),
+            Operator::WriteJson(_) => Err(KernelError::Unsupported(
+                "polars-deltalake is read-only; WriteJson is not supported".into(),
+            )),
         }
     }
 
@@ -191,18 +200,18 @@ impl PolarsPlanExecutor {
         files: Vec<ScanFile>,
         constant_cols: &[String],
         schema: SchemaRef,
-    ) -> DeltaResult<NodeState> {
+    ) -> KernelResult<NodeState> {
         let (read_schema, meta_cols) = split_scan_schema(&schema, constant_cols)?;
         let const_cols: Vec<(&StructField, DataType)> = constant_fields(&schema, constant_cols)?
             .into_iter()
             .map(|f| Ok((f, f.data_type.to_polars().map_err(to_kernel_err)?)))
-            .collect::<DeltaResult<_>>()?;
+            .collect::<KernelResult<_>>()?;
 
         let entries = files
             .into_iter()
             .map(|f| {
                 if f.file_constants.len() != constant_cols.len() {
-                    return Err(Error::Generic(format!(
+                    return Err(KernelError::Generic(format!(
                         "scan file has {} constants, node declares {}",
                         f.file_constants.len(),
                         constant_cols.len()
@@ -214,7 +223,7 @@ impl PolarsPlanExecutor {
                     literals,
                 })
             })
-            .collect::<DeltaResult<Vec<_>>>()?;
+            .collect::<KernelResult<Vec<_>>>()?;
 
         let lf = self.scan_entries(file_type, entries, &read_schema, &schema, meta_cols)?;
         Ok(NodeState { lf, schema })
@@ -227,7 +236,7 @@ impl PolarsPlanExecutor {
         read_schema: &StructType,
         output_schema: &SchemaRef,
         meta_cols: MetadataColumns,
-    ) -> DeltaResult<LazyFrame> {
+    ) -> KernelResult<LazyFrame> {
         let select = crate::translation::schema::select_exprs_for_schema(output_schema);
         let row_index = meta_cols.row_index().cloned();
         let file_path = meta_cols.file_path().cloned();
@@ -245,14 +254,30 @@ impl PolarsPlanExecutor {
         };
 
         // Polars sizes a frame from the columns it reads, so a scan with no
-        // read columns collapses to height 0 and the constants below broadcast
-        // to one synthetic row per file. `ParquetHandler` takes `num_rows` from
-        // the footer for this shape; `FileEntry` carries no file size to do the
-        // same, so refuse rather than under-report every file's row count.
+        // read columns would collapse to height 0 and broadcast the constants
+        // to one synthetic row per file. The parquet footer's row count sets
+        // the height instead.
         if read_schema.fields().next().is_none() {
-            return Err(Error::Unsupported(
-                "plan scan: a node whose output is entirely file constants is not supported".into(),
-            ));
+            if matches!(file_type, FileType::Json) {
+                return Err(KernelError::Unsupported(
+                    "plan scan: a JSON node whose output is entirely file constants is not supported"
+                        .into(),
+                ));
+            }
+            let frames = entries
+                .into_iter()
+                .map(|e| {
+                    let rows = fetch_parquet_metadata(self.storage.as_ref(), &e.meta)?.num_rows;
+                    let df = metadata_only_frame(&meta_cols, &e.meta.location, rows)?;
+                    // An empty select would discard the height just set.
+                    Ok(if select.is_empty() {
+                        df.lazy()
+                    } else {
+                        shape(df.lazy(), e.literals)
+                    })
+                })
+                .collect::<KernelResult<_>>()?;
+            return concat_frames(frames, output_schema);
         }
 
         // Equal per-file literals (checkpoint parts, V2 sidecars) collapse into
@@ -265,7 +290,7 @@ impl PolarsPlanExecutor {
                 let paths: Vec<PlRefPath> = entries
                     .iter()
                     .map(|e| path_for_polars_io(&e.meta.location))
-                    .collect::<DeltaResult<_>>()?;
+                    .collect::<KernelResult<_>>()?;
                 let lf = self.scan_parquet_lazy(paths, read_schema, None)?;
                 vec![shape(lf, literals)]
             }
@@ -280,7 +305,7 @@ impl PolarsPlanExecutor {
                     }
                     Ok(shape(lf, e.literals))
                 })
-                .collect::<DeltaResult<_>>()?,
+                .collect::<KernelResult<_>>()?,
             FileType::Json => {
                 // One parse over every commit file: polars infers one schema
                 // for all lines and the align select runs once, so the plan
@@ -299,7 +324,7 @@ impl PolarsPlanExecutor {
                         let payloads: Vec<bytes::Bytes> = self
                             .storage
                             .read_files(slices)?
-                            .collect::<DeltaResult<_>>()?;
+                            .collect::<KernelResult<_>>()?;
                         cache.insert(&metas, parse_commit_files(&payloads)?)
                     }
                 };
@@ -332,7 +357,7 @@ impl PolarsPlanExecutor {
         paths: Vec<PlRefPath>,
         read_schema: &StructType,
         row_index: Option<PlSmallStr>,
-    ) -> DeltaResult<LazyFrame> {
+    ) -> KernelResult<LazyFrame> {
         // Plan contract: a field carrying `parquet.field.id` matches by ID,
         // which polars cannot express — refuse rather than null-fill.
         ensure_no_field_id_matching(read_schema)?;
@@ -351,17 +376,19 @@ impl PolarsPlanExecutor {
     /// Reads files named by `input` rows. Deletion vectors are not applied
     /// here yet — matching the kernel's own sync executor, a row with a
     /// non-null DV descriptor is an error.
-    fn eval_dynamic_scan(&self, ds: DynamicScan, input: &NodeState) -> DeltaResult<NodeState> {
+    fn eval_dynamic_scan(&self, ds: DynamicScan, input: &NodeState) -> KernelResult<NodeState> {
         let df =
             crate::engine::collect_streaming_single(input.lf.clone()).map_err(to_kernel_err)?;
 
         // A non-null descriptor means a deletion vector whatever an ancestor's
         // validity says, so ANDing ancestors in could only hide one.
-        let dv = resolve_path(&df, &ds.dv_column).map_err(to_kernel_err)?;
-        if dv.null_count() != dv.len() {
-            return Err(Error::Unsupported(
-                "DynamicScan with deletion vectors is not implemented".into(),
-            ));
+        if let Some(dv_column) = &ds.dv_column {
+            let dv = resolve_path(&df, dv_column).map_err(to_kernel_err)?;
+            if dv.null_count() != dv.len() {
+                return Err(KernelError::Unsupported(
+                    "DynamicScan with deletion vectors is not implemented".into(),
+                ));
+            }
         }
 
         let path = resolve_path(&df, &ds.path_column).map_err(to_kernel_err)?;
@@ -381,7 +408,7 @@ impl PolarsPlanExecutor {
                 let dt = field.data_type.to_polars().map_err(to_kernel_err)?;
                 series.cast(&dt).map_err(to_kernel_err)
             })
-            .collect::<DeltaResult<_>>()?;
+            .collect::<KernelResult<_>>()?;
 
         let names: Vec<&str> = const_fields.iter().map(|f| f.name.as_str()).collect();
         let per_row =
@@ -390,18 +417,18 @@ impl PolarsPlanExecutor {
         for (row, literals) in per_row.into_iter().enumerate() {
             let rel = path
                 .get(row)
-                .ok_or_else(|| Error::Generic("DynamicScan path must not be null".into()))?;
+                .ok_or_else(|| KernelError::Generic("DynamicScan path must not be null".into()))?;
             let location = ds
                 .base_url
                 .join(rel)
-                .map_err(|e| Error::Generic(format!("DynamicScan path join failed: {e}")))?;
+                .map_err(|e| KernelError::Generic(format!("DynamicScan path join failed: {e}")))?;
             // Kernel's contract requires the column to be a non-null LONG and
             // nothing more; a zero-byte commit reads as an empty batch on the
             // ScanJson path, so it must not abort here either.
             let size = match size.get(row) {
                 Some(s) if s >= 0 => s as u64,
                 _ => {
-                    return Err(Error::Generic(
+                    return Err(KernelError::Generic(
                         "DynamicScan file size must be a non-negative long".into(),
                     ));
                 }
@@ -502,12 +529,11 @@ fn non_nullable_guards(read_schema: &StructType) -> Vec<Expr> {
 
 /// Splits a scan output schema into the fields read from files (everything
 /// that is neither a constant nor a metadata column) and the requested
-/// synthetic metadata columns, via the same classifier the classic
-/// `ParquetHandler` uses — the two read paths must not drift.
+/// synthetic metadata columns.
 fn split_scan_schema(
     schema: &SchemaRef,
     constant_cols: &[String],
-) -> DeltaResult<(StructType, MetadataColumns)> {
+) -> KernelResult<(StructType, MetadataColumns)> {
     let (read_schema, meta) = split_metadata_columns(schema, "plan scan")?;
     let read_fields: Vec<StructField> = read_schema
         .fields()
@@ -520,12 +546,12 @@ fn split_scan_schema(
 fn constant_fields<'a>(
     schema: &'a SchemaRef,
     constant_cols: &[String],
-) -> DeltaResult<Vec<&'a StructField>> {
+) -> KernelResult<Vec<&'a StructField>> {
     constant_cols
         .iter()
         .map(|name| {
             schema.field(name).ok_or_else(|| {
-                Error::Generic(format!(
+                KernelError::Generic(format!(
                     "file-constant column '{name}' not found in scan schema"
                 ))
             })
@@ -536,11 +562,11 @@ fn constant_fields<'a>(
 fn kernel_constant_literals(
     constants: &[Scalar],
     cols: &[(&StructField, DataType)],
-) -> DeltaResult<Vec<Expr>> {
+) -> KernelResult<Vec<Expr>> {
     constants
         .iter()
         .zip(cols)
-        .map(|(scalar, (field, dt))| -> DeltaResult<Expr> {
+        .map(|(scalar, (field, dt))| -> KernelResult<Expr> {
             // Same untrusted proto boundary as `Values`: a mistyped constant
             // would otherwise surface as an opaque cast failure mid-collect,
             // or cast cleanly and broadcast a silently wrong NULL.
@@ -556,7 +582,7 @@ fn kernel_constant_literals(
         .collect()
 }
 
-fn concat_frames(frames: Vec<LazyFrame>, schema: &SchemaRef) -> DeltaResult<LazyFrame> {
+fn concat_frames(frames: Vec<LazyFrame>, schema: &SchemaRef) -> KernelResult<LazyFrame> {
     match frames.len() {
         0 => Ok(schema.empty_frame().map_err(to_kernel_err)?.lazy()),
         1 => Ok(frames.into_iter().next().expect("len checked")),
@@ -564,19 +590,18 @@ fn concat_frames(frames: Vec<LazyFrame>, schema: &SchemaRef) -> DeltaResult<Lazy
     }
 }
 
-fn eval_values(values: Values) -> DeltaResult<NodeState> {
+fn eval_values(values: Values) -> KernelResult<NodeState> {
     let Values { schema, rows } = values;
-    let row_slices: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
     // Foreign plans arrive via the proto round-trip; the shared builder
     // guards the scalar/schema agreement `build_series` panics on.
-    let df = crate::translation::scalar_rows_to_frame(&schema, &row_slices, "Values")?;
+    let df = crate::translation::scalar_rows_to_frame(&schema, &rows, "Values")?;
     Ok(NodeState {
         lf: df.lazy(),
         schema,
     })
 }
 
-fn eval_project(project: Project, input: &NodeState) -> DeltaResult<NodeState> {
+fn eval_project(project: Project, input: &NodeState) -> KernelResult<NodeState> {
     let Project { expr, schema } = project;
     let input_struct = input.schema.as_ref();
     let out_dt = KernelDataType::Struct(Box::new(schema.as_ref().clone()));
@@ -609,7 +634,7 @@ fn eval_project(project: Project, input: &NodeState) -> DeltaResult<NodeState> {
     Ok(NodeState { lf, schema })
 }
 
-fn eval_semi_join(join: SemiJoin, probe: &NodeState, build: &NodeState) -> DeltaResult<NodeState> {
+fn eval_semi_join(join: SemiJoin, probe: &NodeState, build: &NodeState) -> KernelResult<NodeState> {
     let SemiJoin {
         inverted,
         probe_keys,
@@ -639,7 +664,7 @@ fn eval_semi_join(join: SemiJoin, probe: &NodeState, build: &NodeState) -> Delta
     })
 }
 
-fn eval_aggregate(agg: Aggregate, input: &NodeState) -> DeltaResult<NodeState> {
+fn eval_aggregate(agg: Aggregate, input: &NodeState) -> KernelResult<NodeState> {
     let Aggregate {
         group_by,
         aggs,
@@ -647,7 +672,7 @@ fn eval_aggregate(agg: Aggregate, input: &NodeState) -> DeltaResult<NodeState> {
     } = agg;
     let out_fields: Vec<&StructField> = schema.fields().collect();
     if out_fields.len() != group_by.len() + aggs.len() {
-        return Err(Error::Generic(format!(
+        return Err(KernelError::Generic(format!(
             "Aggregate schema has {} fields, expected {} keys + {} aggs",
             out_fields.len(),
             group_by.len(),
@@ -793,21 +818,28 @@ mod scan_entries_tests {
         assert_eq!(plan_scan_count([literals(1i64), literals(2i64)]), 2);
     }
 
-    /// A read schema with no fields would report one synthetic row per file
-    /// instead of the file's row count.
+    /// A read schema with no fields takes each file's height from its
+    /// footer, not from the one row the constants would broadcast to.
     #[test]
-    fn a_scan_with_no_read_columns_is_refused() {
+    fn a_scan_with_no_read_columns_takes_its_height_from_the_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.parquet");
+        let mut df = polars::df!("x" => [1i64, 2, 3]).unwrap();
+        ParquetWriter::new(std::fs::File::create(&path).unwrap())
+            .finish(&mut df)
+            .unwrap();
+
         let read_schema = StructType::try_new(Vec::<StructField>::new()).unwrap();
         let output_schema = Arc::new(StructType::try_new([long_field("v")]).unwrap());
         let entries = vec![FileEntry {
             meta: FileMeta {
-                location: Url::parse("file:///t/0.parquet").unwrap(),
+                location: Url::from_file_path(&path).unwrap(),
                 last_modified: 0,
-                size: 0,
+                size: std::fs::metadata(&path).unwrap().len(),
             },
-            literals: vec![lit(7i64).alias("v")],
+            literals: vec![lit(7i64).cast(PlDataType::Int64).alias("v")],
         }];
-        let err = executor()
+        let out = executor()
             .scan_entries(
                 FileType::Parquet,
                 entries,
@@ -815,12 +847,14 @@ mod scan_entries_tests {
                 &output_schema,
                 MetadataColumns::default(),
             )
-            .err()
-            .expect("a constants-only scan must not report one row per file");
-        assert!(err.to_string().contains("file constants"), "got: {err}");
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(out.height(), 3, "height comes from the footer");
+        assert_eq!(out.column("v").unwrap().i64().unwrap().get(2), Some(7));
     }
 
-    /// The polars behaviour that refusal guards against.
+    /// The polars behaviour the footer path works around.
     #[test]
     fn a_frame_with_no_columns_loses_its_height() {
         let df = polars::df!("x" => [1i64, 2, 3]).unwrap();
@@ -878,7 +912,7 @@ mod scan_entries_tests {
     }
 
     /// Foreign plans reach `eval_values` through the proto round-trip, so a
-    /// mismatched scalar must surface as an Error, not a `build_series`
+    /// mismatched scalar must surface as a `KernelError`, not a `build_series`
     /// panic unwinding into PyO3.
     #[test]
     fn values_scalar_type_mismatch_errors() {
@@ -933,9 +967,7 @@ mod scan_entries_tests {
         split_metadata_columns(&schema, "test").unwrap().1
     }
 
-    /// The classic handler synthesizes FilePath; the plan path refused the
-    /// identical schema. One classifier serves both, and each entry carries
-    /// its own URL.
+    /// FilePath is synthesized per entry, each carrying its own URL.
     #[test]
     fn plan_scan_synthesizes_file_path_per_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1254,7 +1286,7 @@ mod dynamic_scan_size_tests {
             path_column: ColumnName::new(["path"]),
             file_size_column: ColumnName::new(["size"]),
             last_modified_column: ColumnName::new(["modtime"]),
-            dv_column: ColumnName::new(["dv"]),
+            dv_column: Some(ColumnName::new(["dv"])),
         };
         executor
             .eval_dynamic_scan(ds, &input)

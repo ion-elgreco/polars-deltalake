@@ -13,10 +13,10 @@ use delta_kernel::engine_data::EngineData;
 use delta_kernel::expressions::{Expression, ExpressionRef, ExpressionStructPatch, Scalar};
 use delta_kernel::schema::{DataType as KernelDataType, SchemaRef, StructField, StructType};
 use delta_kernel::{
-    DeltaResult, Error, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
+    EvaluationHandler, ExpressionEvaluator, KernelError, KernelResult, PredicateEvaluator,
 };
 use polars::prelude::{
-    Column, DataFrame, Expr, IntoColumn, IntoLazy, Scalar as PolarsScalar, Series, col, lit,
+    Column, DataFrame, Expr, IntoColumn, IntoLazy, Scalar as PolarsScalar, col, lit,
 };
 use polars_utils::pl_str::PlSmallStr;
 
@@ -49,7 +49,7 @@ pub(crate) fn projection_exprs(
     input_schema: &StructType,
     expression: &Expression,
     output_type: &KernelDataType,
-) -> DeltaResult<Vec<Expr>> {
+) -> KernelResult<Vec<Expr>> {
     let ops = build_column_ops(input_schema, expression, output_type)?;
     Ok(ops.iter().map(op_to_expr).collect())
 }
@@ -68,7 +68,7 @@ impl EvaluationHandler for PolarsEvaluationHandler {
         input_schema: SchemaRef,
         expression: ExpressionRef,
         output_type: KernelDataType,
-    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+    ) -> KernelResult<Arc<dyn ExpressionEvaluator>> {
         let ops = build_column_ops(input_schema.as_ref(), expression.as_ref(), &output_type)?;
         Ok(Arc::new(PolarsExpressionEvaluator::new(
             ops,
@@ -80,28 +80,9 @@ impl EvaluationHandler for PolarsEvaluationHandler {
         &self,
         input_schema: SchemaRef,
         predicate: delta_kernel::expressions::PredicateRef,
-    ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
+    ) -> KernelResult<Arc<dyn PredicateEvaluator>> {
         let predicate_expr = translate_predicate(&predicate, Some(input_schema.as_ref()))?;
         Ok(Arc::new(PolarsPredicateEvaluator { predicate_expr }))
-    }
-
-    /// Read path never reaches this — kernel only calls `null_row` from
-    /// checkpoint emit (`create_checkpoint_metadata_batch` builds an
-    /// all-null row, then transforms one field to set `checkpointMetadata`).
-    /// Implemented anyway so the handler is complete against the trait.
-    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
-        let schema = output_schema.to_polars().map_err(to_kernel_err)?;
-        let columns = schema
-            .iter()
-            .map(|(name, dtype)| Series::new_null(name.clone(), 1).cast(dtype))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(to_kernel_err)?;
-        let df = DataFrame::new(
-            1,
-            columns.into_iter().map(IntoColumn::into_column).collect(),
-        )
-        .map_err(to_kernel_err)?;
-        Ok(Box::new(PolarsEngineData::new(df)))
     }
 
     /// Read path never reaches this — kernel only calls `create_many` from
@@ -111,9 +92,9 @@ impl EvaluationHandler for PolarsEvaluationHandler {
     fn create_many(
         &self,
         schema: SchemaRef,
-        rows: &[&[Scalar]],
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        let df = scalar_rows_to_frame(&schema, rows, "create_many")?;
+        rows: Vec<Vec<Scalar>>,
+    ) -> KernelResult<Box<dyn EngineData>> {
+        let df = scalar_rows_to_frame(&schema, &rows, "create_many")?;
         Ok(Box::new(PolarsEngineData::new(df)))
     }
 }
@@ -124,12 +105,12 @@ impl EvaluationHandler for PolarsEvaluationHandler {
 /// agreement is not guaranteed and `build_series` panics on a mismatch.
 pub(crate) fn scalar_rows_to_frame(
     schema: &delta_kernel::schema::StructType,
-    rows: &[&[Scalar]],
+    rows: &[Vec<Scalar>],
     context: &str,
-) -> DeltaResult<DataFrame> {
+) -> KernelResult<DataFrame> {
     let fields: Vec<_> = schema.fields().collect();
     if let Some(bad) = rows.iter().find(|row| row.len() != fields.len()) {
-        return Err(Error::Generic(format!(
+        return Err(KernelError::Generic(format!(
             "{context}: row has {} scalars, schema has {} fields",
             bad.len(),
             fields.len()
@@ -146,7 +127,7 @@ pub(crate) fn scalar_rows_to_frame(
             ensure_scalar_types(column_scalars.iter().copied(), field, context)?;
             build_series(&field.name, &field.data_type, &column_scalars)
         })
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     DataFrame::new(
         rows.len(),
         columns.into_iter().map(IntoColumn::into_column).collect(),
@@ -220,7 +201,7 @@ impl PolarsExpressionEvaluator {
 }
 
 impl ExpressionEvaluator for PolarsExpressionEvaluator {
-    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+    fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
         let df = downcast_engine_data(batch)?.dataframe();
         let height = df.height();
 
@@ -269,7 +250,7 @@ fn build_column_ops(
     input_schema: &StructType,
     expression: &Expression,
     output_type: &KernelDataType,
-) -> DeltaResult<Vec<ColumnOp>> {
+) -> KernelResult<Vec<ColumnOp>> {
     match (output_type, expression) {
         (KernelDataType::Struct(output_struct), Expression::StructPatch(t)) => {
             build_transform_ops(t, output_struct, input_schema)
@@ -277,14 +258,14 @@ fn build_column_ops(
         (KernelDataType::Struct(output_struct), Expression::Struct(children, nullability)) => {
             // A top-level gate would null whole rows — no DataFrame representation.
             if nullability.is_some() {
-                return Err(Error::Unsupported(
+                return Err(KernelError::Unsupported(
                     "PolarsExpressionEvaluator: nullability predicate on a top-level output struct"
                         .into(),
                 ));
             }
             let n_out = output_struct.num_fields();
             if children.len() != n_out {
-                return Err(Error::Generic(format!(
+                return Err(KernelError::Generic(format!(
                     "PolarsExpressionEvaluator: output struct has {n_out} fields but expression has {} children",
                     children.len()
                 )));
@@ -317,7 +298,7 @@ fn build_transform_ops(
     t: &ExpressionStructPatch,
     output_struct: &StructType,
     input_schema: &StructType,
-) -> DeltaResult<Vec<ColumnOp>> {
+) -> KernelResult<Vec<ColumnOp>> {
     if t.input_path.is_some() {
         let struct_expr = translate_transform(t, output_struct, input_schema)?;
         return Ok(output_struct
@@ -359,7 +340,7 @@ fn classify_single(
     output_type: &KernelDataType,
     input_schema: &StructType,
     output_name: PlSmallStr,
-) -> DeltaResult<ColumnOp> {
+) -> KernelResult<ColumnOp> {
     match expression {
         Expression::Literal(scalar) => {
             if let Some(polars_scalar) = try_to_polars_scalar(scalar) {
@@ -390,12 +371,12 @@ fn classify_single(
     })
 }
 
-pub(super) fn downcast_engine_data(batch: &dyn EngineData) -> DeltaResult<&PolarsEngineData> {
+pub(super) fn downcast_engine_data(batch: &dyn EngineData) -> KernelResult<&PolarsEngineData> {
     batch
         .any_ref()
         .downcast_ref::<PolarsEngineData>()
         .ok_or_else(|| {
-            Error::Generic(
+            KernelError::Generic(
                 "PolarsEvaluationHandler received EngineData that is not PolarsEngineData".into(),
             )
         })
@@ -416,7 +397,7 @@ mod evaluator_height_tests {
         let schema = Arc::new(
             StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap(),
         );
-        let rows: &[&[Scalar]] = &[&[Scalar::String("x".to_string())]];
+        let rows = vec![vec![Scalar::String("x".to_string())]];
         let result = handler.create_many(schema, rows);
         assert!(result.is_err(), "type mismatch must error, not panic");
     }

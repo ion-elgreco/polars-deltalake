@@ -7,7 +7,7 @@ use delta_kernel::engine_data::{
 };
 use delta_kernel::expressions::{ArrayData, ColumnName};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{KernelError, KernelResult};
 use polars::prelude::{
     BinaryChunked, BooleanChunked, DataFrame, DataType as PlDataType, Expr, Float32Chunked,
     Float64Chunked, Int8Chunked, Int16Chunked, Int32Chunked, Int64Chunked, IntoColumn, LazyFrame,
@@ -29,8 +29,8 @@ pub(crate) fn collect_streaming_single(lf: LazyFrame) -> polars::prelude::Polars
 
 /// The same collect, streamed as ordered `COLLECT_CHUNK_ROWS`-sized morsels.
 /// The positional flags are `maintain_order` and `lazy`; `lazy: false`
-/// starts the query inside this call — `read_batch`'s file-after-file
-/// deferral comes from its `flat_map`, not from this flag. Every batch
+/// starts the query inside this call — the handlers' file-after-file
+/// deferral comes from their `flat_map`, not from this flag. Every batch
 /// consumer wants the same pair, so they are decided here.
 pub(crate) fn collect_streaming_batches(
     lf: LazyFrame,
@@ -101,17 +101,17 @@ impl EngineData for PolarsEngineData {
         &self,
         column_names: &[ColumnName],
         visitor: &mut dyn RowVisitor,
-    ) -> DeltaResult<()> {
+    ) -> KernelResult<()> {
         // Owned Series outlive the typed getters that borrow into them.
         let owned: Vec<Series> = column_names
             .iter()
             .map(|cn| resolve_path(&self.df, cn).map_err(to_kernel_err))
-            .collect::<DeltaResult<_>>()?;
+            .collect::<KernelResult<_>>()?;
 
         let getters: Vec<PolarsGetter<'_>> = owned
             .iter()
             .map(PolarsGetter::from_series)
-            .collect::<DeltaResult<_>>()?;
+            .collect::<KernelResult<_>>()?;
 
         let refs: Vec<&dyn GetData<'_>> = getters.iter().map(|g| g as &dyn GetData<'_>).collect();
 
@@ -121,10 +121,10 @@ impl EngineData for PolarsEngineData {
     fn apply_selection_vector(
         self: Box<Self>,
         mut selection_vector: Vec<bool>,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         let height = self.df.height();
         if selection_vector.len() > height {
-            return Err(Error::InvalidSelectionVector(format!(
+            return Err(KernelError::InvalidSelectionVector(format!(
                 "selection vector len {} > data height {}",
                 selection_vector.len(),
                 height
@@ -149,10 +149,10 @@ impl EngineData for PolarsEngineData {
         &self,
         schema: SchemaRef,
         columns: Vec<ArrayData>,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> KernelResult<Box<dyn EngineData>> {
         let fields: Vec<_> = schema.fields().collect();
         if fields.len() != columns.len() {
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "append_columns: schema has {} fields but got {} columns",
                 fields.len(),
                 columns.len()
@@ -163,11 +163,11 @@ impl EngineData for PolarsEngineData {
         let new_cols: Vec<polars::prelude::Column> = fields
             .iter()
             .zip(columns.iter())
-            .map(|(field, arr_data)| -> DeltaResult<_> {
+            .map(|(field, arr_data)| -> KernelResult<_> {
                 let scalars: Vec<&delta_kernel::expressions::Scalar> =
                     arr_data.array_elements().iter().collect();
                 if scalars.len() != height {
-                    return Err(Error::Generic(format!(
+                    return Err(KernelError::Generic(format!(
                         "append_columns: column {} has {} elements but data has {} rows",
                         field.name,
                         scalars.len(),
@@ -187,7 +187,7 @@ impl EngineData for PolarsEngineData {
                 )?;
                 Ok(series.into_column())
             })
-            .collect::<DeltaResult<_>>()?;
+            .collect::<KernelResult<_>>()?;
         let new_df = self.df.hstack(&new_cols).map_err(to_kernel_err)?;
         Ok(Box::new(PolarsEngineData::new(new_df)))
     }
@@ -234,7 +234,7 @@ enum PolarsGetter<'a> {
 }
 
 impl<'a> PolarsGetter<'a> {
-    fn from_series(series: &'a Series) -> DeltaResult<Self> {
+    fn from_series(series: &'a Series) -> KernelResult<Self> {
         Ok(match series.dtype() {
             PlDataType::Boolean => Self::Bool(series.bool().map_err(to_kernel_err)?),
             PlDataType::Int8 => Self::Byte(series.i8().map_err(to_kernel_err)?),
@@ -255,7 +255,7 @@ impl<'a> PolarsGetter<'a> {
             // Any other unit is off by three orders of magnitude once
             // `get_timestamp` reads the physical chunk as microseconds.
             PlDataType::Datetime(unit, _) => {
-                return Err(Error::UnexpectedColumnType(format!(
+                return Err(KernelError::UnexpectedColumnType(format!(
                     "column {} is Datetime({unit:?}); kernel reads timestamps as microseconds",
                     series.name(),
                 )));
@@ -284,7 +284,7 @@ impl<'a> PolarsGetter<'a> {
                     Self::StringMap(StringMapGetter::new(series.list().map_err(to_kernel_err)?)?)
                 }
                 other => {
-                    return Err(Error::UnexpectedColumnType(format!(
+                    return Err(KernelError::UnexpectedColumnType(format!(
                         "column {} has unsupported polars dtype List<{other:?}>; \
                          only List<String> and List<Struct<{{key, value}}>> are wired up",
                         series.name(),
@@ -294,7 +294,7 @@ impl<'a> PolarsGetter<'a> {
             // Loud failure here rather than silent null-padding downstream:
             // Struct (kernel should have descended), Array (fixed-size), etc.
             other => {
-                return Err(Error::UnexpectedColumnType(format!(
+                return Err(KernelError::UnexpectedColumnType(format!(
                     "column {} has unsupported polars dtype {other:?}",
                     series.name(),
                 )));
@@ -308,7 +308,7 @@ impl<'a> PolarsGetter<'a> {
 /// Timestamp → Int64 at the GetData layer.
 macro_rules! delegate_get {
     ($method:ident -> $ret:ty, $variant:ident, $label:literal) => {
-        fn $method(&'a self, row: usize, field: &str) -> DeltaResult<Option<$ret>> {
+        fn $method(&'a self, row: usize, field: &str) -> KernelResult<Option<$ret>> {
             match self {
                 Self::$variant(c) => Ok(c.get(row)),
                 _ => Err(type_mismatch(field, $label)),
@@ -360,13 +360,13 @@ pub(crate) struct StringListGetter<'a> {
 }
 
 impl<'a> StringListGetter<'a> {
-    fn new(list: &'a ListChunked) -> DeltaResult<Self> {
+    fn new(list: &'a ListChunked) -> KernelResult<Self> {
         let arr = downcast_single_chunk_list(list)?;
         let values = arr
             .values()
             .as_any()
             .downcast_ref::<polars_arrow::array::Utf8ViewArray>()
-            .ok_or_else(|| Error::Generic("List<String> inner is not Utf8View".into()))?;
+            .ok_or_else(|| KernelError::Generic("List<String> inner is not Utf8View".into()))?;
         Ok(Self {
             string_array: PlStringArray { inner: values },
             offsets: arr.offsets(),
@@ -393,13 +393,13 @@ pub(crate) struct StringMapGetter<'a> {
 }
 
 impl<'a> StringMapGetter<'a> {
-    fn new(list: &'a ListChunked) -> DeltaResult<Self> {
+    fn new(list: &'a ListChunked) -> KernelResult<Self> {
         let outer = downcast_single_chunk_list(list)?;
         let struct_arr = outer
             .values()
             .as_any()
             .downcast_ref::<polars_arrow::array::StructArray>()
-            .ok_or_else(|| Error::Generic("Map element is not a Struct".into()))?;
+            .ok_or_else(|| KernelError::Generic("Map element is not a Struct".into()))?;
 
         let key_arr = struct_arr
             .values()
@@ -408,7 +408,7 @@ impl<'a> StringMapGetter<'a> {
                 v.as_any()
                     .downcast_ref::<polars_arrow::array::Utf8ViewArray>()
             })
-            .ok_or_else(|| Error::Generic("Map key is not Utf8View".into()))?;
+            .ok_or_else(|| KernelError::Generic("Map key is not Utf8View".into()))?;
         let val_arr = struct_arr
             .values()
             .get(1)
@@ -416,7 +416,7 @@ impl<'a> StringMapGetter<'a> {
                 v.as_any()
                     .downcast_ref::<polars_arrow::array::Utf8ViewArray>()
             })
-            .ok_or_else(|| Error::Generic("Map value is not Utf8View".into()))?;
+            .ok_or_else(|| KernelError::Generic("Map value is not Utf8View".into()))?;
 
         Ok(Self {
             keys: PlStringArray { inner: key_arr },
@@ -438,10 +438,10 @@ impl<'a> StringMapGetter<'a> {
 
 fn downcast_single_chunk_list(
     list: &ListChunked,
-) -> DeltaResult<&polars_arrow::array::ListArray<i64>> {
+) -> KernelResult<&polars_arrow::array::ListArray<i64>> {
     let chunks = list.chunks();
     if chunks.len() != 1 {
-        return Err(Error::Generic(format!(
+        return Err(KernelError::Generic(format!(
             "expected single-chunk ListChunked, got {}",
             chunks.len()
         )));
@@ -449,15 +449,15 @@ fn downcast_single_chunk_list(
     chunks[0]
         .as_any()
         .downcast_ref::<polars_arrow::array::ListArray<i64>>()
-        .ok_or_else(|| Error::Generic("ListChunked is not a LargeList".into()))
+        .ok_or_else(|| KernelError::Generic("ListChunked is not a LargeList".into()))
 }
 
 fn validity_at(bitmap: Option<&polars_arrow::bitmap::Bitmap>, row: usize) -> bool {
     bitmap.is_none_or(|b| b.get_bit(row))
 }
 
-fn type_mismatch(field: &str, want: &str) -> Error {
-    Error::UnexpectedColumnType(format!(
+fn type_mismatch(field: &str, want: &str) -> KernelError {
+    KernelError::UnexpectedColumnType(format!(
         "{field}: requested {want} but column has a different type"
     ))
 }

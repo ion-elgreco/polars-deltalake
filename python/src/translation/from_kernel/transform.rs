@@ -6,7 +6,7 @@
 
 use delta_kernel::expressions::{ColumnName, Expression, ExpressionRef, ExpressionStructPatch};
 use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{KernelError, KernelResult};
 
 use polars::prelude::{Expr, col};
 use polars_utils::pl_str::PlSmallStr;
@@ -39,7 +39,7 @@ pub(super) fn walk_transform_slots<'a>(
     t: &'a ExpressionStructPatch,
     output_struct: &'a StructType,
     input_fields: &[&'a StructField],
-) -> DeltaResult<Vec<TransformSlot<'a>>> {
+) -> KernelResult<Vec<TransformSlot<'a>>> {
     // A non-optional patch naming a field the input doesn't have is an error
     // per the kernel contract; optional ones are silently skipped.
     let mut missing: Vec<&str> = t
@@ -53,7 +53,7 @@ pub(super) fn walk_transform_slots<'a>(
     if !missing.is_empty() {
         // `field_patches` is a HashMap, so sort for a reproducible message.
         missing.sort_unstable();
-        return Err(Error::Generic(format!(
+        return Err(KernelError::Generic(format!(
             "StructPatch: patched field(s) {missing:?} not found in input schema"
         )));
     }
@@ -99,7 +99,7 @@ pub(super) fn walk_transform_slots<'a>(
     }
 
     if output_iter.next().is_some() {
-        return Err(Error::Generic(
+        return Err(KernelError::Generic(
             "Transform: too many fields in output schema (input + transforms didn't fill all slots)"
                 .into(),
         ));
@@ -109,9 +109,9 @@ pub(super) fn walk_transform_slots<'a>(
 
 fn next_output<'a>(
     iter: &mut impl Iterator<Item = &'a StructField>,
-) -> DeltaResult<&'a StructField> {
+) -> KernelResult<&'a StructField> {
     iter.next()
-        .ok_or_else(|| Error::Generic("Transform: ran out of output schema fields".into()))
+        .ok_or_else(|| KernelError::Generic("Transform: ran out of output schema fields".into()))
 }
 
 /// Prepend computed fields, then walk input fields applying per-field
@@ -123,7 +123,7 @@ pub(super) fn translate_transform(
     t: &ExpressionStructPatch,
     output_struct: &StructType,
     input_schema: &StructType,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     let (root_expr, input_fields): (Option<Expr>, Vec<&StructField>) = match &t.input_path {
         Some(path) => (
             Some(column_path_to_expr(path)),
@@ -138,7 +138,7 @@ pub(super) fn translate_transform(
 
     let entries = walk_transform_slots(t, output_struct, &input_fields)?
         .into_iter()
-        .map(|slot| -> DeltaResult<Expr> {
+        .map(|slot| -> KernelResult<Expr> {
             let (raw, output) = match slot {
                 TransformSlot::Passthrough { input_idx, output } => {
                     (lookup_input(input_fields[input_idx].name.as_str()), output)
@@ -150,7 +150,7 @@ pub(super) fn translate_transform(
             };
             Ok(raw.alias(PlSmallStr::from_str(output.name.as_str())))
         })
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect::<KernelResult<Vec<_>>>()?;
     let rebuilt = as_struct_checked(entries, "StructPatch")?;
     // A nested patch rewrites a struct-typed column; `as_struct` alone would
     // make every row valid, and plan filters (`add IS NOT NULL`) select rows
@@ -161,18 +161,21 @@ pub(super) fn translate_transform(
     })
 }
 
-fn descend_struct_path<'a>(root: &'a StructType, path: &ColumnName) -> DeltaResult<&'a StructType> {
+fn descend_struct_path<'a>(
+    root: &'a StructType,
+    path: &ColumnName,
+) -> KernelResult<&'a StructType> {
     let mut current = root;
     for segment in path.iter() {
         let field = current.field(segment).ok_or_else(|| {
-            Error::Generic(format!(
+            KernelError::Generic(format!(
                 "Transform: input_path segment '{segment}' not found in input schema"
             ))
         })?;
         match &field.data_type {
             KernelDataType::Struct(inner) => current = inner,
             other => {
-                return Err(Error::Generic(format!(
+                return Err(KernelError::Generic(format!(
                     "Transform: input_path segment '{segment}' is {other:?}, not a struct"
                 )));
             }
