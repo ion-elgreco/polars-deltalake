@@ -4,13 +4,15 @@
 //! every read goes through. `parse_json` stays polars code: kernel's
 //! plan-based handler parses with arrow.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use delta_kernel::engine_data::{EngineData, FilteredEngineData};
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
-use delta_kernel::schema::SchemaRef;
+use delta_kernel::schema::{ColumnMetadataKey, SchemaRef, StructField};
+use delta_kernel::transforms::{SchemaTransform, transform_output_type};
 use delta_kernel::{
     FileDataReadResultIterator, FileMeta, FileSize, FileSlice, JsonHandler, KernelError,
     KernelResult, KernelResultIterator, KernelResultIteratorStatic, ParquetFooter, ParquetHandler,
@@ -146,6 +148,34 @@ impl PlanBasedParquetHandler {
     }
 }
 
+/// Drops `parquet.field.id` at every depth. The handler contract resolves
+/// such a field by ID, which the executor's scan refuses; this handler has
+/// always matched by name instead, and every column-mapped table we read
+/// stores the physical names in its files.
+struct DropFieldIds;
+
+impl<'a> SchemaTransform<'a> for DropFieldIds {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+        let key = ColumnMetadataKey::ParquetFieldId.as_ref();
+        let data_type = self.transform(&field.data_type);
+        if !field.metadata.contains_key(key) && matches!(data_type, Cow::Borrowed(_)) {
+            return Cow::Borrowed(field);
+        }
+        Cow::Owned(
+            StructField::new(field.name.clone(), data_type.into_owned(), field.nullable)
+                .with_metadata(
+                    field
+                        .metadata
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != key)
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                ),
+        )
+    }
+}
+
 impl ParquetHandler for PlanBasedParquetHandler {
     /// The predicate is dropped, as in kernel's own plan-based handler; the
     /// one caller this engine serves (CDF) passes `None`.
@@ -155,12 +185,13 @@ impl ParquetHandler for PlanBasedParquetHandler {
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
     ) -> KernelResult<FileDataReadResultIterator> {
-        scan_per_file(
-            self.executor.clone(),
-            files,
-            physical_schema,
-            |files, schema| PlanBuilder::scan_parquet(files, &[], schema),
-        )
+        let schema = match DropFieldIds.transform_struct(physical_schema.as_ref()) {
+            Cow::Borrowed(_) => physical_schema,
+            Cow::Owned(stripped) => Arc::new(stripped),
+        };
+        scan_per_file(self.executor.clone(), files, schema, |files, schema| {
+            PlanBuilder::scan_parquet(files, &[], schema)
+        })
     }
 
     fn write_parquet_file(
@@ -260,6 +291,38 @@ mod parquet_handler_tests {
             files[0].location.as_str(),
             "the path column carries the file URL"
         );
+    }
+
+    /// A column-mapped table's physical schema carries `parquet.field.id`;
+    /// the handler matches by physical name, as it did before it ran on
+    /// plans (kernel's CDF reads hit this — Spark suite, PR #31).
+    #[test]
+    fn field_ids_are_matched_by_name() {
+        use delta_kernel::schema::MetadataValue;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut df = polars::df!("col-abc" => [1i64, 2, 3]).unwrap();
+        ParquetWriter::new(std::fs::File::create(dir.path().join("a.parquet")).unwrap())
+            .finish(&mut df)
+            .unwrap();
+        let base = Url::from_directory_path(dir.path()).unwrap();
+
+        let schema = Arc::new(
+            StructType::try_new([StructField::nullable("col-abc", DataType::LONG)
+                .with_metadata([("parquet.field.id", MetadataValue::Number(5))])])
+            .unwrap(),
+        );
+        let files = vec![file_meta(&base, dir.path(), "a.parquet")];
+        let batches = read(&base, &files, schema);
+        let xs: Vec<i64> = frame(batches[0].as_ref())
+            .column("col-abc")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+        assert_eq!(xs, vec![1, 2, 3]);
     }
 
     /// A schema with no fields at all (CDF projecting only its own metadata
