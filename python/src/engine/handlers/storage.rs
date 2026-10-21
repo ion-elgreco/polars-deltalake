@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use delta_kernel::{FileMeta, FileSlice, KernelError, KernelResult, StorageHandler};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use tokio::runtime::Runtime;
@@ -23,18 +23,14 @@ pub(crate) struct ObjectStoreStorageHandler {
 }
 
 impl ObjectStoreStorageHandler {
-    pub(crate) fn base_url(&self) -> &Url {
-        &self.base_url
-    }
-
     pub(crate) fn new(
         table_url: &Url,
         storage_options: impl IntoIterator<Item = (String, String)>,
         rt: &'static Runtime,
-    ) -> DeltaResult<Self> {
+    ) -> KernelResult<Self> {
         let (store, _path) =
             object_store::parse_url_opts(table_url, storage_options).map_err(|e| {
-                Error::Generic(format!("failed to build object store for {table_url}: {e}"))
+                KernelError::Generic(format!("failed to build object store for {table_url}: {e}"))
             })?;
         Ok(Self {
             store: Arc::from(store),
@@ -43,9 +39,9 @@ impl ObjectStoreStorageHandler {
         })
     }
 
-    fn url_to_path(&self, url: &Url) -> DeltaResult<Path> {
+    fn url_to_path(&self, url: &Url) -> KernelResult<Path> {
         if url.scheme() != self.base_url.scheme() {
-            return Err(Error::Generic(format!(
+            return Err(KernelError::Generic(format!(
                 "url scheme mismatch: store={} url={}",
                 self.base_url.scheme(),
                 url.scheme()
@@ -57,16 +53,16 @@ impl ObjectStoreStorageHandler {
             // `Path::from_absolute_path` (which strips the leading prefix).
             let file_path = url
                 .to_file_path()
-                .map_err(|_| Error::Generic(format!("invalid file URL: {url}")))?;
+                .map_err(|_| KernelError::Generic(format!("invalid file URL: {url}")))?;
             Path::from_absolute_path(file_path)
-                .map_err(|e| Error::Generic(format!("invalid file path: {e}")))
+                .map_err(|e| KernelError::Generic(format!("invalid file path: {e}")))
         } else {
             // Percent-decode before handing to object_store: kernel emits
             // URLs with doubly-encoded Hive partition prefixes (see kernel's
             // `WriteContext` docs), so `Path::from(url.path())` would keep
             // them literal and break interop with every other Delta writer.
             Path::from_url_path(url.path()).map_err(|e| {
-                Error::Generic(format!("invalid object store path {}: {e}", url.path()))
+                KernelError::Generic(format!("invalid object store path {}: {e}", url.path()))
             })
         }
     }
@@ -76,7 +72,7 @@ impl StorageHandler for ObjectStoreStorageHandler {
     fn list_from(
         &self,
         path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    ) -> KernelResult<Box<dyn Iterator<Item = KernelResult<FileMeta>> + Send>> {
         let offset = self.url_to_path(path)?;
         // Kernel pattern: the offset is the list-after marker; the prefix is
         // the scope. For a directory URL (trailing `/`) those are the same,
@@ -87,7 +83,7 @@ impl StorageHandler for ObjectStoreStorageHandler {
         } else {
             let mut parts: Vec<_> = offset.parts().collect();
             if parts.pop().is_none() {
-                return Err(Error::Generic(format!(
+                return Err(KernelError::Generic(format!(
                     "offset path must not be a root directory: '{path}'"
                 )));
             }
@@ -100,7 +96,7 @@ impl StorageHandler for ObjectStoreStorageHandler {
                 .list_with_offset(Some(&prefix), &offset)
                 .try_collect()
                 .await
-                .map_err(|e| Error::Generic(format!("object_store list failed: {e}")))
+                .map_err(|e| KernelError::Generic(format!("object_store list failed: {e}")))
         })?;
 
         // Cloud `list` is lexicographically ordered on real GCS/S3/Azure, so
@@ -128,14 +124,14 @@ impl StorageHandler for ObjectStoreStorageHandler {
     fn read_files(
         &self,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    ) -> KernelResult<Box<dyn Iterator<Item = KernelResult<Bytes>> + Send>> {
         // Resolve targets up front so URL-to-Path failures surface
         // synchronously. Presigned URLs (Databricks / R2 / SigV4
         // query-string auth) bypass object_store entirely and are fetched
         // via reqwest — the SAS / signature lives in the URL itself.
         let resolved: Vec<(ReadTarget, Option<std::ops::Range<u64>>)> = files
             .into_iter()
-            .map(|(url, range)| -> DeltaResult<_> {
+            .map(|(url, range)| -> KernelResult<_> {
                 let target = if is_presigned(&url) {
                     ReadTarget::Presigned(url)
                 } else {
@@ -143,10 +139,10 @@ impl StorageHandler for ObjectStoreStorageHandler {
                 };
                 Ok((target, range))
             })
-            .collect::<DeltaResult<_>>()?;
+            .collect::<KernelResult<_>>()?;
 
         let store = self.store.clone();
-        let payloads: Vec<DeltaResult<Bytes>> = self.rt.block_on(async move {
+        let payloads: Vec<KernelResult<Bytes>> = self.rt.block_on(async move {
             stream::iter(resolved)
                 .map(move |(target, range)| {
                     let store = store.clone();
@@ -159,7 +155,9 @@ impl StorageHandler for ObjectStoreStorageHandler {
                                     .map_err(|e| map_get_err(&path, e)),
                                 None => match store.get(&path).await {
                                     Ok(g) => g.bytes().await.map_err(|e| {
-                                        Error::Generic(format!("object_store bytes failed: {e}"))
+                                        KernelError::Generic(format!(
+                                            "object_store bytes failed: {e}"
+                                        ))
                                     }),
                                     Err(e) => Err(map_get_err(&path, e)),
                                 },
@@ -176,7 +174,7 @@ impl StorageHandler for ObjectStoreStorageHandler {
         Ok(Box::new(payloads.into_iter()))
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
         let src_path = self.url_to_path(src)?;
         let dest_path = self.url_to_path(dest)?;
         let store = self.store.clone();
@@ -186,41 +184,41 @@ impl StorageHandler for ObjectStoreStorageHandler {
                 .await
                 .map_err(|e| match e {
                     object_store::Error::AlreadyExists { .. } => {
-                        Error::FileAlreadyExists(dest_path.to_string())
+                        KernelError::FileAlreadyExists(dest_path.to_string())
                     }
-                    other => {
-                        Error::Generic(format!("object_store copy_if_not_exists failed: {other}"))
-                    }
+                    other => KernelError::Generic(format!(
+                        "object_store copy_if_not_exists failed: {other}"
+                    )),
                 })
         })
     }
 
-    fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> DeltaResult<()> {
-        Err(Error::Unsupported(
+    fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> KernelResult<()> {
+        Err(KernelError::Unsupported(
             "polars-deltalake is read-only; write support is not yet implemented".into(),
         ))
     }
 
-    fn delete(&self, path: &Url) -> DeltaResult<()> {
+    fn delete(&self, path: &Url) -> KernelResult<()> {
         let p = self.url_to_path(path)?;
         let store = self.store.clone();
         self.rt.block_on(async move {
             match store.delete(&p).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-                Err(other) => Err(Error::Generic(format!(
+                Err(other) => Err(KernelError::Generic(format!(
                     "object_store delete failed: {other}"
                 ))),
             }
         })
     }
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &Url) -> KernelResult<FileMeta> {
         let p = self.url_to_path(path)?;
         let store = self.store.clone();
         let meta = self.rt.block_on(async move {
             store.head(&p).await.map_err(|e| match e {
-                object_store::Error::NotFound { .. } => Error::FileNotFound(p.to_string()),
-                other => Error::Generic(format!("object_store head failed: {other}")),
+                object_store::Error::NotFound { .. } => KernelError::FileNotFound(p.to_string()),
+                other => KernelError::Generic(format!("object_store head failed: {other}")),
             })
         })?;
 
@@ -235,10 +233,10 @@ impl StorageHandler for ObjectStoreStorageHandler {
 /// Map object_store read errors onto kernel errors. NotFound is special-cased
 /// so the kernel's "is `_last_checkpoint` present?" / commit-conflict checks
 /// see the right variant instead of a generic catch-all.
-fn map_get_err(path: &Path, e: object_store::Error) -> Error {
+fn map_get_err(path: &Path, e: object_store::Error) -> KernelError {
     match e {
-        object_store::Error::NotFound { .. } => Error::FileNotFound(path.to_string()),
-        other => Error::Generic(format!("object_store get failed for {path}: {other}")),
+        object_store::Error::NotFound { .. } => KernelError::FileNotFound(path.to_string()),
+        other => KernelError::Generic(format!("object_store get failed for {path}: {other}")),
     }
 }
 
@@ -273,7 +271,7 @@ fn is_presigned(url: &Url) -> bool {
 /// Fetch a presigned URL via reqwest. Range requests are forwarded as
 /// `Range: bytes=start-end` so the parquet-footer suffix path stays cheap
 /// when the kernel hands us presigned parquet URLs.
-async fn fetch_presigned(url: Url, range: Option<std::ops::Range<u64>>) -> DeltaResult<Bytes> {
+async fn fetch_presigned(url: Url, range: Option<std::ops::Range<u64>>) -> KernelResult<Bytes> {
     let mut req = reqwest::Client::new().get(url.clone());
     if let Some(r) = range {
         // HTTP byte ranges are inclusive on both ends; kernel `Range<u64>` is
@@ -286,16 +284,16 @@ async fn fetch_presigned(url: Url, range: Option<std::ops::Range<u64>>) -> Delta
     let resp = req
         .send()
         .await
-        .map_err(|e| Error::Generic(format!("presigned GET failed for {url}: {e}")))?;
+        .map_err(|e| KernelError::Generic(format!("presigned GET failed for {url}: {e}")))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(Error::FileNotFound(url.to_string()));
+        return Err(KernelError::FileNotFound(url.to_string()));
     }
     let resp = resp
         .error_for_status()
-        .map_err(|e| Error::Generic(format!("presigned GET {url} returned {e}")))?;
+        .map_err(|e| KernelError::Generic(format!("presigned GET {url} returned {e}")))?;
     resp.bytes()
         .await
-        .map_err(|e| Error::Generic(format!("presigned body read failed for {url}: {e}")))
+        .map_err(|e| KernelError::Generic(format!("presigned body read failed for {url}: {e}")))
 }
 
 /// Kernel-aligned: `true` iff `object_store::list` is guaranteed to return

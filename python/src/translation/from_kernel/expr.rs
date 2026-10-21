@@ -9,9 +9,9 @@ use delta_kernel::expressions::{
     UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, SchemaRef, StructType};
-use delta_kernel::transform_output_type;
 use delta_kernel::transforms::SchemaTransform;
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::transforms::transform_output_type;
+use delta_kernel::{KernelError, KernelResult};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{
     Column, DataType as PlDataType, Expr, Field, IntoSeries, LiteralValue, NamedFrom, Schema,
@@ -38,7 +38,7 @@ pub(crate) fn translate_expr(
     expr: &Expression,
     output_type: Option<&KernelDataType>,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     match expr {
         Expression::Literal(scalar) => Ok(scalar_to_lit(scalar)),
         Expression::Column(name) => Ok(column_path_to_expr(name)),
@@ -50,13 +50,13 @@ pub(crate) fn translate_expr(
             let target = match output_type {
                 Some(KernelDataType::Struct(s)) => s,
                 _ => {
-                    return Err(Error::Generic(
+                    return Err(KernelError::Generic(
                         "translate_expr: StructPatch requires a struct output_type".into(),
                     ));
                 }
             };
             let schema = input_schema.ok_or_else(|| {
-                Error::Generic(
+                KernelError::Generic(
                     "translate_expr: StructPatch requires an input_schema (nested-patch path)"
                         .into(),
                 )
@@ -71,10 +71,10 @@ pub(crate) fn translate_expr(
         Expression::Unary(u) => translate_unary_expr(u, input_schema),
         Expression::Binary(b) => translate_binary_expr(b, input_schema),
         Expression::Variadic(v) => translate_variadic_expr(v, input_schema),
-        Expression::Opaque(_) => Err(Error::Unsupported(
+        Expression::Opaque(_) => Err(KernelError::Unsupported(
             "translate_expr: Opaque expressions are not implemented".into(),
         )),
-        Expression::Unknown(s) => Err(Error::Unsupported(format!(
+        Expression::Unknown(s) => Err(KernelError::Unsupported(format!(
             "translate_expr: Unknown expression {s}"
         ))),
         Expression::ParseJson(p) => {
@@ -313,19 +313,27 @@ fn translate_map_to_struct(
     m: &delta_kernel::expressions::MapToStructExpression,
     output_type: Option<&KernelDataType>,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     let target = match output_type {
         Some(KernelDataType::Struct(s)) => s,
         _ => {
-            return Err(Error::Generic(
+            return Err(KernelError::Generic(
                 "translate_expr: MapToStruct requires a struct output_type".into(),
             ));
         }
     };
+    // `parse_scalar` reads offset-less timestamps as UTC and has no timezone
+    // parameter; kernel's own plans never set one yet.
+    if !m.options.is_default() {
+        return Err(KernelError::Unsupported(format!(
+            "MapToStruct: timestamp_timezone {:?} is not supported",
+            m.options.timestamp_timezone()
+        )));
+    }
     let map_expr = translate_expr(&m.map_expr, None, input_schema)?;
     let children: Vec<Expr> = target
         .fields()
-        .map(|f| -> DeltaResult<Expr> {
+        .map(|f| -> KernelResult<Expr> {
             let key_match = polars::prelude::Expr::Element
                 .struct_()
                 .field_by_name(MAP_KEY_FIELD)
@@ -344,7 +352,7 @@ fn translate_map_to_struct(
             Ok(parse_partition_string(raw, &f.data_type)?
                 .alias(PlSmallStr::from_str(f.name.as_str())))
         })
-        .collect::<DeltaResult<_>>()?;
+        .collect::<KernelResult<_>>()?;
     // The arrow reference propagates the map's outer null buffer: a NULL
     // map row is a NULL struct row, not a valid struct of nulls.
     Ok(null_gated(
@@ -369,9 +377,9 @@ fn to_pl_err(e: impl std::fmt::Display) -> polars::prelude::PolarsError {
 /// The empty string is the contract's one exception and never reaches
 /// `parse_scalar`: it stays itself for string, becomes empty bytes for binary
 /// and null for every other type.
-fn parse_partition_string(raw: Expr, target: &KernelDataType) -> DeltaResult<Expr> {
+fn parse_partition_string(raw: Expr, target: &KernelDataType) -> KernelResult<Expr> {
     let KernelDataType::Primitive(prim) = target else {
-        return Err(Error::Generic(format!(
+        return Err(KernelError::Generic(format!(
             "MapToStruct: partition column of type {target:?} is not a primitive"
         )));
     };
@@ -440,7 +448,7 @@ fn translate_struct(
     nullability: Option<&Expression>,
     output_type: Option<&KernelDataType>,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     let names_and_types: Vec<(Option<PlSmallStr>, Option<&KernelDataType>)> = match output_type {
         Some(KernelDataType::Struct(s)) => s
             .fields()
@@ -454,7 +462,7 @@ fn translate_struct(
         _ => children.iter().map(|_| (None, None)).collect(),
     };
     if names_and_types.len() != children.len() {
-        return Err(Error::Generic(format!(
+        return Err(KernelError::Generic(format!(
             "translate_struct: struct child count {} != schema field count {}",
             children.len(),
             names_and_types.len()
@@ -470,7 +478,7 @@ fn translate_struct(
                 None => inner,
             })
         })
-        .collect::<DeltaResult<_>>()?;
+        .collect::<KernelResult<_>>()?;
     let built = as_struct_checked(child_exprs, "translate_struct")?;
     match nullability {
         Some(pred) => Ok(null_gated(translate_expr(pred, None, input_schema)?, built)),
@@ -480,9 +488,9 @@ fn translate_struct(
 
 /// Kernel permits a zero-field struct; polars' `as_struct` `assert!`s on an
 /// empty expression list, and a panic here unwinds into pyo3.
-pub(crate) fn as_struct_checked(children: Vec<Expr>, context: &str) -> DeltaResult<Expr> {
+pub(crate) fn as_struct_checked(children: Vec<Expr>, context: &str) -> KernelResult<Expr> {
     if children.is_empty() {
-        return Err(Error::Unsupported(format!(
+        return Err(KernelError::Unsupported(format!(
             "{context}: a struct with no fields has no polars representation"
         )));
     }
@@ -492,7 +500,7 @@ pub(crate) fn as_struct_checked(children: Vec<Expr>, context: &str) -> DeltaResu
 fn translate_unary_expr(
     u: &UnaryExpression,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     let inner = translate_expr(&u.expr, None, input_schema)?;
     match u.op {
         UnaryExpressionOp::ToJson => Ok(inner.struct_().json_encode()),
@@ -502,7 +510,7 @@ fn translate_unary_expr(
 fn translate_binary_expr(
     b: &BinaryExpression,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     let lhs = translate_expr(&b.left, None, input_schema)?;
     let rhs = translate_expr(&b.right, None, input_schema)?;
     match b.op {
@@ -513,7 +521,7 @@ fn translate_binary_expr(
         // keeps the operand dtype like kernel's `div` — but a zero divisor
         // yields NULL where kernel fails the query. Kernel emits no Divide
         // today, so refuse rather than diverge silently on that.
-        BinaryExpressionOp::Divide => Err(Error::Unsupported(
+        BinaryExpressionOp::Divide => Err(KernelError::Unsupported(
             "translate_expr: Divide yields NULL on a zero divisor where kernel fails".into(),
         )),
     }
@@ -522,17 +530,17 @@ fn translate_binary_expr(
 fn translate_variadic_expr(
     v: &VariadicExpression,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     let children: Vec<Expr> = v
         .exprs
         .iter()
         .map(|e| translate_expr(e, None, input_schema))
-        .collect::<DeltaResult<_>>()?;
+        .collect::<KernelResult<_>>()?;
     match v.op {
         VariadicExpressionOp::Coalesce => Ok(coalesce(&children)),
         VariadicExpressionOp::Array => {
             if children.is_empty() {
-                return Err(Error::Unsupported(
+                return Err(KernelError::Unsupported(
                     "translate_expr: Array expression with no elements".into(),
                 ));
             }
@@ -540,7 +548,7 @@ fn translate_variadic_expr(
             // ARRAY makes each input a single element. Refuse the statically
             // detectable list inputs instead of building the wrong shape.
             if v.exprs.iter().any(|e| is_statically_list(e, input_schema)) {
-                return Err(Error::Unsupported(
+                return Err(KernelError::Unsupported(
                     "translate_expr: ARRAY over a list-typed input is not implemented".into(),
                 ));
             }
@@ -666,6 +674,7 @@ mod map_to_struct_tests {
     fn map_to_struct_p() -> (Expression, KernelDataType) {
         let expr = Expression::MapToStruct(MapToStructExpression {
             map_expr: Box::new(Expression::from(ColumnName::new(["m"]))),
+            options: Default::default(),
         });
         let output_type = KernelDataType::Struct(Box::new(
             StructType::try_new([StructField::nullable("p", KernelDataType::STRING)]).unwrap(),
@@ -1076,7 +1085,7 @@ mod arithmetic_tests {
     #[test]
     fn divide_declines() {
         match translate_binary_expr(&binary(BinaryExpressionOp::Divide), None) {
-            Err(Error::Unsupported(msg)) => assert!(msg.contains("Divide"), "{msg}"),
+            Err(KernelError::Unsupported(msg)) => assert!(msg.contains("Divide"), "{msg}"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }

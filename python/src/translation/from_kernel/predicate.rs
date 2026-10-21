@@ -8,7 +8,7 @@ use delta_kernel::expressions::{
     UnaryPredicate, UnaryPredicateOp,
 };
 use delta_kernel::schema::StructType;
-use delta_kernel::{DeltaResult, Error, PredicateEvaluator};
+use delta_kernel::{KernelError, KernelResult, PredicateEvaluator};
 use polars::prelude::{Expr, IntoLazy, lit};
 use polars_utils::pl_str::PlSmallStr;
 
@@ -24,7 +24,7 @@ pub(super) struct PolarsPredicateEvaluator {
 }
 
 impl PredicateEvaluator for PolarsPredicateEvaluator {
-    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+    fn evaluate(&self, batch: &dyn EngineData) -> KernelResult<Box<dyn EngineData>> {
         let df = downcast_engine_data(batch)?.dataframe().clone();
         // Per kernel contract the result is a single nullable boolean column
         // named "output", one value per input row.
@@ -44,17 +44,17 @@ impl PredicateEvaluator for PolarsPredicateEvaluator {
 pub(crate) fn translate_predicate(
     pred: &Predicate,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     match pred {
         Predicate::BooleanExpression(e) => translate_expr(e, None, input_schema),
         Predicate::Not(inner) => Ok(translate_predicate(inner, input_schema)?.not()),
         Predicate::Unary(u) => translate_unary_predicate(u, input_schema),
         Predicate::Binary(b) => translate_binary_predicate(b, input_schema),
         Predicate::Junction(j) => translate_junction_predicate(j, input_schema),
-        Predicate::Opaque(_) => Err(Error::Unsupported(
+        Predicate::Opaque(_) => Err(KernelError::Unsupported(
             "translate_predicate: Opaque predicates are not implemented".into(),
         )),
-        Predicate::Unknown(s) => Err(Error::Unsupported(format!(
+        Predicate::Unknown(s) => Err(KernelError::Unsupported(format!(
             "translate_predicate: Unknown predicate {s}"
         ))),
     }
@@ -63,7 +63,7 @@ pub(crate) fn translate_predicate(
 fn translate_unary_predicate(
     u: &UnaryPredicate,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     let inner = translate_expr(&u.expr, None, input_schema)?;
     Ok(match u.op {
         UnaryPredicateOp::IsNull => inner.is_null(),
@@ -73,7 +73,7 @@ fn translate_unary_predicate(
 fn translate_binary_predicate(
     b: &BinaryPredicate,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     let lhs = translate_expr(&b.left, None, input_schema)?;
     let rhs = translate_expr(&b.right, None, input_schema)?;
     Ok(match b.op {
@@ -90,7 +90,7 @@ fn translate_binary_predicate(
 fn translate_junction_predicate(
     j: &JunctionPredicate,
     input_schema: Option<&StructType>,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     if j.preds.is_empty() {
         // Empty junction → identity element: AND() = TRUE (vacuously true),
         // OR() = FALSE (vacuously false). Matches kernel's own evaluator

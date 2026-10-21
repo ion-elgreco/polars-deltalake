@@ -1,18 +1,14 @@
-//! `delta_kernel::JsonHandler` over polars-io NDJSON. Map fields appear on
-//! the wire as JSON objects but our internal encoding is
-//! `List<Struct<{key, value}>>`; we let polars infer freely and reshape via
-//! `align` on read.
+//! `JsonHandler::parse_json` and the NDJSON parse / align helpers behind the
+//! plan executor's `ScanJson`. Map fields appear on the wire as JSON objects
+//! but our internal encoding is `List<Struct<{key, value}>>`; we let polars
+//! infer freely and reshape via `align` on read.
 
 use std::io::Cursor;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use delta_kernel::engine_data::EngineData;
-use delta_kernel::expressions::PredicateRef;
 use delta_kernel::schema::{DataType as KernelDataType, MapType, SchemaRef, StructField};
-use delta_kernel::{
-    DeltaResult, Error, FileDataReadResultIterator, FileMeta, JsonHandler, StorageHandler,
-};
+use delta_kernel::{KernelError, KernelResult};
 use polars::io::SerReader;
 use polars::io::json::{JsonFormat, JsonReader};
 use polars::prelude::as_struct as polars_as_struct;
@@ -21,133 +17,56 @@ use polars::prelude::{
     PolarsError, Schema as PlSchema, col, concat_list, lit,
 };
 use polars_utils::pl_str::PlSmallStr;
-use url::Url;
 
 use crate::consts::{MAP_KEY_FIELD, MAP_VALUE_FIELD};
-use crate::engine::log_cache::{LogFileCache, ParsedLog};
+use crate::engine::log_cache::ParsedLog;
 use crate::engine::{PolarsEngineData, select_anchored};
 use crate::errors::to_kernel_err;
 use crate::translation::from_kernel::{as_struct_checked, empty_typed_list_expr, null_gated};
 use crate::translation::schema::{KernelDataTypeExt, KernelSchemaExt};
 
-use super::storage::ObjectStoreStorageHandler;
-
-pub(crate) struct PolarsJsonHandler {
-    storage: Arc<ObjectStoreStorageHandler>,
+/// `JsonHandler::parse_json`: every input string parsed as one NDJSON line
+/// and aligned to `output_schema`.
+pub(crate) fn parse_json_strings(
+    json_strings: Box<dyn EngineData>,
+    output_schema: SchemaRef,
+) -> KernelResult<Box<dyn EngineData>> {
+    let row_count = json_strings.len();
+    let lines = extract_json_strings(json_strings.as_ref())?;
+    if lines.len() != row_count {
+        return Err(KernelError::Generic(format!(
+            "parse_json: expected {row_count} rows, got {} strings",
+            lines.len()
+        )));
+    }
+    let mut blob = String::with_capacity(lines.iter().map(|s| s.len() + 1).sum());
+    for line in &lines {
+        // One document may span lines (pretty-printed stats). JSON forbids
+        // raw control characters inside string literals, so a raw newline
+        // can only be inter-token whitespace — replacing it keeps the value
+        // and keeps the NDJSON framing one-per-line.
+        if line.contains(['\n', '\r']) {
+            blob.push_str(&line.replace(['\n', '\r'], " "));
+        } else {
+            blob.push_str(line);
+        }
+        blob.push('\n');
+    }
+    let df = parse_ndjson_inferred(blob.as_bytes())?;
+    let aligned = align_lazy(df, output_schema.as_ref())?
+        .collect()
+        .map_err(to_kernel_err)?;
+    // Contract: N input rows produce N output rows.
+    if aligned.height() != row_count {
+        return Err(KernelError::Generic(format!(
+            "parse_json: {row_count} input rows produced {} output rows",
+            aligned.height()
+        )));
+    }
+    Ok(Box::new(PolarsEngineData::new(aligned)))
 }
 
-impl PolarsJsonHandler {
-    pub(crate) fn new(storage: Arc<ObjectStoreStorageHandler>) -> Self {
-        Self { storage }
-    }
-}
-
-impl JsonHandler for PolarsJsonHandler {
-    fn parse_json(
-        &self,
-        json_strings: Box<dyn EngineData>,
-        output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        let row_count = json_strings.len();
-        let lines = extract_json_strings(json_strings.as_ref())?;
-        if lines.len() != row_count {
-            return Err(Error::Generic(format!(
-                "parse_json: expected {row_count} rows, got {} strings",
-                lines.len()
-            )));
-        }
-        let mut blob = String::with_capacity(lines.iter().map(|s| s.len() + 1).sum());
-        for line in &lines {
-            // One document may span lines (pretty-printed stats). JSON
-            // forbids raw control characters inside string literals, so a
-            // raw newline can only be inter-token whitespace — replacing it
-            // keeps the value and keeps the NDJSON framing one-per-line.
-            if line.contains(['\n', '\r']) {
-                blob.push_str(&line.replace(['\n', '\r'], " "));
-            } else {
-                blob.push_str(line);
-            }
-            blob.push('\n');
-        }
-        let df = parse_ndjson_inferred(blob.as_bytes())?;
-        let aligned = align_lazy(df, output_schema.as_ref())?
-            .collect()
-            .map_err(to_kernel_err)?;
-        // Contract: N input rows produce N output rows.
-        if aligned.height() != row_count {
-            return Err(Error::Generic(format!(
-                "parse_json: {row_count} input rows produced {} output rows",
-                aligned.height()
-            )));
-        }
-        Ok(Box::new(PolarsEngineData::new(aligned)))
-    }
-
-    fn read_json_files(
-        &self,
-        files: &[FileMeta],
-        physical_schema: SchemaRef,
-        _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
-        // Cached parses skip the fetch. The misses are fetched eagerly
-        // (drops the borrow on `self`) and parsed lazily inside the returned
-        // iterator so kernel can stream commit replay.
-        let cache = LogFileCache::global();
-        let cached: Vec<Option<Arc<ParsedLog>>> = files.iter().map(|f| cache.get(&[f])).collect();
-        let slices = files
-            .iter()
-            .zip(&cached)
-            .filter(|(_, hit)| hit.is_none())
-            .map(|(f, _)| (f.location.clone(), None))
-            .collect::<Vec<_>>();
-        let payloads: Vec<bytes::Bytes> = self
-            .storage
-            .read_files(slices)?
-            .collect::<DeltaResult<_>>()?;
-        let mut payloads = payloads.into_iter();
-        let metas: Vec<FileMeta> = files.to_vec();
-        let schema: SchemaRef = physical_schema;
-
-        let iter = metas.into_iter().zip(cached).map(
-            move |(meta, hit)| -> DeltaResult<Box<dyn EngineData>> {
-                let df = match hit {
-                    Some(df) => df,
-                    None => {
-                        let bytes = payloads.next().ok_or_else(|| {
-                            Error::Generic(format!(
-                                "read_files returned no payload for {}",
-                                meta.location
-                            ))
-                        })?;
-                        cache.insert(&[&meta], ParsedLog::single(parse_ndjson_inferred(&bytes)?))
-                    }
-                };
-                let aligned = align_lazy(DataFrame::clone(&df.df), schema.as_ref())?
-                    .collect()
-                    .map_err(to_kernel_err)?;
-                Ok(Box::new(PolarsEngineData::new(aligned)))
-            },
-        );
-        Ok(Box::new(iter))
-    }
-
-    fn write_json_file(
-        &self,
-        _path: &Url,
-        _data: Box<
-            dyn Iterator<Item = DeltaResult<delta_kernel::engine_data::FilteredEngineData>>
-                + Send
-                + '_,
-        >,
-        _overwrite: bool,
-    ) -> DeltaResult<delta_kernel::FileSize> {
-        Err(Error::Unsupported(
-            "polars-deltalake is read-only; write support is not yet implemented".into(),
-        ))
-    }
-}
-
-pub(crate) fn parse_ndjson_inferred(bytes: &[u8]) -> DeltaResult<DataFrame> {
+pub(crate) fn parse_ndjson_inferred(bytes: &[u8]) -> KernelResult<DataFrame> {
     // polars raises a type-inference error on a reader with no JSON value;
     // a zero-byte or blank commit file is an empty batch, not a failure.
     if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -165,7 +84,7 @@ pub(crate) fn parse_ndjson_inferred(bytes: &[u8]) -> DeltaResult<DataFrame> {
 /// Parse commit files as one NDJSON document, in order. Each file's row
 /// count is its number of non-blank lines, which polars parses one row
 /// each.
-pub(crate) fn parse_commit_files(payloads: &[bytes::Bytes]) -> DeltaResult<ParsedLog> {
+pub(crate) fn parse_commit_files(payloads: &[bytes::Bytes]) -> KernelResult<ParsedLog> {
     let mut joined = Vec::with_capacity(payloads.iter().map(|b| b.len() + 1).sum());
     let mut rows_per_file = Vec::with_capacity(payloads.len());
     for bytes in payloads {
@@ -181,7 +100,7 @@ pub(crate) fn parse_commit_files(payloads: &[bytes::Bytes]) -> DeltaResult<Parse
     let df = parse_ndjson_inferred(&joined)?;
     let expected: usize = rows_per_file.iter().sum();
     if df.height() != expected {
-        return Err(Error::Generic(format!(
+        return Err(KernelError::Generic(format!(
             "commit files parsed to {} rows but hold {expected} lines",
             df.height()
         )));
@@ -197,7 +116,7 @@ pub(crate) fn parse_commit_files(payloads: &[bytes::Bytes]) -> DeltaResult<Parse
 pub(crate) fn align_lazy(
     df: DataFrame,
     kernel_schema: &delta_kernel::schema::StructType,
-) -> DeltaResult<LazyFrame> {
+) -> KernelResult<LazyFrame> {
     // A zero-byte commit parses to a 0-row frame, where every `align` expr is
     // a broadcast literal of length 1 — `require_present` would then read a
     // missing non-nullable column as a violated row that does not exist, and
@@ -213,7 +132,7 @@ pub(crate) fn align_lazy(
             align(col(field.name.as_str()), field, inferred, None, &field.name)
                 .map(|e| e.alias(PlSmallStr::from_str(field.name.as_str())))
         })
-        .collect::<DeltaResult<_>>()?;
+        .collect::<KernelResult<_>>()?;
 
     // The file may name none of the requested fields, or every one it does
     // name aligns to a literal (an empty inferred struct for a Map).
@@ -230,9 +149,9 @@ fn align(
     inferred: Option<&PlDataType>,
     gate: Option<&Expr>,
     path: &str,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     if let KernelDataType::Variant(_) = &field.data_type {
-        return Err(Error::Unsupported(format!(
+        return Err(KernelError::Unsupported(format!(
             "json align: Variant column {} is not supported",
             field.name
         )));
@@ -272,7 +191,7 @@ fn align(
                     )
                     .map(|e| e.alias(PlSmallStr::from_str(child.name.as_str())))
                 })
-                .collect::<DeltaResult<_>>()?;
+                .collect::<KernelResult<_>>()?;
             null_gated(presence, as_struct_checked(children, "json align")?)
         }
         // Primitives, Arrays, and any shape mismatch — let polars cast the
@@ -317,7 +236,7 @@ fn map_from_struct_expr(
     value_expr: Expr,
     fields: &[polars::prelude::Field],
     map_type: &MapType,
-) -> DeltaResult<Expr> {
+) -> KernelResult<Expr> {
     // The declared entry types, not String/String: `to_polars` promises
     // `List<Struct<key,value>>` in exactly these types, and a Map whose
     // value type is not String must not read back stringified.
@@ -364,7 +283,7 @@ fn map_from_struct_expr(
     ))
 }
 
-fn null_expr_for_kernel(kernel_dt: &KernelDataType) -> DeltaResult<Expr> {
+fn null_expr_for_kernel(kernel_dt: &KernelDataType) -> KernelResult<Expr> {
     let polars_dt = kernel_dt.to_polars().map_err(to_kernel_err)?;
     Ok(lit(polars::prelude::LiteralValue::untyped_null()).cast(polars_dt))
 }
@@ -372,16 +291,18 @@ fn null_expr_for_kernel(kernel_dt: &KernelDataType) -> DeltaResult<Expr> {
 /// The JsonHandler contract fixes the input to "a single column batch of
 /// string type" without naming the column, so read it positionally — the
 /// reference engine does the same (`json_strings.column(0)`).
-fn extract_json_strings(data: &dyn EngineData) -> DeltaResult<Vec<String>> {
+fn extract_json_strings(data: &dyn EngineData) -> KernelResult<Vec<String>> {
     let df = data
         .any_ref()
         .downcast_ref::<PolarsEngineData>()
         .ok_or_else(|| {
-            Error::Generic("parse_json received EngineData that is not PolarsEngineData".into())
+            KernelError::Generic(
+                "parse_json received EngineData that is not PolarsEngineData".into(),
+            )
         })?
         .dataframe();
     if df.width() != 1 {
-        return Err(Error::Generic(format!(
+        return Err(KernelError::Generic(format!(
             "parse_json: expected a single string column, got {} columns",
             df.width()
         )));
@@ -407,7 +328,7 @@ mod align_nullability_tests {
 
     use super::*;
 
-    fn aligned(lines: &str, schema: &StructType) -> DeltaResult<DataFrame> {
+    fn aligned(lines: &str, schema: &StructType) -> KernelResult<DataFrame> {
         let df = parse_ndjson_inferred(lines.as_bytes())?;
         align_lazy(df, schema)?.collect().map_err(to_kernel_err)
     }
@@ -670,19 +591,11 @@ mod json_string_tests {
     /// NDJSON re-parse must not split it.
     #[test]
     fn pretty_printed_document_parses() {
-        let url = Url::parse("file:///").unwrap();
-        let rt = crate::engine::rt();
-        let storage =
-            Arc::new(ObjectStoreStorageHandler::new(&url, std::iter::empty(), rt).unwrap());
-        let handler = PolarsJsonHandler::new(storage);
-
-        let schema = Arc::new(
+        let schema = std::sync::Arc::new(
             StructType::try_new([StructField::nullable("a", KernelDataType::LONG)]).unwrap(),
         );
         let df = polars::df!("json" => [Some("{\n  \"a\": 3\n}")]).unwrap();
-        let out = handler
-            .parse_json(Box::new(PolarsEngineData::new(df)), schema)
-            .unwrap();
+        let out = parse_json_strings(Box::new(PolarsEngineData::new(df)), schema).unwrap();
         let df = out
             .any_ref()
             .downcast_ref::<PolarsEngineData>()

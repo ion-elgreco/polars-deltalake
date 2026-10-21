@@ -18,7 +18,7 @@ use delta_kernel::plans::{Operation, PlanExecutor};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType as KernelDataType, MapType, StructField, StructType};
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
-use delta_kernel::{DeltaResult, Engine, FileMeta, StorageHandler};
+use delta_kernel::{Engine, FileMeta, KernelResult, StorageHandler};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{DataFrame, Expr, col};
 use polars_utils::pl_path::PlRefPath;
@@ -690,11 +690,11 @@ fn visit_add_rows(
             &mut self,
             row_count: usize,
             getters: &[&'a dyn GetData<'a>],
-        ) -> DeltaResult<()> {
+        ) -> KernelResult<()> {
             for i in 0..row_count {
                 let path: Option<&str> = getters[0].get_str(i, "add.path")?;
                 let Some(path) = path else {
-                    return Err(delta_kernel::Error::Generic(
+                    return Err(delta_kernel::KernelError::Generic(
                         "metadata plan emitted a null add.path".into(),
                     ));
                 };
@@ -703,7 +703,7 @@ fn visit_add_rows(
                 let partition_values = getters[1]
                     .get_map(i, "add.partitionValues")?
                     .ok_or_else(|| {
-                        delta_kernel::Error::Generic(
+                        delta_kernel::KernelError::Generic(
                             "metadata plan emitted a null add.partitionValues".into(),
                         )
                     })?
@@ -715,20 +715,20 @@ fn visit_add_rows(
                     Some(st) => {
                         let path_or_inline: &str =
                             getters[3].get_str(i, "pathOrInlineDv")?.ok_or_else(|| {
-                                delta_kernel::Error::Generic(
+                                delta_kernel::KernelError::Generic(
                                     "deletionVector.pathOrInlineDv is null".into(),
                                 )
                             })?;
                         let offset: Option<i32> = getters[4].get_int(i, "offset")?;
                         let size_in_bytes: i32 =
                             getters[5].get_int(i, "sizeInBytes")?.ok_or_else(|| {
-                                delta_kernel::Error::Generic(
+                                delta_kernel::KernelError::Generic(
                                     "deletionVector.sizeInBytes is null".into(),
                                 )
                             })?;
                         let cardinality: i64 =
                             getters[6].get_long(i, "cardinality")?.ok_or_else(|| {
-                                delta_kernel::Error::Generic(
+                                delta_kernel::KernelError::Generic(
                                     "deletionVector.cardinality is null".into(),
                                 )
                             })?;
@@ -743,10 +743,12 @@ fn visit_add_rows(
                 };
 
                 let size: i64 = getters[7].get_long(i, "add.size")?.ok_or_else(|| {
-                    delta_kernel::Error::Generic("metadata plan emitted a null add.size".into())
+                    delta_kernel::KernelError::Generic(
+                        "metadata plan emitted a null add.size".into(),
+                    )
                 })?;
                 let size = u64::try_from(size).map_err(|_| {
-                    delta_kernel::Error::Generic(format!("add.size {size} is negative"))
+                    delta_kernel::KernelError::Generic(format!("add.size {size} is negative"))
                 })?;
                 let modification_time = getters[8]
                     .get_long(i, "add.modificationTime")?

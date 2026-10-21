@@ -4,7 +4,7 @@
 
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, StructField};
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{KernelError, KernelResult};
 use polars::prelude::as_struct as polars_as_struct;
 use polars::prelude::{
     AnyValue, DataFrame, DataType as PlDataType, Expr, Int128Chunked, IntoColumn, IntoLazy,
@@ -148,7 +148,7 @@ pub(crate) fn build_series(
     name: &str,
     dtype: &KernelDataType,
     values: &[&Scalar],
-) -> DeltaResult<Series> {
+) -> KernelResult<Series> {
     use PrimitiveType::*;
 
     let name_pl = PlSmallStr::from_str(name);
@@ -378,7 +378,7 @@ pub(crate) fn build_series(
             let list_dt = PlDataType::List(Box::new(inner_dtype));
             let row_exprs: Vec<Expr> = values
                 .iter()
-                .map(|s| -> DeltaResult<Expr> {
+                .map(|s| -> KernelResult<Expr> {
                     match s {
                         Scalar::Array(arr_data) => {
                             let elements: Vec<&Scalar> = arr_data.array_elements().iter().collect();
@@ -397,7 +397,7 @@ pub(crate) fn build_series(
                         other => panic_mismatch(name, "Array", other),
                     }
                 })
-                .collect::<DeltaResult<Vec<_>>>()?;
+                .collect::<KernelResult<Vec<_>>>()?;
             materialise_per_row_list_series(name, &list_dt, row_exprs)
         }
         KernelDataType::Map(map) => {
@@ -414,7 +414,7 @@ pub(crate) fn build_series(
             let list_dt = PlDataType::List(Box::new(entries_dtype));
             let row_exprs: Vec<Expr> = values
                 .iter()
-                .map(|s| -> DeltaResult<Expr> {
+                .map(|s| -> KernelResult<Expr> {
                     match s {
                         Scalar::Map(md) => {
                             let pairs = md.pairs();
@@ -446,10 +446,10 @@ pub(crate) fn build_series(
                         other => panic_mismatch(name, "Map", other),
                     }
                 })
-                .collect::<DeltaResult<Vec<_>>>()?;
+                .collect::<KernelResult<Vec<_>>>()?;
             materialise_per_row_list_series(name, &list_dt, row_exprs)
         }
-        other => Err(Error::Unsupported(format!(
+        other => Err(KernelError::Unsupported(format!(
             "build_series: dtype {other:?} for column {name} is not yet implemented"
         ))),
     }
@@ -458,7 +458,7 @@ pub(crate) fn build_series(
 /// Polars idiom for a typed-empty list per row: `concat_list([seed]).list().head(0)`.
 /// Plain `lit(null)` won't do — kernel's `get_list`/`get_map` distinguish
 /// "no data" from "empty container".
-pub(crate) fn empty_typed_list_expr(seed: Expr) -> DeltaResult<Expr> {
+pub(crate) fn empty_typed_list_expr(seed: Expr) -> KernelResult<Expr> {
     Ok(polars::prelude::concat_list(vec![seed])
         .map_err(to_kernel_err)?
         .list()
@@ -471,7 +471,7 @@ fn materialise_per_row_list_series(
     name: &str,
     list_dt: &PlDataType,
     row_exprs: Vec<Expr>,
-) -> DeltaResult<Series> {
+) -> KernelResult<Series> {
     let name_pl = PlSmallStr::from_str(name);
     if row_exprs.is_empty() {
         let empty = DataFrame::empty_with_schema(&polars::prelude::Schema::from_iter([(
@@ -528,11 +528,11 @@ pub(crate) fn ensure_scalar_types<'a>(
     scalars: impl IntoIterator<Item = &'a Scalar>,
     field: &delta_kernel::schema::StructField,
     context: &str,
-) -> delta_kernel::DeltaResult<()> {
+) -> delta_kernel::KernelResult<()> {
     for scalar in scalars {
         if !matches!(scalar, Scalar::Null(_)) && !same_shape(&scalar.data_type(), &field.data_type)
         {
-            return Err(delta_kernel::Error::Generic(format!(
+            return Err(delta_kernel::KernelError::Generic(format!(
                 "{context}: scalar for {} is {}, schema declares {}",
                 field.name,
                 scalar.data_type(),

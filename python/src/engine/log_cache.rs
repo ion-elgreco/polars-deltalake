@@ -21,13 +21,6 @@ pub(crate) struct ParsedLog {
     pub(crate) rows_per_file: Vec<usize>,
 }
 
-impl ParsedLog {
-    pub(crate) fn single(df: DataFrame) -> Self {
-        let rows_per_file = vec![df.height()];
-        Self { df, rows_per_file }
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct FileKey {
     location: String,
@@ -101,9 +94,11 @@ mod tests {
     }
 
     fn frame(rows: usize) -> ParsedLog {
-        ParsedLog::single(
-            DataFrame::new(rows, vec![Series::new("a".into(), vec![1i64; rows]).into()]).unwrap(),
-        )
+        ParsedLog {
+            df: DataFrame::new(rows, vec![Series::new("a".into(), vec![1i64; rows]).into()])
+                .unwrap(),
+            rows_per_file: vec![rows],
+        }
     }
 
     #[test]
