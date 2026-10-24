@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::expressions::{Predicate, PredicateRef};
 use delta_kernel::scan::{PartitionValuesOptions, Scan};
 use delta_kernel::{Engine, Snapshot, SnapshotRef};
-use polars::prelude::{DataFrame, Expr, IdxSize, Schema as PlSchema};
+use polars::prelude::{DataFrame, Expr, IdxSize, IntoLazy, Schema as PlSchema};
 use pyo3::prelude::*;
 use pyo3_polars::PySchema;
 use url::Url;
@@ -32,8 +32,9 @@ use ffi::{MorselState, SendExport, morsel_to_py, next_morsel};
 use logical::LogicalScanIter;
 use plan::{ResolvedScan, ResolvedScanCache};
 use predicate::{
-    Conjunct, ConjunctClassification, classify_conjuncts, columns_outside_schema, conjunction,
-    extract_expr_via_json, file_skip_via_partition_eval, flatten_and_conjuncts,
+    Conjunct, ConjunctClassification, classify_conjuncts, coerce_naive_datetime_literals,
+    columns_outside_schema, conjunction, extract_expr_via_json, file_skip_via_partition_eval,
+    flatten_and_conjuncts,
 };
 use read::build_lazy_scan;
 use row_offsets::{file_spans, footer_row_count, physical_prefix, place_dvs};
@@ -69,8 +70,8 @@ impl TableState {
     /// Test / debug helper: classify a predicate by where each conjunct
     /// would be routed, without running a scan.
     fn _classify_predicate(&self, predicate: Bound<'_, PyAny>) -> PyResult<HashMap<String, usize>> {
-        let expr = extract_expr_via_json(&predicate)?;
         let schema = self.snapshot.schema();
+        let expr = coerce_naive_datetime_literals(extract_expr_via_json(&predicate)?, &schema);
         let conjuncts: Vec<Conjunct> = flatten_and_conjuncts(&expr)
             .into_iter()
             .map(|c| Conjunct {
@@ -181,8 +182,8 @@ impl TableScan {
                 state.original_predicate.clear();
             }
             Some(p) => {
-                let expr = extract_expr_via_json(&p)?;
                 let schema = self.snapshot.schema();
+                let expr = coerce_naive_datetime_literals(extract_expr_via_json(&p)?, &schema);
                 // Per-conjunct so one untranslatable term doesn't disable
                 // file-skipping for its siblings.
                 let mut translated: Vec<Predicate> = Vec::new();
@@ -413,18 +414,20 @@ impl TableScan {
                 )
                 .map(|r| r.map_err(|e| anyhow::anyhow!("scan iteration failed: {e:#}"))),
             )
-        } else if routing.post_transform.is_empty() {
-            source
+        } else if let Some(pred) = conjunction(routing.post_transform) {
+            // No rewrite layer to apply these in (a nested-field conjunct on
+            // a plain table): filter each batch after the scan, where the
+            // cast policy has already shaped the struct.
+            Box::new(source.map(move |r| {
+                r.and_then(|df| {
+                    df.lazy()
+                        .filter(pred.clone())
+                        .collect()
+                        .map_err(|e| anyhow::anyhow!("post-scan filter failed: {e:#}"))
+                })
+            }))
         } else {
-            // `LogicalScanIter` is the only layer that applies these, so
-            // without it the conjuncts would drop and return unfiltered rows.
-            // Every column a `post_transform` conjunct names is now read, and
-            // its partition column forces a select — so this arm is
-            // unreachable rather than merely unexercised.
-            return Err(anyhow::anyhow!(
-                "internal: {} post-transform conjunct(s) with no logical rewrite to apply them",
-                routing.post_transform.len()
-            ));
+            source
         };
         state.iter = Some(new_iter);
         state.morsel.reset();

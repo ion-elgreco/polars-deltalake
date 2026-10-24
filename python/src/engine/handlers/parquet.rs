@@ -235,7 +235,7 @@ pub(crate) fn fetch_parquet_metadata(
 /// `ParquetOptions` shaped by the kernel-declared physical schema. Shared
 /// across the plan executor's scans and the scan-driver's bulk read.
 pub(crate) fn parquet_options(physical_schema: &StructType) -> KernelResult<ParquetOptions> {
-    let target_schema = physical_schema.to_polars().map_err(to_kernel_err)?;
+    let target_schema = physical_schema.to_polars_parquet().map_err(to_kernel_err)?;
     Ok(ParquetOptions {
         schema: Some(target_schema),
         ..Default::default()

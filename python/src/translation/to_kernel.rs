@@ -277,7 +277,7 @@ fn align_numeric_literal(
 
 /// `SelectFields` is excluded: its selector expands to names later, so it is
 /// not a path yet.
-fn column_path(expr: &Expr) -> Option<Vec<PlSmallStr>> {
+pub(crate) fn column_path(expr: &Expr) -> Option<Vec<PlSmallStr>> {
     match expr {
         Expr::Column(name) => Some(vec![name.clone()]),
         Expr::Alias(inner, _) => column_path(inner),

@@ -46,6 +46,10 @@ where
 pub(crate) trait KernelSchemaExt {
     fn to_polars(&self) -> anyhow::Result<Arc<PlSchema>>;
 
+    /// The dtypes the parquet reader is asked for; see
+    /// [`KernelDataTypeExt::to_polars_parquet`].
+    fn to_polars_parquet(&self) -> anyhow::Result<Arc<PlSchema>>;
+
     /// Zero rows, typed to this schema — the shape every "nothing to read"
     /// arm hands back so downstream concat / vstack still line up.
     fn empty_frame(&self) -> anyhow::Result<DataFrame> {
@@ -55,60 +59,87 @@ pub(crate) trait KernelSchemaExt {
 
 impl KernelSchemaExt for StructType {
     fn to_polars(&self) -> anyhow::Result<Arc<PlSchema>> {
-        let fields = self
-            .fields()
-            .map(|f| {
-                f.data_type
-                    .to_polars()
-                    .map(|dt| (PlSmallStr::from_str(&f.name), dt))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Arc::new(PlSchema::from_iter(fields)))
+        schema_with(self, &primitive_to_polars)
     }
+
+    fn to_polars_parquet(&self) -> anyhow::Result<Arc<PlSchema>> {
+        schema_with(self, &primitive_parquet_dtype)
+    }
+}
+
+type PrimitiveMapping<'a> = &'a dyn Fn(&PrimitiveType) -> anyhow::Result<PlDataType>;
+
+fn schema_with(schema: &StructType, prim: PrimitiveMapping) -> anyhow::Result<Arc<PlSchema>> {
+    let fields = schema
+        .fields()
+        .map(|f| dtype_with(&f.data_type, prim).map(|dt| (PlSmallStr::from_str(&f.name), dt)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Arc::new(PlSchema::from_iter(fields)))
 }
 
 pub(crate) trait KernelDataTypeExt {
     fn to_polars(&self) -> anyhow::Result<PlDataType>;
+
+    /// The dtype the parquet reader is asked for. Differs from
+    /// [`Self::to_polars`] only for `interval`, which Spark stores as plain
+    /// `INT64` microseconds: polars' scan cast policy has no int → duration
+    /// arm, so the read takes the integers and the select casts them.
+    fn to_polars_parquet(&self) -> anyhow::Result<PlDataType>;
 }
 
 impl KernelDataTypeExt for KernelDataType {
     fn to_polars(&self) -> anyhow::Result<PlDataType> {
-        Ok(match self {
-            KernelDataType::Primitive(p) => primitive_to_polars(p)?,
-            KernelDataType::Array(arr) => {
-                let ArrayType { element_type, .. } = arr.as_ref();
-                PlDataType::List(Box::new(element_type.to_polars()?))
-            }
-            // A variant reads as its physical struct: unshredded, the
-            // `metadata` and `value` binaries. Nothing decodes it yet.
-            KernelDataType::Struct(s) | KernelDataType::Variant(s) => PlDataType::Struct(
-                s.fields()
-                    .map(|f| {
-                        Ok::<_, anyhow::Error>(PlField::new(
-                            PlSmallStr::from_str(&f.name),
-                            f.data_type.to_polars()?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-            KernelDataType::Map(map) => {
-                let MapType {
-                    key_type,
-                    value_type,
-                    ..
-                } = map.as_ref();
-                PlDataType::List(Box::new(PlDataType::Struct(vec![
-                    PlField::new(
-                        PlSmallStr::from_static(crate::consts::MAP_KEY_FIELD),
-                        key_type.to_polars()?,
-                    ),
-                    PlField::new(
-                        PlSmallStr::from_static(crate::consts::MAP_VALUE_FIELD),
-                        value_type.to_polars()?,
-                    ),
-                ])))
-            }
-        })
+        dtype_with(self, &primitive_to_polars)
+    }
+
+    fn to_polars_parquet(&self) -> anyhow::Result<PlDataType> {
+        dtype_with(self, &primitive_parquet_dtype)
+    }
+}
+
+fn dtype_with(dt: &KernelDataType, prim: PrimitiveMapping) -> anyhow::Result<PlDataType> {
+    Ok(match dt {
+        KernelDataType::Primitive(p) => prim(p)?,
+        KernelDataType::Array(arr) => {
+            let ArrayType { element_type, .. } = arr.as_ref();
+            PlDataType::List(Box::new(dtype_with(element_type, prim)?))
+        }
+        // A variant reads as its physical struct: unshredded, the
+        // `metadata` and `value` binaries. Nothing decodes it yet.
+        KernelDataType::Struct(s) | KernelDataType::Variant(s) => PlDataType::Struct(
+            s.fields()
+                .map(|f| {
+                    Ok::<_, anyhow::Error>(PlField::new(
+                        PlSmallStr::from_str(&f.name),
+                        dtype_with(&f.data_type, prim)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        KernelDataType::Map(map) => {
+            let MapType {
+                key_type,
+                value_type,
+                ..
+            } = map.as_ref();
+            PlDataType::List(Box::new(PlDataType::Struct(vec![
+                PlField::new(
+                    PlSmallStr::from_static(crate::consts::MAP_KEY_FIELD),
+                    dtype_with(key_type, prim)?,
+                ),
+                PlField::new(
+                    PlSmallStr::from_static(crate::consts::MAP_VALUE_FIELD),
+                    dtype_with(value_type, prim)?,
+                ),
+            ])))
+        }
+    })
+}
+
+fn primitive_parquet_dtype(p: &PrimitiveType) -> anyhow::Result<PlDataType> {
+    match p {
+        PrimitiveType::IntervalDayTime => Ok(PlDataType::Int64),
+        other => primitive_to_polars(other),
     }
 }
 
@@ -248,9 +279,17 @@ fn arrow_to_kernel_dtype(dt: &ArrowDataType) -> anyhow::Result<KernelDataType> {
 
 /// `col(...)` per kernel schema field, in schema order. Used by the scan
 /// driver and the engine's read paths to shape frames to a kernel schema.
+/// One `col` per field, cast back to its logical dtype where the parquet
+/// read dtype differs (`interval`).
 pub(crate) fn select_exprs_for_schema(schema: &StructType) -> Vec<polars::prelude::Expr> {
     schema
         .fields()
-        .map(|f| polars::prelude::col(PlSmallStr::from_str(f.name.as_str())))
+        .map(|f| {
+            let column = polars::prelude::col(PlSmallStr::from_str(f.name.as_str()));
+            match (f.data_type.to_polars(), f.data_type.to_polars_parquet()) {
+                (Ok(logical), Ok(read)) if logical != read => column.cast(logical),
+                _ => column,
+            }
+        })
         .collect()
 }

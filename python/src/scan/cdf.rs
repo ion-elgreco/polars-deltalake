@@ -20,7 +20,9 @@ use crate::translation::to_kernel::polars_expr_to_kernel_predicate;
 
 use super::ffi::{MorselState, SendExport, morsel_to_py, next_morsel};
 use super::parse_uri;
-use super::predicate::{extract_expr_via_json, flatten_and_conjuncts};
+use super::predicate::{
+    coerce_naive_datetime_literals, extract_expr_via_json, flatten_and_conjuncts,
+};
 
 type BatchIter = Box<dyn Iterator<Item = anyhow::Result<DataFrame>> + Send>;
 
@@ -136,8 +138,8 @@ impl CdfTableScan {
         state.polars_predicate = None;
 
         if let Some(p) = predicate {
-            let expr = extract_expr_via_json(&p)?;
             let schema = self.table_changes.schema();
+            let expr = coerce_naive_datetime_literals(extract_expr_via_json(&p)?, schema);
             let mut translated: Vec<Predicate> = Vec::new();
             for c in flatten_and_conjuncts(&expr) {
                 if touches_cdf_metadata(c) {
