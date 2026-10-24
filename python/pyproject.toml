@@ -39,6 +39,10 @@ build-backend = "maturin"
 [tool.maturin]
 module-name = "polars_deltalake._internal"
 
+# 0.13.4 drops the compromised eMudhra emSign roots from the embedded CA bundle.
+[tool.uv]
+required-version = ">=0.13.4"
+
 [tool.pytest.ini_options]
 markers = [
     "integration: tests that spin up Docker-backed cloud emulators (RustFS for S3, Azurite for Azure, fake-gcs-server for GCS). Filter with `-m integration` or `-m 'not integration'`; they auto-skip when no Docker daemon is reachable.",
